@@ -1,0 +1,20 @@
+# Secrets and environment
+.env
+*.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# App runtime & data
+logs/
+*.log
+data/fplreview.csv
+data/*.json
+
+# IDEs & System
+.DS_Store
+.idea/
+.vscode/
