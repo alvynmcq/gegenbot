@@ -1,6 +1,7 @@
 """Expected Points (xP), form, and Fixture Difficulty Rating (FDR) metrics calculation."""
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
@@ -192,6 +193,8 @@ def calculate_player_metrics(
         # Check FPL Review projection
         fplreview_val: Optional[float] = None
         fplreview_3gw_val: Optional[float] = None
+        decay_factor = float(os.getenv("DECAY_FACTOR", "0.85"))
+        decay_sum = 1.0 + decay_factor + (decay_factor ** 2)
         if player_id in fplreview_map:
             entry = fplreview_map[player_id]
             if isinstance(entry, dict):
@@ -199,7 +202,7 @@ def calculate_player_metrics(
                 fplreview_3gw_val = entry.get("fplreview_xp_3gw")
             elif isinstance(entry, (int, float)):
                 fplreview_val = float(entry)
-                fplreview_3gw_val = round(fplreview_val * 3.0, 2)
+                fplreview_3gw_val = round(fplreview_val * decay_sum, 2)
 
         if fplreview_val is not None:
             # Respect availability if fully unavailable (injured/suspended)
@@ -214,7 +217,7 @@ def calculate_player_metrics(
             xp_3gw = fplreview_3gw_val
         else:
             fdr_3gw_mult = max(0.6, 1.0 + (3.0 - avg_fdr) * 0.08)
-            xp_3gw = round(max(0.0, base_xp * fdr_3gw_mult * availability * 3.0), 2)
+            xp_3gw = round(max(0.0, base_xp * fdr_3gw_mult * availability * decay_sum), 2)
 
         records.append({
             "id": player_id,

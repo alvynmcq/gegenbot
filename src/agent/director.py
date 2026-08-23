@@ -46,17 +46,18 @@ class AIDirector:
         optimization_result: OptimizationResult,
         reason: str = "Automated mathematical optimization",
     ) -> DecisionOutput:
-        """Fallback to the candidate with highest net xP."""
+        """Fallback to the candidate with highest strategic value score and net xP."""
         candidates = optimization_result.candidates
         if not candidates:
             raise ValueError("No candidates available for fallback decision.")
 
-        # Sort candidates by net xP descending
+        # Sort candidates by strategic value score descending (accounting for FT banking and hit hurdle)
         best_candidate_idx = 0
-        best_net_xp = -999.0
+        best_score = -999.0
         for idx, cand in enumerate(candidates):
-            if cand.net_xp > best_net_xp:
-                best_net_xp = cand.net_xp
+            score = cand.strategic_value_score if cand.strategic_value_score != 0.0 else cand.net_xp
+            if score > best_score:
+                best_score = score
                 best_candidate_idx = idx
 
         chosen = candidates[best_candidate_idx]
@@ -110,6 +111,7 @@ class AIDirector:
             c_name = cand.captain.web_name if cand.captain else "N/A"
             vc_name = cand.vice_captain.web_name if cand.vice_captain else "N/A"
             tx_list = [f"OUT: {t.player_out.web_name} (£{t.player_out.cost_m}m) ➔ IN: {t.player_in.web_name} (£{t.player_in.cost_m}m)" for t in cand.transfers]
+            bench_summary = [f"{p.web_name} (Sub #{p.bench_order})" for p in cand.bench]
             candidate_summaries.append({
                 "candidate_index": idx,
                 "option_name": cand.name,
@@ -118,9 +120,12 @@ class AIDirector:
                 "formation": cand.formation,
                 "captain": c_name,
                 "vice_captain": vc_name,
+                "bench_order": bench_summary,
                 "gross_xp": cand.gross_xp,
                 "hit_cost": cand.hit_cost,
                 "net_xp": cand.net_xp,
+                "multi_gw_xp": cand.multi_gw_xp,
+                "strategic_value_score": cand.strategic_value_score,
                 "bank_remaining_m": cand.bank_remaining_m,
             })
 

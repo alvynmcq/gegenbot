@@ -11,9 +11,21 @@ from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
 from src.dashboard.app import create_app, extract_leagues, fetch_entry_details, build_global_summary
-from src.data_fetcher import FPLReviewFetcher, fetch_fplreview_projections, map_fplreview_to_elements
+from src.data_fetcher import (
+    FPLReviewFetcher,
+    calculate_fallback_xp,
+    fetch_fplreview_projections,
+    map_fplreview_to_elements,
+)
 from src.engine.metrics import calculate_player_metrics, calculate_team_fdr_next_n_fixtures
-from src.engine.optimizer import FPLOptimizer, PlayerPick, CandidateSquad, OptimizationResult
+from src.engine.optimizer import (
+    CandidateSquad,
+    FPLOptimizer,
+    OptimizationResult,
+    PlayerPick,
+    get_solver,
+    _solve_problem,
+)
 from src.notifier.telegram import TelegramNotifier
 from src.tracker.league_scanner import LeagueAnalysis, LeagueScanner, ThreatMatrix, ThreatPlayer, RivalManager
 
@@ -269,14 +281,24 @@ def test_fplreview_csv_parsing_and_mapping(mock_bootstrap_data):
     assert df is not None
     assert len(df) == 3
 
-    mapped = fetcher.map_to_bootstrap(df, mock_bootstrap_data, current_event=1)
-    assert 1 in mapped
-    assert mapped[1]["fplreview_xp"] == 5.8
-    assert mapped[1]["fplreview_xp_3gw"] == round(5.8 + 5.2 + 4.9, 2)
-    assert 15 in mapped
-    assert mapped[15]["fplreview_xp"] == 9.4
-    assert 25 in mapped
-    assert mapped[25]["fplreview_xp"] == 11.2
+    # 1. Default Horizon Decay Factor (gamma = 0.85): 5.8 + 0.85*5.2 + 0.85^2*4.9 = 13.76
+    mapped_default = fetcher.map_to_bootstrap(df, mock_bootstrap_data, current_event=1, decay_factor=0.85)
+    assert 1 in mapped_default
+    assert mapped_default[1]["fplreview_xp"] == 5.8
+    expected_decayed_3gw = round(5.8 + 0.85 * 5.2 + (0.85 ** 2) * 4.9, 2)
+    assert mapped_default[1]["fplreview_xp_3gw"] == expected_decayed_3gw
+    assert 15 in mapped_default
+    assert mapped_default[15]["fplreview_xp"] == 9.4
+    assert 25 in mapped_default
+    assert mapped_default[25]["fplreview_xp"] == 11.2
+
+    # 2. Custom Horizon Decay Factor (gamma = 1.0): 5.8 + 5.2 + 4.9 = 15.9
+    mapped_undecayed = fetcher.map_to_bootstrap(df, mock_bootstrap_data, current_event=1, decay_factor=1.0)
+    assert mapped_undecayed[1]["fplreview_xp_3gw"] == round(5.8 + 5.2 + 4.9, 2)
+
+    # 3. Custom Horizon Decay Factor (gamma = 0.90): 5.8 + 0.9*5.2 + 0.81*4.9 = 14.45
+    mapped_90 = fetcher.map_to_bootstrap(df, mock_bootstrap_data, current_event=1, decay_factor=0.90)
+    assert mapped_90[1]["fplreview_xp_3gw"] == round(5.8 + 0.90 * 5.2 + (0.90 ** 2) * 4.9, 2)
 
 
 def test_fplreview_name_and_accent_matching(mock_bootstrap_data):
@@ -1175,6 +1197,158 @@ def test_validate_auth_method():
     ok, msg = client_no_auth.validate_auth(12345)
     assert ok is False
     assert "FPL_AUTH_TOKEN is not configured" in msg
+
+
+# ==========================================
+# 5. Solver Engine Upgrade Tests (HiGHS, Decay, Candidates)
+# ==========================================
+
+def test_highs_solver_backend_detection_and_fallback():
+    """Test HiGHS solver backend configuration and graceful PULP_CBC_CMD fallback."""
+    import pulp
+
+    # 1. Test get_solver returns an available solver
+    solver = get_solver(msg=False)
+    assert solver is not None
+
+    # 2. Test problem solving with get_solver
+    prob = pulp.LpProblem("TestSolver", pulp.LpMaximize)
+    x = pulp.LpVariable.dict("x", [0], lowBound=0, upBound=10, cat=pulp.LpContinuous) if hasattr(pulp.LpVariable, "dict") else pulp.LpVariable("x", 0, 10)
+    prob += x[0] if isinstance(x, dict) else x
+    status = _solve_problem(prob, primary_solver=solver)
+    assert status == pulp.LpStatusOptimal
+    val = pulp.value(x[0]) if isinstance(x, dict) else pulp.value(x)
+    assert val == 10.0
+
+    # 3. Test fallback behavior when primary solver raises an error
+    faulty_solver = MagicMock()
+    faulty_solver.actualSolve.side_effect = Exception("HiGHS binary error simulation")
+    prob2 = pulp.LpProblem("TestFallback", pulp.LpMaximize)
+    y = pulp.LpVariable("y", 0, 5)
+    prob2 += y
+    status2 = _solve_problem(prob2, primary_solver=faulty_solver)
+    assert status2 == pulp.LpStatusOptimal
+    assert pulp.value(y) == 5.0
+
+
+def test_multi_gameweek_decay_factor_in_optimizer():
+    """Test multi-gameweek horizon decay factor math in FPLOptimizer."""
+    gamma = 0.80
+    expected_decay_sum = round(1.0 + gamma + (gamma ** 2), 4)  # 1.0 + 0.80 + 0.64 = 2.44
+
+    raw_df = pd.DataFrame([{
+        "id": 1,
+        "web_name": "TestMID",
+        "element_type": 3,
+        "position": "MID",
+        "team_id": 1,
+        "team_name": "Team 1",
+        "team_code": "T01",
+        "cost_m": 6.0,
+        "xp": 5.0,
+        "status": "a",
+        "chance_of_playing_next_round": 100,
+    }])
+
+    optimizer = FPLOptimizer(raw_df, decay_factor=gamma)
+    assert optimizer.decay_factor == 0.80
+    assert optimizer.df.iloc[0]["discounted_3gw"] == round(5.0 * expected_decay_sum, 2)
+    assert optimizer.df.iloc[0]["discounted_3gw"] == 12.20
+
+
+def test_diverse_candidates_generation_and_hit_hurdle(mock_bootstrap_data, mock_fixtures_data):
+    """Test generation of 3 distinct candidates with rolling value and hit hurdle logic."""
+    players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+    optimizer = FPLOptimizer(players_df)
+    initial_squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
+
+    opt_result = optimizer.optimize(
+        current_squad_ids=initial_squad,
+        bank_m=2.0,
+        free_transfers=1,
+        evaluate_chips=False,
+    )
+
+    assert len(opt_result.candidates) == 3
+    cand_0, cand_1, cand_2 = opt_result.candidates
+
+    # Candidate 1: 0 Transfers (Roll)
+    assert cand_0.transfers_count == 0
+    assert "Roll / Bank Transfer" in cand_0.name
+    assert cand_0.strategic_value_score > cand_0.net_xp  # Has +1.5 FT rolling value bonus
+
+    # Candidate 2: 1-Transfer Move
+    assert cand_1.transfers_count <= 1
+    assert cand_1.hit_cost == 0
+
+    # Candidate 3: 2-Transfer Move
+    assert cand_2.transfers_count <= 2
+    if cand_2.transfers_count == 2:
+        assert cand_2.hit_cost == 4
+        # Verify candidate name contains hit details or hurdle evaluation
+        assert "-4 Hit" in cand_2.name
+
+
+def test_local_csv_priority_and_html_fallback(tmp_path, mock_bootstrap_data, mock_fixtures_data):
+    """Test local CSV file priority over remote scraping, and HTML error payload resilience."""
+    # 1. Test local CSV reading
+    local_csv_file = tmp_path / "custom_projections.csv"
+    local_csv_file.write_text("ID,Name,Pos,Team,1_Pts\n1,GK_1,GKP,Team 1,7.7\n")
+
+    fetcher = FPLReviewFetcher(file_path=local_csv_file)
+    df = fetcher.fetch_projections()
+    assert df is not None
+    assert len(df) == 1
+    assert float(df.iloc[0]["1_Pts"]) == 7.7
+
+    # 2. Test HTML error page passed as file
+    html_file = tmp_path / "projections.csv"
+    html_file.write_text("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body>Error</body></html>")
+    fetcher_html_file = FPLReviewFetcher(file_path=html_file)
+    # When file is HTML, should skip and return None without exception
+    with patch("requests.get", return_value=MagicMock(status_code=404, text="<html>404</html>")):
+        res_df = fetcher_html_file.fetch_projections()
+        assert res_df is None
+
+    # 3. Test HTML payload passed as string content
+    html_str = "<!DOCTYPE html><html><body>Error</body></html>"
+    df_html = fetch_fplreview_projections(csv_content=html_str)
+    assert df_html is None
+
+    # 4. Pipeline calculation resilience when projections return None
+    players_df = calculate_player_metrics(
+        mock_bootstrap_data,
+        mock_fixtures_data,
+        current_event=1,
+        fplreview_df=None,
+    )
+    assert not players_df.empty
+    assert "xp" in players_df.columns
+
+
+def test_calculate_fallback_xp_helper():
+    """Test calculate_fallback_xp standalone helper."""
+    element = {
+        "id": 10,
+        "web_name": "TestPlayer",
+        "element_type": 3,
+        "form": "6.0",
+        "points_per_game": "5.0",
+        "ep_next": "5.5",
+    }
+    fb = calculate_fallback_xp(
+        element=element,
+        next_fdr=2.0,
+        next_is_home=True,
+        avg_fdr=2.5,
+        availability=1.0,
+        decay_factor=0.85,
+    )
+    assert "xp" in fb
+    assert fb["xp"] == 5.5
+    assert fb["xp_source"] == "fpl_ep_next"
+    assert fb["xp_3gw"] > fb["xp"]
+
 
 
 

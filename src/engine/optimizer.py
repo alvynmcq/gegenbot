@@ -19,6 +19,47 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+def get_solver(msg: bool = False, time_limit: Optional[int] = None) -> pulp.LpSolver:
+    """
+    Return the HiGHS solver backend with graceful fallback to PULP_CBC_CMD.
+    HiGHS provides superior linear and mixed-integer programming performance.
+    Gracefully falls back on ARM64 / Raspberry Pi or when highspy is not available.
+    """
+    # 1. Attempt HiGHS direct Python API
+    try:
+        if hasattr(pulp, "getSolver"):
+            solver = pulp.getSolver("HiGHS", msg=msg, timeLimit=time_limit)
+            if solver.available():
+                return solver
+    except Exception as exc:
+        logger.debug(f"HiGHS solver via getSolver not available: {exc}")
+
+    # 2. Attempt HiGHS_CMD binary solver
+    try:
+        if hasattr(pulp, "HiGHS_CMD"):
+            solver = pulp.HiGHS_CMD(msg=msg, timeLimit=time_limit)
+            if solver.available():
+                return solver
+    except Exception as exc:
+        logger.debug(f"HiGHS_CMD binary solver not available: {exc}")
+
+    # 3. Graceful fallback to PULP_CBC_CMD
+    logger.debug("Using PULP_CBC_CMD solver fallback.")
+    return pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit)
+
+
+def _solve_problem(prob: pulp.LpProblem, primary_solver: Optional[pulp.LpSolver] = None) -> int:
+    """Solve LpProblem with primary solver (HiGHS) and automatic fallback to CBC on exception."""
+    solver = primary_solver or get_solver(msg=False)
+    try:
+        status = prob.solve(solver)
+        return status
+    except Exception as exc:
+        logger.warning(f"Solver {solver} failed with exception ({exc}). Retrying with PULP_CBC_CMD.")
+        fallback = pulp.PULP_CBC_CMD(msg=False)
+        return prob.solve(fallback)
+
+
 def get_player_injury_multiplier(
     status: Optional[str] = "a",
     chance: Optional[int] = None,
@@ -155,19 +196,22 @@ def _parse_target_gws(env_var_name: str) -> List[int]:
 class FPLOptimizer:
     """Advanced MILP solver for FPL squad optimization with Multi-Period Horizon and Game Theory."""
 
-    def __init__(self, players_df: pd.DataFrame):
+    def __init__(self, players_df: pd.DataFrame, decay_factor: Optional[float] = None):
         """
         Initialize optimizer with player DataFrame and apply injury/rotation status discounting.
+        Incorporates configurable horizon decay factor (gamma) for multi-gameweek lookahead.
         Expected columns: id, web_name, element_type, position, team_id, team_name, team_code, cost_m, xp
         Optional columns: xp_3gw, status, chance_of_playing_next_round, fixtures_in_gw
         """
         self.df = players_df.copy().reset_index(drop=True)
+        self.decay_factor = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
+        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
 
         if "raw_xp" not in self.df.columns:
             self.df["raw_xp"] = self.df["xp"]
 
         if "xp_3gw" not in self.df.columns:
-            self.df["xp_3gw"] = self.df["xp"] * 3.0
+            self.df["xp_3gw"] = self.df["xp"] * decay_sum
 
         if "fixtures_in_gw" not in self.df.columns:
             self.df["fixtures_in_gw"] = 1
@@ -183,7 +227,7 @@ class FPLOptimizer:
             raw = float(row.get("raw_xp", row.get("xp", 0.0)))
             disc = round(raw * mult, 2)
             discounted_xps.append(disc)
-            raw_3gw = float(row.get("xp_3gw", raw * 3.0))
+            raw_3gw = float(row.get("xp_3gw", raw * decay_sum))
             discounted_3gw.append(round(raw_3gw * mult, 2))
 
         self.df["injury_multiplier"] = multipliers
@@ -208,7 +252,8 @@ class FPLOptimizer:
         rev_xp = info.get("fplreview_xp")
         raw_xp = float(info.get("raw_xp", info["xp"]))
         disc_xp = float(info.get("discounted_xp", info["xp"]))
-        xp_3gw_val = float(info.get("discounted_3gw", disc_xp * 3.0))
+        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
+        xp_3gw_val = float(info.get("discounted_3gw", disc_xp * decay_sum))
         mult = float(info.get("injury_multiplier", 1.0))
         chance_val = info.get("chance_of_playing_next_round")
         chance_int = int(chance_val) if chance_val is not None and not pd.isna(chance_val) else None
@@ -264,8 +309,7 @@ class FPLOptimizer:
         prob += pulp.lpSum([costs[i] * squad_vars[i] for i in indices]) <= budget_m
         prob += pulp.lpSum([squad_vars[i] * xps[i] for i in indices])
 
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        status = prob.solve(solver)
+        status = _solve_problem(prob)
 
         if status == pulp.LpStatusOptimal:
             selected_ids = [player_ids[i] for i in indices if pulp.value(squad_vars[i]) > 0.5]
@@ -465,8 +509,7 @@ class FPLOptimizer:
             for i in indices
         ]), "TotalXP"
 
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        status = prob.solve(solver)
+        status = _solve_problem(prob)
 
         if status != pulp.LpStatusOptimal:
             logger.warning("PuLP solver failed to find optimal solution from scratch.")
@@ -506,8 +549,9 @@ class FPLOptimizer:
         hit_cost = 0
         net_xp = gross_xp
 
-        # Multi-GW outlook sum (3-GW)
-        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * 3.0) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * 3.0)), 2)
+        # Multi-GW decayed outlook sum (3-GW)
+        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * decay_sum)), 2)
 
         total_cost_m = round(sum(self.player_map[pid]["cost_m"] for pid in selected_squad_ids), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
@@ -620,9 +664,10 @@ class FPLOptimizer:
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
-        # Multi-period blended xP per player
+        # Multi-period blended xP per player discounted with horizon decay factor
+        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
         blended_xps = [
-            round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / 3.0), 3)
+            round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / decay_sum), 3)
             for i in indices
         ]
 
@@ -633,19 +678,18 @@ class FPLOptimizer:
             for i in indices
         ]), "TotalXP"
 
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        status = prob.solve(solver)
+        status = _solve_problem(prob)
 
         if status != pulp.LpStatusOptimal:
             prob.constraints[f"ExactTransfers_{k_transfers}"] = (15 - retained) <= k_transfers
-            status = prob.solve(solver)
+            status = _solve_problem(prob)
 
             if status != pulp.LpStatusOptimal:
                 for i in zero_mult_indices:
                     cname = f"NoZeroMultStarter_{i}"
                     if cname in prob.constraints:
                         del prob.constraints[cname]
-                status = prob.solve(solver)
+                status = _solve_problem(prob)
 
             if status != pulp.LpStatusOptimal:
                 logger.warning(f"PuLP solver failed to find optimal solution for K={k_transfers}")
@@ -687,12 +731,12 @@ class FPLOptimizer:
         hit_cost = extra_transfers * 4
         net_xp = round(gross_xp - hit_cost, 2)
 
-        # Multi-GW 3-week outlook
-        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * 3.0) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * 3.0)), 2)
+        # Multi-GW 3-week decayed outlook sum
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * decay_sum)), 2)
 
         # Strategic value score includes rolling transfer bonus if 0 transfers made
         roll_bonus = rolling_bonus_xp if actual_transfers_count == 0 else 0.0
-        strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / 3.0) * 0.15, 2)
+        strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / decay_sum) * 0.15, 2)
 
         total_cost_m = round(sum(effective_costs[i] for i in selected_squad_indices), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
@@ -1034,7 +1078,8 @@ class FPLOptimizer:
 
         candidates: List[CandidateSquad] = []
 
-        # Candidate 1: K = 0 (Roll Transfer)
+        # Candidate 1: 0 Transfers (Roll / Bank FT with +1.5 xP Strategic Value)
+        rolling_bonus_xp = float(os.getenv("ROLLING_BONUS_XP", "1.5"))
         cand_0 = self._solve_for_k_transfers(
             current_set,
             total_budget_m,
@@ -1042,11 +1087,12 @@ class FPLOptimizer:
             free_transfers=free_transfers,
             selling_prices=selling_prices,
             eo_weights=eo_weights,
+            rolling_bonus_xp=rolling_bonus_xp,
         )
         if cand_0:
             candidates.append(cand_0)
 
-        # Candidate 2: K = 1 (1 Transfer)
+        # Candidate 2: Optimal 1-Free Transfer Move
         cand_1 = self._solve_for_k_transfers(
             current_set,
             total_budget_m,
@@ -1054,11 +1100,13 @@ class FPLOptimizer:
             free_transfers=free_transfers,
             selling_prices=selling_prices,
             eo_weights=eo_weights,
+            rolling_bonus_xp=rolling_bonus_xp,
         )
         if cand_1:
             candidates.append(cand_1)
 
-        # Candidate 3: K = 2 (2 Transfers)
+        # Candidate 3: Optimal 2-Transfer Move (Factoring -4 Hit penalty only if net decayed xP gain exceeds +5.0 xP hurdle)
+        hit_min_gain = float(os.getenv("HIT_MIN_NET_XP_GAIN", "5.0"))
         cand_2 = self._solve_for_k_transfers(
             current_set,
             total_budget_m,
@@ -1066,8 +1114,17 @@ class FPLOptimizer:
             free_transfers=free_transfers,
             selling_prices=selling_prices,
             eo_weights=eo_weights,
+            rolling_bonus_xp=rolling_bonus_xp,
         )
         if cand_2:
+            if cand_2.hit_cost > 0:
+                baseline_xp = cand_0.net_xp if cand_0 else (cand_1.net_xp if cand_1 else 0.0)
+                net_gain = round(cand_2.net_xp - baseline_xp, 2)
+                if net_gain >= hit_min_gain:
+                    cand_2.name = f"Option 3: Optimal 2-Transfer Move (-{cand_2.hit_cost} Hit · +{net_gain:.2f} Net xP Gain vs Roll)"
+                else:
+                    cand_2.name = f"Option 3: 2-Transfer Move (-{cand_2.hit_cost} Hit · Sub-optimal: +{net_gain:.2f} xP below +{hit_min_gain:.1f} xP Hurdle)"
+                    cand_2.strategic_value_score = round(cand_2.strategic_value_score - 2.0, 2)
             candidates.append(cand_2)
 
         # Keep candidates ordered by transfers count: 0 moves, 1 move, 2 moves

@@ -45,6 +45,12 @@ class FPLReviewFetcher:
     """Fetches, parses, and maps free FPL Review projections to official FPL element IDs."""
 
     DEFAULT_CSV_PATH = Path("data/fplreview.csv")
+    LOCAL_CANDIDATE_PATHS = [
+        Path("data/fplreview.csv"),
+        Path("data/projections.csv"),
+        Path("fplreview.csv"),
+        Path("projections.csv"),
+    ]
     DEFAULT_PROJECTIONS_URL = "https://fplreview.com/free-planner/"
 
     def __init__(
@@ -66,11 +72,17 @@ class FPLReviewFetcher:
     ) -> Optional[pd.DataFrame]:
         """
         Fetch and parse FPL Review projections CSV from string content, local file, or remote URL.
-        Returns a DataFrame if successful, or None on failure/timeout.
+        Local CSV files (data/fplreview.csv or data/projections.csv) take priority over remote scraping.
+        Returns a DataFrame if successful, or None on failure/timeout without interrupting the pipeline.
         """
         # 1. Direct CSV content provided (e.g. in unit tests or memory cache)
         if csv_content is not None:
             try:
+                # Check for HTML error payload passed as string
+                trimmed = csv_content.strip()
+                if trimmed.startswith("<!DOCTYPE") or trimmed.startswith("<html"):
+                    logger.warning("Provided CSV content contains HTML markup. Ignoring.")
+                    return None
                 df = pd.read_csv(io.StringIO(csv_content))
                 logger.info(f"Loaded {len(df)} projection records from provided CSV content.")
                 return df
@@ -78,16 +90,30 @@ class FPLReviewFetcher:
                 logger.warning(f"Failed to parse provided CSV content: {e}")
                 return None
 
-        # 2. Local CSV file check
-        if self.file_path and self.file_path.exists():
-            try:
-                df = pd.read_csv(self.file_path)
-                logger.info(f"Loaded {len(df)} projection records from local file: {self.file_path}")
-                return df
-            except Exception as e:
-                logger.warning(f"Failed to read local FPL Review CSV ({self.file_path}): {e}")
+        # 2. Local CSV file check (Prioritize local projection files)
+        candidate_files: List[Path] = []
+        if self.file_path:
+            candidate_files.append(self.file_path)
+        for cand in self.LOCAL_CANDIDATE_PATHS:
+            if cand not in candidate_files:
+                candidate_files.append(cand)
 
-        # 3. Remote HTTP Fetch
+        for candidate in candidate_files:
+            if candidate.exists() and candidate.is_file():
+                try:
+                    with open(candidate, "r", encoding="utf-8", errors="ignore") as f:
+                        header_preview = f.read(512).strip()
+                    if header_preview.startswith("<!DOCTYPE") or header_preview.startswith("<html"):
+                        logger.warning(f"Local file {candidate} contains HTML instead of CSV projections. Skipping.")
+                        continue
+                    df = pd.read_csv(candidate)
+                    if not df.empty:
+                        logger.info(f"Loaded {len(df)} projection records from local file: {candidate}")
+                        return df
+                except Exception as e:
+                    logger.warning(f"Failed to read local FPL projections CSV ({candidate}): {e}")
+
+        # 3. Remote HTTP Fetch (Fallback when no valid local CSV found)
         target_url = force_url or self.url
         if target_url:
             logger.info(f"Fetching FPL Review projections from remote endpoint: {target_url}")
@@ -130,13 +156,18 @@ class FPLReviewFetcher:
         fplreview_df: pd.DataFrame,
         bootstrap_data: Dict[str, Any],
         current_event: int = 1,
+        decay_factor: Optional[float] = None,
     ) -> Dict[int, Dict[str, float]]:
         """
         Map FPL Review projection rows to official FPL element IDs.
+        Calculates multi-gameweek discounted expected points:
+            xP_effective = xP_t + (gamma * xP_{t+1}) + (gamma^2 * xP_{t+2})
         Returns: {element_id: {"fplreview_xp": float, "fplreview_xp_3gw": float}}
         """
         if fplreview_df is None or fplreview_df.empty:
             return {}
+
+        gamma = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
 
         elements = bootstrap_data.get("elements", [])
         teams = bootstrap_data.get("teams", [])
@@ -206,7 +237,7 @@ class FPLReviewFetcher:
             logger.warning("Could not identify Gameweek xP projection column in FPL Review data.")
             return {}
 
-        # Also identify next 3 gameweeks for 3GW projection if present
+        # Also identify next 3 gameweeks for discounted 3GW projection
         gw_plus_1_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 1}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
         gw_plus_2_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 2}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
 
@@ -236,7 +267,7 @@ class FPLReviewFetcher:
         mapped_projections: Dict[int, Dict[str, float]] = {}
 
         for _, row in df.iterrows():
-            # Extract raw points projection
+            # Extract raw points projection for current gameweek
             try:
                 raw_xp = float(row[gw_col])
                 if pd.isna(raw_xp):
@@ -245,31 +276,32 @@ class FPLReviewFetcher:
             except (ValueError, TypeError):
                 continue
 
-            # Calculate 3GW sum if columns exist
-            xp_3gw_val = xp_val
+            # Calculate discounted multi-week projection: xP_t + (gamma * xP_{t+1}) + (gamma^2 * xP_{t+2})
             multi_gw_sum = xp_val
-            has_3gw = False
+            has_future_cols = False
             if gw_plus_1_col and gw_plus_1_col in row:
                 try:
                     p1 = float(row[gw_plus_1_col])
                     if not pd.isna(p1):
-                        multi_gw_sum += max(0.0, p1)
-                        has_3gw = True
+                        multi_gw_sum += gamma * max(0.0, p1)
+                        has_future_cols = True
                 except (ValueError, TypeError):
                     pass
             if gw_plus_2_col and gw_plus_2_col in row:
                 try:
                     p2 = float(row[gw_plus_2_col])
                     if not pd.isna(p2):
-                        multi_gw_sum += max(0.0, p2)
-                        has_3gw = True
+                        multi_gw_sum += (gamma ** 2) * max(0.0, p2)
+                        has_future_cols = True
                 except (ValueError, TypeError):
                     pass
 
-            if has_3gw:
+            if has_future_cols:
                 xp_3gw_val = round(multi_gw_sum, 2)
             else:
-                xp_3gw_val = round(xp_val * 3.0, 2)
+                # Horizon decay over 3-gameweek baseline lookahead
+                decay_sum = 1.0 + gamma + (gamma ** 2)
+                xp_3gw_val = round(xp_val * decay_sum, 2)
 
             matched_element_id: Optional[int] = None
 
@@ -317,6 +349,74 @@ class FPLReviewFetcher:
         return mapped_projections
 
 
+def calculate_fallback_xp(
+    element: Dict[str, Any],
+    next_fdr: float = 3.0,
+    next_is_home: bool = False,
+    avg_fdr: float = 3.0,
+    availability: float = 1.0,
+    decay_factor: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Calculate fallback baseline expected points for an individual player using
+    ep_next, player form, points per game, and FDR rating without interrupting the pipeline.
+    """
+    gamma = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
+    decay_sum = 1.0 + gamma + (gamma ** 2)
+
+    try:
+        form = float(element.get("form", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        form = 0.0
+
+    try:
+        ppg = float(element.get("points_per_game", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        ppg = 0.0
+
+    try:
+        ep_next_raw = element.get("ep_next")
+        ep_next_val = float(ep_next_raw) if ep_next_raw is not None else None
+    except (ValueError, TypeError):
+        ep_next_val = None
+
+    pos_fallback = {1: 2.5, 2: 2.5, 3: 3.0, 4: 3.0}
+    elem_type = element.get("element_type", 3)
+    pos_base = pos_fallback.get(elem_type, 2.5)
+
+    if form > 0 and ppg > 0:
+        base_xp = 0.60 * form + 0.40 * ppg
+    elif form > 0:
+        base_xp = form
+    elif ppg > 0:
+        base_xp = ppg
+    else:
+        base_xp = pos_base
+
+    fdr_mult = max(0.6, 1.0 + (3.0 - next_fdr) * 0.08)
+    if next_is_home:
+        fdr_mult *= 1.05
+
+    heuristic_xp = round(max(0.0, base_xp * fdr_mult * availability), 2)
+
+    if ep_next_val is not None and ep_next_val > 0:
+        xp = round(max(0.0, ep_next_val * availability), 2)
+        source = "fpl_ep_next"
+    else:
+        xp = heuristic_xp
+        source = "fpl_heuristic"
+
+    fdr_3gw_mult = max(0.6, 1.0 + (3.0 - avg_fdr) * 0.08)
+    xp_3gw = round(max(0.0, base_xp * fdr_3gw_mult * availability * decay_sum), 2)
+
+    return {
+        "xp": xp,
+        "xp_3gw": xp_3gw,
+        "xp_source": source,
+        "base_xp": round(base_xp, 2),
+    }
+
+
 def fetch_fplreview_projections(
     url: Optional[str] = None,
     file_path: Optional[Union[str, Path]] = None,
@@ -332,7 +432,14 @@ def map_fplreview_to_elements(
     fplreview_df: pd.DataFrame,
     bootstrap_data: Dict[str, Any],
     current_event: int = 1,
+    decay_factor: Optional[float] = None,
 ) -> Dict[int, Dict[str, float]]:
     """Helper function to map FPL Review projections to official element IDs."""
     fetcher = FPLReviewFetcher()
-    return fetcher.map_to_bootstrap(fplreview_df, bootstrap_data, current_event=current_event)
+    return fetcher.map_to_bootstrap(
+        fplreview_df,
+        bootstrap_data,
+        current_event=current_event,
+        decay_factor=decay_factor,
+    )
+
