@@ -1,4 +1,4 @@
-"""FPL API Client for data retrieval and automated execution."""
+"""FPL API Client for data retrieval and automated execution with self-healing authentication."""
 
 import json
 import logging
@@ -25,9 +25,12 @@ class FPLRateLimitError(FPLClientError):
 
 
 class FPLClient:
-    """Client for Fantasy Premier League REST API with caching and retry backoff."""
+    """Client for Fantasy Premier League REST API with caching, PingOne OAuth token refresh, and retry backoff."""
 
     BASE_URL = "https://fantasy.premierleague.com/api"
+    PINGONE_TOKEN_URL = "https://auth.pingone.eu/68340de1-dfb9-412e-937c-20172986d129/as/token"
+    PINGONE_CLIENT_ID = "1f243d70-a140-4035-8c41-341f5af5aa12"
+    LOGIN_URL = "https://users.premierleague.com/accounts/login/"
     CACHE_DIR = Path("data")
     BOOTSTRAP_CACHE_FILE = CACHE_DIR / "bootstrap_cache.json"
     CACHE_TTL_SECONDS = 600  # 10 minutes
@@ -37,12 +40,119 @@ class FPLClient:
         auth: Optional[FPLAuth] = None,
         session: Optional[requests.Session] = None,
         cache_dir: Optional[Path] = None,
+        client_id: Optional[str] = None,
     ):
         self.auth = auth or FPLAuth()
         self.session = session or requests.Session()
+        self.client_id = client_id or self.PINGONE_CLIENT_ID
         self.cache_dir = cache_dir or self.CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.bootstrap_cache_path = self.cache_dir / "bootstrap_cache.json"
+
+        # Sync access token to session cookies
+        self._sync_session_cookies()
+
+    def _sync_session_cookies(self) -> None:
+        """Synchronize current access token to session cookie jar under .premierleague.com domain."""
+        if self.auth.access_token:
+            clean_token = self.auth.access_token.replace("Bearer ", "").strip()
+            self.session.cookies.set("access_token", clean_token, domain=".premierleague.com", path="/")
+
+    def refresh_access_token(self) -> bool:
+        """
+        Refresh FPL OAuth access token using PingOne token endpoint or login fallback.
+        Updates session headers, cookie jar, auth state, and persists to data/auth_state.json.
+        """
+        refresh_token = self.auth.refresh_token
+        if refresh_token:
+            logger.info("Attempting automated PingOne OAuth2 token refresh...")
+            payload = {
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "refresh_token": refresh_token,
+            }
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            }
+            try:
+                resp = requests.post(
+                    self.PINGONE_TOKEN_URL,
+                    data=payload,
+                    headers=headers,
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_access = data.get("access_token")
+                    new_refresh = data.get("refresh_token", refresh_token)
+                    expires_in = data.get("expires_in", 7200)
+
+                    if new_access:
+                        self.auth.update_tokens(
+                            access_token=new_access,
+                            refresh_token=new_refresh,
+                            expires_in=expires_in,
+                        )
+                        self._sync_session_cookies()
+                        logger.info("Successfully refreshed PingOne OAuth2 access token and updated state.")
+                        return True
+                    else:
+                        logger.warning("PingOne response did not contain access_token.")
+                else:
+                    logger.warning(
+                        f"PingOne token refresh failed with HTTP {resp.status_code}: {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(f"Error during PingOne token refresh: {e}")
+
+        # Fallback to direct credentials login if available
+        if self.auth.email and self.auth.password:
+            logger.info(f"Attempting direct credential login fallback for {self.auth.email}...")
+            return self.login_with_credentials(self.auth.email, self.auth.password)
+
+        logger.warning("No valid refresh token or login credentials available for token refresh.")
+        return False
+
+    def login_with_credentials(self, email: Optional[str] = None, password: Optional[str] = None) -> bool:
+        """Authenticate directly against FPL users login endpoint as fallback."""
+        user_email = email or self.auth.email
+        user_pwd = password or self.auth.password
+        if not user_email or not user_pwd:
+            logger.warning("Email or password not provided for credential login.")
+            return False
+
+        payload = {
+            "login": user_email,
+            "password": user_pwd,
+            "app": "plfpl-web",
+            "redirect_uri": "https://fantasy.premierleague.com/",
+        }
+        headers = dict(self.auth.BASE_HEADERS)
+        try:
+            resp = self.session.post(self.LOGIN_URL, data=payload, headers=headers, timeout=15)
+            cookies = resp.cookies.get_dict()
+            token = cookies.get("access_token") or cookies.get("pl_profile")
+            if token:
+                self.auth.update_tokens(access_token=token, expires_in=7200)
+                self._sync_session_cookies()
+                logger.info("Direct credential login succeeded.")
+                return True
+            if resp.status_code in (200, 302):
+                for cookie in self.session.cookies:
+                    if cookie.name in ("access_token", "pl_profile"):
+                        self.auth.update_tokens(access_token=cookie.value, expires_in=7200)
+                        self._sync_session_cookies()
+                        return True
+            logger.warning(f"Direct credential login failed with HTTP {resp.status_code}.")
+        except Exception as e:
+            logger.warning(f"Exception during direct credential login: {e}")
+        return False
 
     def _request(
         self,
@@ -54,11 +164,12 @@ class FPLClient:
         max_retries: int = 3,
         backoff_factor: float = 1.5,
     ) -> Any:
-        """Execute HTTP request with 429 rate limit backoff and error handling."""
+        """Execute HTTP request with 429 rate limit backoff, 401 token refresh interceptor, and error handling."""
         url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
-        headers = self.auth.get_headers(authenticated=authenticated)
+        token_refreshed = False
 
         for attempt in range(1, max_retries + 1):
+            headers = self.auth.get_headers(authenticated=authenticated)
             try:
                 response = self.session.request(
                     method=method.upper(),
@@ -77,7 +188,28 @@ class FPLClient:
                     time.sleep(retry_after)
                     continue
 
-                if response.status_code == 401 or response.status_code == 403:
+                # 401 / 403 Interceptor & Auto-Retry
+                if (response.status_code == 401 or response.status_code == 403) and authenticated:
+                    if not token_refreshed and self.auth.can_refresh:
+                        logger.info(f"Received HTTP {response.status_code} on {url}. Intercepting to refresh token...")
+                        if self.refresh_access_token():
+                            token_refreshed = True
+                            # Replay the original request transparently with new headers
+                            new_headers = self.auth.get_headers(authenticated=authenticated)
+                            retry_resp = self.session.request(
+                                method=method.upper(),
+                                url=url,
+                                headers=new_headers,
+                                params=params,
+                                json=json_data,
+                                timeout=15,
+                            )
+                            if retry_resp.status_code not in (401, 403):
+                                retry_resp.raise_for_status()
+                                return retry_resp.json()
+                            response = retry_resp
+
+                    logger.warning(f"Authentication failed on {url} (HTTP {response.status_code}). Ensure FPL_AUTH_TOKEN is valid.")
                     raise FPLClientError(
                         f"Authentication failed ({response.status_code}): Ensure FPL_AUTH_TOKEN is valid."
                     )
@@ -85,6 +217,8 @@ class FPLClient:
                 response.raise_for_status()
                 return response.json()
 
+            except FPLClientError:
+                raise
             except requests.exceptions.RequestException as exc:
                 if attempt == max_retries:
                     logger.error(f"HTTP request failed permanently for {url}: {exc}")
@@ -189,14 +323,23 @@ class FPLClient:
         )
 
     def validate_auth(self, team_id: int) -> Tuple[bool, str]:
-        """Verify if authentication token is active and valid for team_id."""
+        """Verify if authentication token is active and valid for team_id, attempting refresh if needed."""
         if not self.auth.is_authenticated:
-            return False, "FPL_AUTH_TOKEN is not configured."
+            if self.auth.can_refresh and self.refresh_access_token():
+                logger.info("Authentication self-healed via token refresh.")
+            else:
+                return False, "FPL_AUTH_TOKEN is not configured."
         try:
             self.get_my_team(team_id)
             return True, "Authentication token valid."
         except FPLClientError as e:
+            # Attempt a refresh and retry before declaring auth invalid
+            if self.auth.can_refresh and self.refresh_access_token():
+                try:
+                    self.get_my_team(team_id)
+                    return True, "Authentication token refreshed and valid."
+                except Exception as retry_err:
+                    return False, f"Authentication check failed after refresh: {retry_err}"
             return False, f"Authentication check failed: {e}"
         except Exception as e:
             return False, f"Unexpected error during auth check: {e}"
-
