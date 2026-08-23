@@ -1,12 +1,18 @@
 """Mini-league scanner for Effective Ownership (EO%), rival picks, and Threat Matrix."""
 
+import concurrent.futures
 import logging
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field
 
 from src.api.client import FPLClient
 
 logger = logging.getLogger(__name__)
+
+# In-memory picks cache: {(entry_id, gameweek): (timestamp, picks_data)}
+_PICKS_CACHE: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
+_PICKS_CACHE_TTL = 3600  # 1 hour
 
 
 class ThreatPlayer(BaseModel):
@@ -53,10 +59,29 @@ class LeagueAnalysis(BaseModel):
 
 
 class LeagueScanner:
-    """Scans classic mini-leagues, computes EO% and generates tactical threat matrices."""
+    """Scans classic mini-leagues concurrently, computes EO% and generates tactical threat matrices."""
 
-    def __init__(self, client: FPLClient):
+    def __init__(self, client: FPLClient, max_workers: int = 8):
         self.client = client
+        self.max_workers = max_workers
+
+    def _fetch_manager_picks(self, entry_id: int, gameweek: int) -> Optional[Dict[str, Any]]:
+        """Fetch manager picks with in-memory TTL caching."""
+        cache_key = (entry_id, gameweek)
+        now = time.time()
+        if cache_key in _PICKS_CACHE:
+            ts, data = _PICKS_CACHE[cache_key]
+            if (now - ts) < _PICKS_CACHE_TTL:
+                return data
+
+        try:
+            picks_data = self.client.get_entry_picks(entry_id, gameweek)
+            if picks_data:
+                _PICKS_CACHE[cache_key] = (now, picks_data)
+            return picks_data
+        except Exception as exc:
+            logger.debug(f"Failed to fetch picks for entry {entry_id} GW{gameweek}: {exc}")
+            return None
 
     def scan_league(
         self,
@@ -66,11 +91,10 @@ class LeagueScanner:
         bootstrap_data: Optional[Dict[str, Any]] = None,
     ) -> LeagueAnalysis:
         """
-        Scan all managers in the specified mini-league for the target gameweek.
+        Scan all managers in the specified mini-league concurrently for the target gameweek.
         """
         my_team_set = my_team_ids or set()
 
-        # Fetch bootstrap data if not provided to map player IDs to names/positions
         if not bootstrap_data:
             bootstrap_data = self.client.get_bootstrap_static()
 
@@ -108,6 +132,23 @@ class LeagueScanner:
         captain_counts: Dict[str, int] = {}
         rivals_list: List[RivalManager] = []
 
+        # Concurrent retrieval of rival squad picks
+        manager_entries = [m.get("entry") for m in results if m.get("entry")]
+        picks_results: Dict[int, Optional[Dict[str, Any]]] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(manager_entries) or 1)) as executor:
+            future_to_entry = {
+                executor.submit(self._fetch_manager_picks, entry_id, gameweek): entry_id
+                for entry_id in manager_entries
+            }
+            for future in concurrent.futures.as_completed(future_to_entry):
+                eid = future_to_entry[future]
+                try:
+                    picks_results[eid] = future.result()
+                except Exception as exc:
+                    logger.debug(f"Picks future failed for entry {eid}: {exc}")
+                    picks_results[eid] = None
+
         for manager in results:
             entry_id = manager.get("entry")
             player_name = manager.get("player_name", "Manager")
@@ -123,8 +164,8 @@ class LeagueScanner:
                 total_points=total_points,
             )
 
-            try:
-                picks_data = self.client.get_entry_picks(entry_id, gameweek)
+            picks_data = picks_results.get(entry_id)
+            if picks_data:
                 entry_history = picks_data.get("entry_history", {})
                 rival_summary.event_transfers_cost = entry_history.get("event_transfers_cost", 0)
                 rival_summary.active_chip = picks_data.get("active_chip")
@@ -135,19 +176,13 @@ class LeagueScanner:
                     multiplier = pick.get("multiplier", 1)
                     is_captain = pick.get("is_captain", False)
 
-                    # Ownership counts
                     player_ownership_count[pid] = player_ownership_count.get(pid, 0) + 1
-
-                    # Effective ownership: Starter = 1, Captain = 2, Triple Captain = 3, Benched = 0
                     player_eo_weighted[pid] = player_eo_weighted.get(pid, 0.0) + multiplier
 
                     if is_captain:
                         c_name = elements.get(pid, {}).get("web_name", f"Player {pid}")
                         rival_summary.captain_name = c_name
                         captain_counts[c_name] = captain_counts.get(c_name, 0) + 1
-
-            except Exception as exc:
-                logger.debug(f"Failed to fetch picks for entry {entry_id} GW{gameweek}: {exc}")
 
             rivals_list.append(rival_summary)
 
@@ -206,7 +241,6 @@ class LeagueScanner:
                     risk_upside_note=f"Differential ({eo}% EO). Owned: massive rank gain opportunity.",
                 ))
 
-        # Sort threat lists by EO descending
         shields.sort(key=lambda x: -x.eo_percent)
         vulnerabilities.sort(key=lambda x: -x.eo_percent)
         daggers.sort(key=lambda x: x.eo_percent)

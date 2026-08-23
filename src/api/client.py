@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -187,3 +187,16 @@ class FPLClient:
             json_data=payload,
             authenticated=True,
         )
+
+    def validate_auth(self, team_id: int) -> Tuple[bool, str]:
+        """Verify if authentication token is active and valid for team_id."""
+        if not self.auth.is_authenticated:
+            return False, "FPL_AUTH_TOKEN is not configured."
+        try:
+            self.get_my_team(team_id)
+            return True, "Authentication token valid."
+        except FPLClientError as e:
+            return False, f"Authentication check failed: {e}"
+        except Exception as e:
+            return False, f"Unexpected error during auth check: {e}"
+

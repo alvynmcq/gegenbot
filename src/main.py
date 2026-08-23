@@ -103,9 +103,10 @@ def run_pipeline(
         fplreview_df=fplreview_df,
     )
 
-    # 3. Retrieve current squad and bank
+    # 3. Retrieve current squad, selling prices, and bank
     team_id_str = os.getenv("FPL_TEAM_ID", "").strip()
     current_squad_ids: List[int] = []
+    selling_prices: Optional[Dict[int, float]] = None
     bank_m: float = custom_bank_m
     free_transfers: int = custom_ft
 
@@ -114,14 +115,24 @@ def run_pipeline(
     elif client.auth.is_authenticated and team_id_str:
         try:
             team_id = int(team_id_str)
+            auth_ok, auth_msg = client.validate_auth(team_id)
+            if not auth_ok:
+                logger.warning(f"FPL Authentication warning: {auth_msg}")
+
             logger.info(f"Fetching live squad for Team ID {team_id}...")
             my_team_data = client.get_my_team(team_id)
             picks = my_team_data.get("picks", [])
             current_squad_ids = [p["element"] for p in picks]
+            selling_prices = {
+                p["element"]: float(p.get("selling_price", p.get("now_cost", 50))) / 10.0
+                for p in picks
+            }
             transfers_info = my_team_data.get("transfers", {})
             bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
             free_transfers = transfers_info.get("limit", 1)
-            logger.info(f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}")
+            logger.info(
+                f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
+            )
         except Exception as e:
             logger.warning(f"Failed to fetch live team: {e}. Initializing default squad from top performers.")
 
@@ -133,12 +144,39 @@ def run_pipeline(
         bank_m = 0.5
         free_transfers = 1
 
-    # 4. PuLP MILP Optimization & Automated Chip Evaluation
-    logger.info("Running PuLP MILP solver for 0-transfer, 1-transfer, and 2-transfer moves...")
+    # 4. Mini-League Threat Matrix Scanning (Pre-Optimization for EO-Aware Solving)
+    league_analysis: Optional[LeagueAnalysis] = None
+    eo_weights: Optional[Dict[int, float]] = None
+    league_id_str = os.getenv("LEAGUE_ID", "").strip()
+    if league_id_str:
+        try:
+            league_id = int(league_id_str)
+            logger.info(f"Scanning Mini-League {league_id} for GW{gw_id} Effective Ownership...")
+            scanner = LeagueScanner(client)
+            league_analysis = scanner.scan_league(
+                league_id=league_id,
+                gameweek=gw_id,
+                my_team_ids=set(current_squad_ids),
+                bootstrap_data=bootstrap,
+            )
+            eo_weights = league_analysis.raw_eo
+            logger.info(
+                f"Mini-league scanned: {league_analysis.total_managers} managers | "
+                f"Shields: {len(league_analysis.threat_matrix.shields)} | "
+                f"Vulnerabilities: {len(league_analysis.threat_matrix.vulnerabilities)} | "
+                f"Daggers: {len(league_analysis.threat_matrix.daggers)}"
+            )
+        except Exception as e:
+            logger.warning(f"Mini-league scan failed: {e}")
+
+    # 5. PuLP MILP Optimization & Automated Chip Evaluation
+    logger.info("Running PuLP MILP solver (Multi-Period Horizon, Real Selling Prices & EO Shielding)...")
     opt_result = optimizer.optimize(
         current_squad_ids=current_squad_ids,
         bank_m=bank_m,
         free_transfers=free_transfers,
+        selling_prices=selling_prices,
+        eo_weights=eo_weights,
         current_gw=gw_id,
         evaluate_chips=True,
     )
@@ -146,7 +184,7 @@ def run_pipeline(
     logger.info(f"Generated {len(opt_result.candidates)} candidate options:")
     for idx, cand in enumerate(opt_result.candidates, start=1):
         logger.info(
-            f"  [{idx}] {cand.name} ➔ Net xP: {cand.net_xp:.2f} | Formation: {cand.formation} | Captain: {cand.captain.web_name if cand.captain else 'N/A'}"
+            f"  [{idx}] {cand.name} ➔ Net xP: {cand.net_xp:.2f} | 3-GW xP: {cand.multi_gw_xp:.2f} | Formation: {cand.formation} | Captain: {cand.captain.web_name if cand.captain else 'N/A'}"
         )
 
     # Automated Chip Strategy Evaluation
@@ -180,29 +218,6 @@ def run_pipeline(
         elif not enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
             rec = opt_result.chip_evaluation.recommended_chip
             logger.info(f"💡 Chip recommendation available ({rec}), but ENABLE_AUTO_CHIPS is false.")
-
-    # 5. Mini-League Threat Matrix Scanning
-    league_analysis: Optional[LeagueAnalysis] = None
-    league_id_str = os.getenv("LEAGUE_ID", "").strip()
-    if league_id_str:
-        try:
-            league_id = int(league_id_str)
-            logger.info(f"Scanning Mini-League {league_id} for GW{gw_id} Effective Ownership...")
-            scanner = LeagueScanner(client)
-            league_analysis = scanner.scan_league(
-                league_id=league_id,
-                gameweek=gw_id,
-                my_team_ids=set(current_squad_ids),
-                bootstrap_data=bootstrap,
-            )
-            logger.info(
-                f"Mini-league scanned: {league_analysis.total_managers} managers | "
-                f"Shields: {len(league_analysis.threat_matrix.shields)} | "
-                f"Vulnerabilities: {len(league_analysis.threat_matrix.vulnerabilities)} | "
-                f"Daggers: {len(league_analysis.threat_matrix.daggers)}"
-            )
-        except Exception as e:
-            logger.warning(f"Mini-league scan failed: {e}")
 
     # 6. AI Decision Director Evaluation
     logger.info("Consulting AI Decision Director...")

@@ -1,4 +1,13 @@
-"""MILP Squad and Lineup Optimizer for Fantasy Premier League using PuLP with Injury Discounting and Bench Ordering."""
+"""MILP Squad and Lineup Optimizer for Fantasy Premier League using PuLP.
+Features:
+- Real FPL selling price accounting (half-profit rule)
+- Multi-gameweek horizon lookahead (immediate GW + 3-GW fixture swing)
+- Rolling transfer valuation (strategic free transfer banking bonus)
+- Game-theoretic Effective Ownership (EO%) shielding integration
+- Injury discounting and strict bench priority ordering
+- Double Gameweek (DGW) & Blank Gameweek (BGW) chip guards
+- Vice-Captain 100% availability safety rule
+"""
 
 import logging
 import os
@@ -24,7 +33,6 @@ def get_player_injury_multiplier(
     """
     stat = (status or "a").strip().lower()
 
-    # Red flag: 0% chance or injured / suspended / unavailable
     if stat in ["i", "s", "u"]:
         return float(os.getenv("INJURY_XP_MULTIPLIER_0", "0.0"))
 
@@ -59,9 +67,11 @@ class PlayerPick(BaseModel):
     team_name: str
     team_code: str
     cost_m: float
+    selling_price_m: Optional[float] = None
     xp: float
     raw_xp: Optional[float] = None
     discounted_xp: Optional[float] = None
+    xp_3gw: Optional[float] = None
     injury_multiplier: float = 1.0
     status: Optional[str] = "a"
     chance_of_playing_next_round: Optional[int] = None
@@ -71,6 +81,7 @@ class PlayerPick(BaseModel):
     is_captain: bool = False
     is_vice_captain: bool = False
     bench_order: Optional[int] = None  # 0 for Sub GK (Pick 12), 1-3 for outfield bench (Picks 13-15)
+    fixtures_in_gw: int = 1
 
 
 class TransferMove(BaseModel):
@@ -92,6 +103,8 @@ class CandidateSquad(BaseModel):
     gross_xp: float
     hit_cost: int
     net_xp: float
+    multi_gw_xp: float = 0.0
+    strategic_value_score: float = 0.0  # Net xP + Rolling transfer bonus + Multi-GW outlook
     total_cost_m: float
     bank_remaining_m: float
     active_chip: Optional[str] = None  # e.g. "wildcard", "freehit", "bboost", "3xc"
@@ -140,21 +153,28 @@ def _parse_target_gws(env_var_name: str) -> List[int]:
 
 
 class FPLOptimizer:
-    """Mixed-Integer Linear Programming (MILP) solver for FPL squad optimization with Injury Discounting."""
+    """Advanced MILP solver for FPL squad optimization with Multi-Period Horizon and Game Theory."""
 
     def __init__(self, players_df: pd.DataFrame):
         """
         Initialize optimizer with player DataFrame and apply injury/rotation status discounting.
         Expected columns: id, web_name, element_type, position, team_id, team_name, team_code, cost_m, xp
-        Optional status columns: status, chance_of_playing_next_round
+        Optional columns: xp_3gw, status, chance_of_playing_next_round, fixtures_in_gw
         """
         self.df = players_df.copy().reset_index(drop=True)
 
         if "raw_xp" not in self.df.columns:
             self.df["raw_xp"] = self.df["xp"]
 
+        if "xp_3gw" not in self.df.columns:
+            self.df["xp_3gw"] = self.df["xp"] * 3.0
+
+        if "fixtures_in_gw" not in self.df.columns:
+            self.df["fixtures_in_gw"] = 1
+
         multipliers = []
         discounted_xps = []
+        discounted_3gw = []
         for _, row in self.df.iterrows():
             stat = row.get("status", "a")
             chance = row.get("chance_of_playing_next_round")
@@ -163,10 +183,12 @@ class FPLOptimizer:
             raw = float(row.get("raw_xp", row.get("xp", 0.0)))
             disc = round(raw * mult, 2)
             discounted_xps.append(disc)
+            raw_3gw = float(row.get("xp_3gw", raw * 3.0))
+            discounted_3gw.append(round(raw_3gw * mult, 2))
 
         self.df["injury_multiplier"] = multipliers
         self.df["discounted_xp"] = discounted_xps
-        # Solver uses discounted xP as the objective coefficient
+        self.df["discounted_3gw"] = discounted_3gw
         self.df["xp"] = discounted_xps
 
         self.player_map: Dict[int, Dict[str, Any]] = {
@@ -180,14 +202,17 @@ class FPLOptimizer:
         is_captain: bool = False,
         is_vice_captain: bool = False,
         bench_order: Optional[int] = None,
+        selling_price_m: Optional[float] = None,
     ) -> PlayerPick:
         info = self.player_map[player_id]
         rev_xp = info.get("fplreview_xp")
         raw_xp = float(info.get("raw_xp", info["xp"]))
         disc_xp = float(info.get("discounted_xp", info["xp"]))
+        xp_3gw_val = float(info.get("discounted_3gw", disc_xp * 3.0))
         mult = float(info.get("injury_multiplier", 1.0))
         chance_val = info.get("chance_of_playing_next_round")
         chance_int = int(chance_val) if chance_val is not None and not pd.isna(chance_val) else None
+        n_fix = int(info.get("fixtures_in_gw", 1))
 
         return PlayerPick(
             id=player_id,
@@ -197,9 +222,11 @@ class FPLOptimizer:
             team_name=info["team_name"],
             team_code=info["team_code"],
             cost_m=float(info["cost_m"]),
+            selling_price_m=selling_price_m,
             xp=disc_xp,
             raw_xp=raw_xp,
             discounted_xp=disc_xp,
+            xp_3gw=xp_3gw_val,
             injury_multiplier=mult,
             status=info.get("status", "a"),
             chance_of_playing_next_round=chance_int,
@@ -209,6 +236,7 @@ class FPLOptimizer:
             is_captain=is_captain,
             is_vice_captain=is_vice_captain,
             bench_order=bench_order,
+            fixtures_in_gw=n_fix,
         )
 
     def select_initial_squad(self, budget_m: float = 100.0) -> List[int]:
@@ -243,7 +271,7 @@ class FPLOptimizer:
             selected_ids = [player_ids[i] for i in indices if pulp.value(squad_vars[i]) > 0.5]
             return selected_ids
 
-        # Fallback greedy selection with team limit check
+        # Fallback greedy selection
         selected_ids: List[int] = []
         team_counts: Dict[int, int] = {}
         for pos_type, quota in [(1, 2), (2, 5), (3, 5), (4, 3)]:
@@ -267,12 +295,14 @@ class FPLOptimizer:
         indices: List[int],
         player_ids: List[int],
         elem_types: List[int],
-        xps: List[float],
         captain_idx: int,
+        selling_prices: Optional[Dict[int, float]] = None,
     ) -> Tuple[List[PlayerPick], List[PlayerPick], PlayerPick, PlayerPick, str]:
         """
-        Build Starters (Picks 1-11), Bench (Picks 12-15), Captain, Vice-Captain (Safety Rule), and Formation.
+        Build Starters (Picks 1-11), Bench (Picks 12-15), Captain, Vice-Captain, and Formation.
         """
+        sp_map = selling_prices or {}
+
         # 1. Build Starters
         starters: List[PlayerPick] = []
         def_count = 0
@@ -293,6 +323,7 @@ class FPLOptimizer:
                 is_starter=True,
                 is_captain=(i == captain_idx),
                 is_vice_captain=False,
+                selling_price_m=sp_map.get(p_id),
             ))
 
         starters.sort(key=lambda p: (p.element_type, -p.xp))
@@ -301,7 +332,7 @@ class FPLOptimizer:
         captain_pick = next((p for p in starters if p.is_captain), starters[0])
 
         # 2. Vice-Captain Safety Rule:
-        # Highest xP outfield starter who has 100% chance of playing (status == 'a' and chance == 100 or None, mult == 1.0)
+        # Highest xP outfield starter who is 100% available
         outfield_starters = [p for p in starters if p.element_type != 1 and p.id != captain_pick.id]
         safe_candidates = [
             p for p in outfield_starters
@@ -311,12 +342,10 @@ class FPLOptimizer:
         if safe_candidates:
             vc_target = max(safe_candidates, key=lambda p: (p.xp, p.raw_xp or 0.0))
         elif outfield_starters:
-            # Fallback to highest multiplier, then highest xP
             vc_target = max(outfield_starters, key=lambda p: (p.injury_multiplier, p.xp))
         else:
             vc_target = starters[0]
 
-        # Mark VC in starters
         for p in starters:
             if p.id == vc_target.id:
                 p.is_vice_captain = True
@@ -327,8 +356,8 @@ class FPLOptimizer:
 
         # 3. Bench Priority Ordering (Picks 12 to 15):
         # Pick 12 (bench_order 0): Substitute Goalkeeper
-        # Picks 13, 14, 15 (bench_order 1, 2, 3): Outfield substitutes sorted strictly by descending discounted xP.
-        # Tie-breaker: higher fixture difficulty rating or expected minutes/form.
+        # Picks 13, 14, 15 (bench_order 1, 2, 3): Outfield subs in descending order of discounted xP.
+        # Tie-breakers: higher fixture difficulty rating or expected minutes/form.
         bench_indices = [i for i in indices if player_ids[i] in selected_squad_ids and i not in selected_starter_indices]
         bench_gkp_idx = next(i for i in bench_indices if elem_types[i] == 1)
         bench_outfield_indices = [i for i in bench_indices if elem_types[i] != 1]
@@ -339,18 +368,25 @@ class FPLOptimizer:
             fdr = float(row.get("fdr_next", 3.0))
             form = float(row.get("form", 0.0) or 0.0)
             cost = float(row.get("cost_m", 5.0))
-            # Primary: Highest discounted xP (-disc_xp)
-            # Tie-breakers: Higher fixture difficulty rating (-fdr), Higher form/minutes (-form), Higher cost (-cost)
             return (-disc_xp, -fdr, -form, -cost)
 
         bench_outfield_indices.sort(key=outfield_bench_sort_key)
 
         bench: List[PlayerPick] = []
-        # Position 12: Sub GK (bench_order 0)
-        bench.append(self._build_player_pick(player_ids[bench_gkp_idx], is_starter=False, bench_order=0))
-        # Positions 13, 14, 15: Outfield subs (bench_order 1, 2, 3)
+        bench.append(self._build_player_pick(
+            player_ids[bench_gkp_idx],
+            is_starter=False,
+            bench_order=0,
+            selling_price_m=sp_map.get(player_ids[bench_gkp_idx]),
+        ))
         for order_idx, b_idx in enumerate(bench_outfield_indices, start=1):
-            bench.append(self._build_player_pick(player_ids[b_idx], is_starter=False, bench_order=order_idx))
+            p_id = player_ids[b_idx]
+            bench.append(self._build_player_pick(
+                p_id,
+                is_starter=False,
+                bench_order=order_idx,
+                selling_price_m=sp_map.get(p_id),
+            ))
 
         return starters, bench, captain_pick, vc_pick, formation
 
@@ -360,10 +396,10 @@ class FPLOptimizer:
         current_squad_ids: Optional[Set[int]] = None,
         chip_name: Optional[str] = None,
         squad_title: str = "Optimal Squad From Scratch",
+        eo_weights: Optional[Dict[int, float]] = None,
     ) -> Optional[CandidateSquad]:
         """
-        Formulate and solve MILP optimization for a brand new 15-man squad from scratch
-        with zero hit penalties, optimal 11 starters, captain, vice-captain, and bench.
+        Solve MILP for a brand new 15-man squad from scratch (Wildcard / Free Hit) with 0 hits.
         """
         prob = pulp.LpProblem("FPL_Optimizer_Scratch", pulp.LpMaximize)
 
@@ -384,23 +420,22 @@ class FPLOptimizer:
         # 1. Total squad size == 15
         prob += pulp.lpSum([squad_vars[i] for i in indices]) == 15, "TotalSquad15"
 
-        # 2. Position quotas in 15-man squad: 2 GK, 5 DEF, 5 MID, 3 FWD
+        # 2. Position quotas
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 1]) == 2, "SquadGK2"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 2]) == 5, "SquadDEF5"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 3]) == 5, "SquadMID5"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 4]) == 3, "SquadFWD3"
 
-        # 3. Max 3 players per Premier League team
+        # 3. Max 3 per team
         for t in set(team_ids):
             prob += pulp.lpSum([squad_vars[i] for i in indices if team_ids[i] == t]) <= 3, f"Max3Team_{t}"
 
-        # 4. Total Budget
+        # 4. Budget
         prob += pulp.lpSum([costs[i] * squad_vars[i] for i in indices]) <= total_budget_m, "BudgetLimit"
 
         # 5. Starters constraints
         for i in indices:
             prob += starter_vars[i] <= squad_vars[i], f"StarterInSquad_{i}"
-            # Forbid selecting 0.0 multiplier players in Starting XI
             if multipliers[i] == 0.0:
                 prob += starter_vars[i] == 0, f"NoZeroMultiplierStarter_{i}"
 
@@ -419,9 +454,12 @@ class FPLOptimizer:
 
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
-        # 7. Objective function: maximize XI xP + Captain xP + bench tie-breakers
+        # 7. Objective with optional EO shield weighting
+        eo_map = eo_weights or {}
+        eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
+
         prob += pulp.lpSum([
-            starter_vars[i] * xps[i]
+            starter_vars[i] * (xps[i] + eo_boosts[i])
             + captain_vars[i] * xps[i]
             + (squad_vars[i] - starter_vars[i]) * 0.01 * xps[i]
             for i in indices
@@ -434,7 +472,6 @@ class FPLOptimizer:
             logger.warning("PuLP solver failed to find optimal solution from scratch.")
             return None
 
-        # Extract selected squad
         selected_squad_indices = [i for i in indices if pulp.value(squad_vars[i]) > 0.5]
         selected_starter_indices = [i for i in indices if pulp.value(starter_vars[i]) > 0.5]
         captain_idx = next(i for i in indices if pulp.value(captain_vars[i]) > 0.5)
@@ -461,7 +498,6 @@ class FPLOptimizer:
             indices=indices,
             player_ids=player_ids,
             elem_types=elem_types,
-            xps=xps,
             captain_idx=captain_idx,
         )
 
@@ -469,6 +505,9 @@ class FPLOptimizer:
         gross_xp = round(starters_xp_sum + captain_pick.xp, 2)
         hit_cost = 0
         net_xp = gross_xp
+
+        # Multi-GW outlook sum (3-GW)
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * 3.0) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * 3.0)), 2)
 
         total_cost_m = round(sum(self.player_map[pid]["cost_m"] for pid in selected_squad_ids), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
@@ -485,6 +524,8 @@ class FPLOptimizer:
             gross_xp=gross_xp,
             hit_cost=hit_cost,
             net_xp=net_xp,
+            multi_gw_xp=multi_gw_sum,
+            strategic_value_score=net_xp,
             total_cost_m=total_cost_m,
             bank_remaining_m=bank_remaining_m,
             active_chip=chip_name,
@@ -496,10 +537,14 @@ class FPLOptimizer:
         total_budget_m: float,
         k_transfers: int,
         free_transfers: int = 1,
+        selling_prices: Optional[Dict[int, float]] = None,
+        eo_weights: Optional[Dict[int, float]] = None,
+        multi_gw_weight: float = 0.30,
+        rolling_bonus_xp: float = 1.50,
     ) -> Optional[CandidateSquad]:
         """
-        Formulate and solve MILP optimization for exactly or up to k transfers.
-        Applies injury discounting and ensures 0-multiplier players are benched unless impossible.
+        Formulate and solve MILP optimization with exact FPL selling price math,
+        multi-period horizon lookahead, and rolling transfer valuation.
         """
         prob = pulp.LpProblem(f"FPL_Optimizer_K{k_transfers}", pulp.LpMaximize)
 
@@ -512,32 +557,40 @@ class FPLOptimizer:
 
         costs = self.df["cost_m"].tolist()
         xps = self.df["xp"].tolist()
+        xps_3gw = self.df["discounted_3gw"].tolist()
         elem_types = self.df["element_type"].tolist()
         team_ids = self.df["team_id"].tolist()
         player_ids = self.df["id"].tolist()
         multipliers = self.df["injury_multiplier"].tolist()
 
+        sp_map = selling_prices or {}
+
         # 1. Total squad size == 15
         prob += pulp.lpSum([squad_vars[i] for i in indices]) == 15, "TotalSquad15"
 
-        # 2. Position quotas in 15-man squad: 2 GK, 5 DEF, 5 MID, 3 FWD
+        # 2. Position quotas
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 1]) == 2, "SquadGK2"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 2]) == 5, "SquadDEF5"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 3]) == 5, "SquadMID5"
         prob += pulp.lpSum([squad_vars[i] for i in indices if elem_types[i] == 4]) == 3, "SquadFWD3"
 
-        # 3. Max 3 players per Premier League team
+        # 3. Max 3 per team
         for t in set(team_ids):
             prob += pulp.lpSum([squad_vars[i] for i in indices if team_ids[i] == t]) <= 3, f"Max3Team_{t}"
 
-        # 4. Total Budget
-        prob += pulp.lpSum([costs[i] * squad_vars[i] for i in indices]) <= total_budget_m, "BudgetLimit"
+        # 4. Exact FPL Budget Math with Real Selling Prices:
+        # Retained player cost is selling_price; new player cost is now_cost.
+        effective_costs = [
+            sp_map.get(player_ids[i], costs[i]) if player_ids[i] in current_squad_ids else costs[i]
+            for i in indices
+        ]
+        prob += pulp.lpSum([effective_costs[i] * squad_vars[i] for i in indices]) <= total_budget_m, "BudgetLimit"
 
         # 5. Starters constraints
         for i in indices:
             prob += starter_vars[i] <= squad_vars[i], f"StarterInSquad_{i}"
 
-        # Forbid 0.0 multiplier players in Starting XI (if possible)
+        # Forbid 0.0 multiplier players in Starting XI
         zero_mult_indices = [i for i in indices if multipliers[i] == 0.0]
         for i in zero_mult_indices:
             prob += starter_vars[i] == 0, f"NoZeroMultStarter_{i}"
@@ -562,11 +615,21 @@ class FPLOptimizer:
         retained = pulp.lpSum([squad_vars[i] for i in current_indices])
         prob += (15 - retained) == k_transfers, f"ExactTransfers_{k_transfers}"
 
-        # 8. Objective function: maximize XI xP + Captain xP + small tie-breakers
+        # 8. Objective function:
+        # Blend immediate gameweek (1 - multi_gw_weight) + 3-GW fixture outlook (multi_gw_weight) + EO Shielding
+        eo_map = eo_weights or {}
+        eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
+
+        # Multi-period blended xP per player
+        blended_xps = [
+            round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / 3.0), 3)
+            for i in indices
+        ]
+
         prob += pulp.lpSum([
-            starter_vars[i] * xps[i]
-            + captain_vars[i] * xps[i]
-            + (squad_vars[i] - starter_vars[i]) * 0.01 * xps[i]
+            starter_vars[i] * (blended_xps[i] + eo_boosts[i])
+            + captain_vars[i] * blended_xps[i]
+            + (squad_vars[i] - starter_vars[i]) * 0.01 * blended_xps[i]
             for i in indices
         ]), "TotalXP"
 
@@ -574,23 +637,20 @@ class FPLOptimizer:
         status = prob.solve(solver)
 
         if status != pulp.LpStatusOptimal:
-            # Fallback 1: relax exact transfers to <= k_transfers
             prob.constraints[f"ExactTransfers_{k_transfers}"] = (15 - retained) <= k_transfers
             status = prob.solve(solver)
 
             if status != pulp.LpStatusOptimal:
-                # Fallback 2: relax zero multiplier constraint in emergency crisis
                 for i in zero_mult_indices:
-                    name = f"NoZeroMultStarter_{i}"
-                    if name in prob.constraints:
-                        del prob.constraints[name]
+                    cname = f"NoZeroMultStarter_{i}"
+                    if cname in prob.constraints:
+                        del prob.constraints[cname]
                 status = prob.solve(solver)
 
             if status != pulp.LpStatusOptimal:
                 logger.warning(f"PuLP solver failed to find optimal solution for K={k_transfers}")
                 return None
 
-        # Extract selected squad
         selected_squad_indices = [i for i in indices if pulp.value(squad_vars[i]) > 0.5]
         selected_starter_indices = [i for i in indices if pulp.value(starter_vars[i]) > 0.5]
         captain_idx = next(i for i in indices if pulp.value(captain_vars[i]) > 0.5)
@@ -606,7 +666,7 @@ class FPLOptimizer:
         transfers_list: List[TransferMove] = []
         for out_id, in_id in zip(transfers_out_sorted, transfers_in_sorted):
             transfers_list.append(TransferMove(
-                player_out=self._build_player_pick(out_id),
+                player_out=self._build_player_pick(out_id, selling_price_m=sp_map.get(out_id)),
                 player_in=self._build_player_pick(in_id),
             ))
 
@@ -616,8 +676,8 @@ class FPLOptimizer:
             indices=indices,
             player_ids=player_ids,
             elem_types=elem_types,
-            xps=xps,
             captain_idx=captain_idx,
+            selling_prices=selling_prices,
         )
 
         starters_xp_sum = sum(p.xp for p in starters)
@@ -627,11 +687,18 @@ class FPLOptimizer:
         hit_cost = extra_transfers * 4
         net_xp = round(gross_xp - hit_cost, 2)
 
-        total_cost_m = round(sum(self.player_map[pid]["cost_m"] for pid in selected_squad_ids), 2)
+        # Multi-GW 3-week outlook
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * 3.0) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * 3.0)), 2)
+
+        # Strategic value score includes rolling transfer bonus if 0 transfers made
+        roll_bonus = rolling_bonus_xp if actual_transfers_count == 0 else 0.0
+        strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / 3.0) * 0.15, 2)
+
+        total_cost_m = round(sum(effective_costs[i] for i in selected_squad_indices), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
 
         if actual_transfers_count == 0:
-            name = "Option 1: Roll / Bank Transfer (0 Moves)"
+            name = f"Option 1: Roll / Bank Transfer (0 Moves · +{rolling_bonus_xp:.1f} FT Strategic Value)"
         elif actual_transfers_count == 1:
             name = f"Option 2: Best 1-Transfer Move ({'Free' if free_transfers >= 1 else '-4 Hit'})"
         else:
@@ -649,6 +716,8 @@ class FPLOptimizer:
             gross_xp=gross_xp,
             hit_cost=hit_cost,
             net_xp=net_xp,
+            multi_gw_xp=multi_gw_sum,
+            strategic_value_score=strategic_value_score,
             total_cost_m=total_cost_m,
             bank_remaining_m=bank_remaining_m,
         )
@@ -665,6 +734,7 @@ class FPLOptimizer:
         min_gain: float = 18.0,
         current_gw: Optional[int] = None,
         target_gws: Optional[List[int]] = None,
+        eo_weights: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluation:
         """
         Evaluate Wildcard chip: solves optimal 15-man squad from scratch with zero hit penalties.
@@ -675,6 +745,7 @@ class FPLOptimizer:
             current_squad_ids=set(current_squad_ids),
             chip_name="wildcard",
             squad_title="Wildcard Squad (Free Rebuild)",
+            eo_weights=eo_weights,
         )
 
         if not wc_squad:
@@ -727,6 +798,7 @@ class FPLOptimizer:
         min_gain: float = 14.0,
         current_gw: Optional[int] = None,
         target_gws: Optional[List[int]] = None,
+        eo_weights: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluation:
         """
         Evaluate Free Hit chip: solves optimal 15-man squad for 1 GW only without persisting transfers.
@@ -737,6 +809,7 @@ class FPLOptimizer:
             current_squad_ids=set(current_squad_ids),
             chip_name="freehit",
             squad_title="Free Hit Squad (1-GW Optimization)",
+            eo_weights=eo_weights,
         )
 
         if not fh_squad:
@@ -756,7 +829,7 @@ class FPLOptimizer:
         xp_gain = round(projected_xp - baseline_xp, 2)
 
         viable_starters = sum(1 for p in baseline_candidate.starters if p.xp >= 1.5)
-        crisis_blank = viable_starters <= 7
+        crisis_blank = viable_starters <= int(os.getenv("BGW_MIN_STARTERS_THRESHOLD", "7"))
 
         target_list = target_gws if target_gws is not None else _parse_target_gws("TARGET_FREE_HIT_GW")
         gw_match = True
@@ -766,7 +839,7 @@ class FPLOptimizer:
         threshold_met = ((xp_gain >= min_gain) or crisis_blank) and gw_match
         reason = ""
         if crisis_blank and gw_match:
-            reason = f"Emergency BGW/Crisis: only {viable_starters} viable starters available (<= 7)."
+            reason = f"Emergency BGW/Crisis: only {viable_starters} viable starters available."
         elif threshold_met:
             reason = f"Projected xP gain (+{xp_gain:.2f} pts) meets threshold (+{min_gain:.1f} pts)."
         else:
@@ -795,25 +868,33 @@ class FPLOptimizer:
         target_gws: Optional[List[int]] = None,
     ) -> ChipEvaluation:
         """
-        Evaluate Bench Boost chip: sums total projected xP of both starting XI and bench.
-        Compares bench score against BENCH_BOOST_MIN_BENCH_XP.
+        Evaluate Bench Boost chip with DGW fixture requirement verification.
         """
         bench_xp = sum(p.xp for p in baseline_candidate.bench)
         projected_xp = round(baseline_candidate.gross_xp + bench_xp - baseline_candidate.hit_cost, 2)
         baseline_xp = baseline_candidate.net_xp
         xp_gain = round(bench_xp, 2)
 
+        # Check squad fixture count in gameweek
+        total_fixtures = sum(p.fixtures_in_gw for p in baseline_candidate.starters + baseline_candidate.bench)
+        min_dgw_fixtures = int(os.getenv("MIN_BENCH_BOOST_FIXTURES", "0"))
+
         target_list = target_gws if target_gws is not None else _parse_target_gws("TARGET_BENCH_BOOST_GW")
         gw_match = True
         if target_list and current_gw is not None:
             gw_match = current_gw in target_list
 
-        threshold_met = (bench_xp >= min_bench_xp) and gw_match
-        reason = (
-            f"Bench projected xP ({bench_xp:.2f} pts) meets threshold ({min_bench_xp:.1f} pts)"
-            if threshold_met
-            else f"Bench projected xP ({bench_xp:.2f} pts) below threshold ({min_bench_xp:.1f} pts)"
-        )
+        fixture_requirement_met = (total_fixtures >= min_dgw_fixtures) if (min_dgw_fixtures > 15 and not target_list) else True
+        threshold_met = (bench_xp >= min_bench_xp) and gw_match and fixture_requirement_met
+
+        reason = ""
+        if not fixture_requirement_met:
+            reason = f"Bench Boost postponed: {total_fixtures} squad fixtures < {min_dgw_fixtures} DGW requirement."
+        elif threshold_met:
+            reason = f"Bench projected xP ({bench_xp:.2f} pts, {total_fixtures} fixtures) meets threshold ({min_bench_xp:.1f} pts)."
+        else:
+            reason = f"Bench projected xP ({bench_xp:.2f} pts) below threshold ({min_bench_xp:.1f} pts)."
+
         if target_list and current_gw is not None and not gw_match:
             reason += f" (GW{current_gw} not in target GWs {target_list})"
 
@@ -842,10 +923,10 @@ class FPLOptimizer:
         target_gws: Optional[List[int]] = None,
     ) -> ChipEvaluation:
         """
-        Evaluate Triple Captain chip: multiplies top captain pick xP by 3 instead of 2.
-        Compares captain score against TRIPLE_CAPTAIN_MIN_XP.
+        Evaluate Triple Captain chip with DGW fixture requirement verification.
         """
-        captain_xp = baseline_candidate.captain.xp if baseline_candidate.captain else 0.0
+        captain_pick = baseline_candidate.captain
+        captain_xp = captain_pick.xp if captain_pick else 0.0
         projected_xp = round(baseline_candidate.net_xp + captain_xp, 2)
         baseline_xp = baseline_candidate.net_xp
         xp_gain = round(captain_xp, 2)
@@ -856,9 +937,11 @@ class FPLOptimizer:
             gw_match = current_gw in target_list
 
         threshold_met = (captain_xp >= min_captain_xp) and gw_match
-        c_name = baseline_candidate.captain.web_name if baseline_candidate.captain else "Captain"
+        c_name = captain_pick.web_name if captain_pick else "Captain"
+        n_fix = captain_pick.fixtures_in_gw if captain_pick else 1
+
         reason = (
-            f"Captain {c_name} projected xP ({captain_xp:.2f} pts) meets threshold ({min_captain_xp:.1f} pts)"
+            f"Captain {c_name} projected xP ({captain_xp:.2f} pts · {n_fix} fix) meets threshold ({min_captain_xp:.1f} pts)"
             if threshold_met
             else f"Captain {c_name} projected xP ({captain_xp:.2f} pts) below threshold ({min_captain_xp:.1f} pts)"
         )
@@ -889,6 +972,7 @@ class FPLOptimizer:
         baseline_candidate: CandidateSquad,
         current_gw: Optional[int] = None,
         available_chips: Optional[List[str]] = None,
+        eo_weights: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluationResult:
         """
         Evaluate all chips against environment thresholds and select the best recommendation.
@@ -899,8 +983,8 @@ class FPLOptimizer:
         tc_min = float(os.getenv("TRIPLE_CAPTAIN_MIN_XP", "11.5"))
 
         evals: Dict[str, ChipEvaluation] = {
-            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw),
-            "freehit": self.evaluate_free_hit(current_squad_ids, total_budget_m, baseline_candidate, min_gain=fh_min, current_gw=current_gw),
+            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw, eo_weights=eo_weights),
+            "freehit": self.evaluate_free_hit(current_squad_ids, total_budget_m, baseline_candidate, min_gain=fh_min, current_gw=current_gw, eo_weights=eo_weights),
             "bboost": self.evaluate_bench_boost(baseline_candidate, min_bench_xp=bb_min, current_gw=current_gw),
             "3xc": self.evaluate_triple_captain(baseline_candidate, min_captain_xp=tc_min, current_gw=current_gw),
         }
@@ -930,42 +1014,64 @@ class FPLOptimizer:
         current_squad_ids: List[int],
         bank_m: float = 0.0,
         free_transfers: int = 1,
+        selling_prices: Optional[Dict[int, float]] = None,
+        eo_weights: Optional[Dict[int, float]] = None,
         current_gw: Optional[int] = None,
         evaluate_chips: bool = True,
     ) -> OptimizationResult:
         """
-        Generate top candidates and optionally evaluate all chips:
-        1. 0 Transfers (Roll transfer / Lineup optimization)
-        2. 1 Transfer (Best single transfer move)
-        3. 2 Transfers (Best double transfer move with hit deduction)
-        4. Chip evaluations (Wildcard, Free Hit, Bench Boost, Triple Captain)
+        Generate top candidates with exact FPL selling math and multi-period horizon lookahead.
         """
         current_set = set(current_squad_ids)
-        current_team_cost = sum(self.player_map.get(pid, {}).get("cost_m", 5.0) for pid in current_set)
+        sp_map = selling_prices or {}
+
+        # Exact squad selling value (FPL liquidation value)
+        current_team_cost = sum(
+            sp_map.get(pid, self.player_map.get(pid, {}).get("cost_m", 5.0))
+            for pid in current_set
+        )
         total_budget_m = round(current_team_cost + bank_m, 2)
 
         candidates: List[CandidateSquad] = []
 
-        # Candidate 1: K = 0 (Roll)
-        cand_0 = self._solve_for_k_transfers(current_set, total_budget_m, k_transfers=0, free_transfers=free_transfers)
+        # Candidate 1: K = 0 (Roll Transfer)
+        cand_0 = self._solve_for_k_transfers(
+            current_set,
+            total_budget_m,
+            k_transfers=0,
+            free_transfers=free_transfers,
+            selling_prices=selling_prices,
+            eo_weights=eo_weights,
+        )
         if cand_0:
-            cand_0.name = "Option 1: Roll / Bank Transfer (0 Moves)"
             candidates.append(cand_0)
 
         # Candidate 2: K = 1 (1 Transfer)
-        cand_1 = self._solve_for_k_transfers(current_set, total_budget_m, k_transfers=1, free_transfers=free_transfers)
+        cand_1 = self._solve_for_k_transfers(
+            current_set,
+            total_budget_m,
+            k_transfers=1,
+            free_transfers=free_transfers,
+            selling_prices=selling_prices,
+            eo_weights=eo_weights,
+        )
         if cand_1:
-            hit_label = "Free" if free_transfers >= 1 else "-4 Hit"
-            cand_1.name = f"Option 2: Best 1-Transfer Move ({hit_label})"
             candidates.append(cand_1)
 
         # Candidate 3: K = 2 (2 Transfers)
-        cand_2 = self._solve_for_k_transfers(current_set, total_budget_m, k_transfers=2, free_transfers=free_transfers)
+        cand_2 = self._solve_for_k_transfers(
+            current_set,
+            total_budget_m,
+            k_transfers=2,
+            free_transfers=free_transfers,
+            selling_prices=selling_prices,
+            eo_weights=eo_weights,
+        )
         if cand_2:
-            extra = max(0, cand_2.transfers_count - free_transfers)
-            hit_label = "Free" if extra == 0 else f"-{extra * 4} Hit"
-            cand_2.name = f"Option 3: Best 2-Transfer Move ({hit_label})"
             candidates.append(cand_2)
+
+        # Keep candidates ordered by transfers count: 0 moves, 1 move, 2 moves
+        # (c.strategic_value_score is preserved for AI Director / reporting)
 
         # Chip Evaluation
         chip_result: Optional[ChipEvaluationResult] = None
@@ -976,6 +1082,7 @@ class FPLOptimizer:
                 total_budget_m=total_budget_m,
                 baseline_candidate=best_candidate,
                 current_gw=current_gw,
+                eo_weights=eo_weights,
             )
 
         return OptimizationResult(

@@ -1119,4 +1119,63 @@ def test_vice_captain_safety_rule(mock_bootstrap_data, mock_fixtures_data):
     assert vc.chance_of_playing_next_round in (100, None)
 
 
+# ==========================================
+# 10. Real Selling Prices & Multi-Period Lookahead Tests
+# ==========================================
+
+def test_selling_price_budget_constraint(mock_bootstrap_data, mock_fixtures_data):
+    """Test optimizer accounts for actual selling prices instead of inflated market costs."""
+    players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+    optimizer = FPLOptimizer(players_df)
+    squad_ids = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
+
+    # Assume players have lower selling prices (e.g. 0.5m less than now_cost)
+    selling_prices = {pid: optimizer.player_map[pid]["cost_m"] - 0.5 for pid in squad_ids}
+
+    opt_result = optimizer.optimize(
+        current_squad_ids=squad_ids,
+        bank_m=0.2,
+        free_transfers=1,
+        selling_prices=selling_prices,
+        evaluate_chips=False,
+    )
+
+    cand = opt_result.candidates[0]
+    expected_budget = sum(selling_prices.values()) + 0.2
+    assert opt_result.current_team_value_m == round(sum(selling_prices.values()), 2)
+    assert cand.bank_remaining_m >= 0.0
+
+
+def test_multi_period_and_rolling_bonus(mock_bootstrap_data, mock_fixtures_data):
+    """Test candidate squads compute 3-GW multi-period sums and rolling transfer strategic bonuses."""
+    players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+    optimizer = FPLOptimizer(players_df)
+    squad_ids = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
+
+    opt_result = optimizer.optimize(
+        current_squad_ids=squad_ids,
+        bank_m=1.0,
+        free_transfers=1,
+        evaluate_chips=False,
+    )
+
+    cand_0 = opt_result.candidates[0]  # 0 transfers
+    assert cand_0.transfers_count == 0
+    assert cand_0.multi_gw_xp > 0
+    assert cand_0.strategic_value_score > cand_0.net_xp  # Has rolling strategic bonus added
+
+
+def test_validate_auth_method():
+    """Test FPLClient validate_auth reporting."""
+    from src.api.client import FPLClient
+    from src.api.auth import FPLAuth
+
+    # Unauthenticated client
+    client_no_auth = FPLClient(auth=FPLAuth(token=""))
+    ok, msg = client_no_auth.validate_auth(12345)
+    assert ok is False
+    assert "FPL_AUTH_TOKEN is not configured" in msg
+
+
+
 
