@@ -70,6 +70,32 @@ def get_active_gameweek(events: List[Dict[str, Any]]) -> tuple[int, str, bool]:
     return 1, "", True
 
 
+def get_latest_live_gameweek(events: List[Dict[str, Any]]) -> Optional[int]:
+    """
+    Identify the most recent gameweek whose deadline has passed (picks are publicly available).
+    Returns None if no gameweek deadline has passed yet in the season (pre-season).
+    """
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    latest_gw: Optional[int] = None
+
+    for ev in events:
+        deadline_str = ev.get("deadline_time", "")
+        if deadline_str:
+            try:
+                deadline_dt = datetime.datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+                if deadline_dt <= now_utc:
+                    latest_gw = ev.get("id")
+            except Exception:
+                pass
+
+    if latest_gw is None:
+        for ev in events:
+            if ev.get("is_previous") or (ev.get("is_current") and ev.get("finished")):
+                latest_gw = ev.get("id")
+
+    return latest_gw
+
+
 def _build_competitive_context(
     entry_history: Dict[str, Any],
     rivals: Optional[List[Dict[str, Any]]] = None,
@@ -355,11 +381,18 @@ def run_pipeline(
     if league_id_str:
         try:
             league_id = int(league_id_str)
-            logger.info(f"Scanning Mini-League {league_id} for GW{gw_id} Effective Ownership...")
+            # Before target GW deadline, target GW picks are unpublished (return 404).
+            # Scan the latest completed/live gameweek to assess rival squads.
+            scan_gw = get_latest_live_gameweek(events)
+            if scan_gw is not None:
+                logger.info(f"Scanning Mini-League {league_id} using GW{scan_gw} picks for Effective Ownership...")
+            else:
+                logger.info(f"Scanning Mini-League {league_id} standings (Pre-GW1, no picks available yet)...")
+
             scanner = LeagueScanner(client)
             league_analysis = scanner.scan_league(
                 league_id=league_id,
-                gameweek=gw_id,
+                gameweek=scan_gw,
                 my_team_ids=set(current_squad_ids),
                 bootstrap_data=bootstrap,
             )
@@ -613,12 +646,14 @@ def run_pipeline(
     return output_payload
 
 
-def run_post_deadline_intel(client: FPLClient):
+def run_post_deadline_intel(client: FPLClient, target_gw: Optional[int] = None):
     """Run post-deadline mini-league scanner and send intelligence briefing to Telegram."""
     logger.info("Running post-deadline mini-league intelligence scan...")
     bootstrap = client.get_bootstrap_static()
     events = bootstrap.get("events", [])
-    gw_id, _, _ = get_active_gameweek(events)
+    gw_id = target_gw or get_latest_live_gameweek(events)
+    if not gw_id:
+        gw_id, _, _ = get_active_gameweek(events)
 
     league_id_str = os.getenv("LEAGUE_ID", "").strip()
     if not league_id_str:
@@ -706,7 +741,7 @@ def run_daemon(client: FPLClient):
             # Trigger T+5m Post-Deadline Scan
             if -180 <= delta_minutes <= -5 and gw_id not in post_scanned_gameweeks:
                 logger.info(f"📡 Gameweek {gw_id} underway (+5m passed deadline). Triggering post-deadline scanner...")
-                run_post_deadline_intel(client)
+                run_post_deadline_intel(client, target_gw=gw_id)
                 post_scanned_gameweeks.add(gw_id)
 
             # Adaptive sleep: sleep faster near deadline, slower when days away

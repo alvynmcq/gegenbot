@@ -162,3 +162,18 @@ def test_validate_auth_self_healing(tmp_path):
             assert ok is True
             assert "Authentication token refreshed and valid" in msg
             assert mock_refresh.call_count == 1
+
+
+def test_http_404_fast_fail_no_retry():
+    """Test HTTP 404 immediately raises FPLClientError without retrying or backoff."""
+    client = FPLClient()
+    resp_404 = MagicMock()
+    resp_404.status_code = 404
+
+    with patch.object(client.session, "request", return_value=resp_404) as mock_req:
+        with pytest.raises(FPLClientError, match="Resource not found \\(404\\)"):
+            client._request("GET", "entry/872480/event/2/picks/", max_retries=3)
+
+        # Ensure it fast-failed on attempt 1 without wasting retries
+        assert mock_req.call_count == 1
+

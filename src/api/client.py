@@ -214,6 +214,15 @@ class FPLClient:
                         f"Authentication failed ({response.status_code}): Ensure FPL_AUTH_TOKEN is valid."
                     )
 
+                # Fast-fail non-retryable 4xx client errors (404 not found, 400 bad request, etc.)
+                if response.status_code == 404:
+                    logger.debug(f"Resource not found (404) for {url}")
+                    raise FPLClientError(f"Resource not found (404) for {url}")
+
+                if 400 <= response.status_code < 500:
+                    logger.warning(f"Client error ({response.status_code}) on {url}: {response.text}")
+                    raise FPLClientError(f"Client error ({response.status_code}) for {url}")
+
                 response.raise_for_status()
                 return response.json()
 

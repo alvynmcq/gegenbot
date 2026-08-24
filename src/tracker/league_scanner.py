@@ -50,7 +50,7 @@ class LeagueAnalysis(BaseModel):
     """Comprehensive mini-league scanning analysis."""
     league_id: int
     league_name: str
-    gameweek: int
+    gameweek: Optional[int] = None
     total_managers: int
     rivals: List[RivalManager] = Field(default_factory=list)
     captain_distribution: Dict[str, int] = Field(default_factory=dict)
@@ -65,8 +65,11 @@ class LeagueScanner:
         self.client = client
         self.max_workers = max_workers
 
-    def _fetch_manager_picks(self, entry_id: int, gameweek: int) -> Optional[Dict[str, Any]]:
+    def _fetch_manager_picks(self, entry_id: int, gameweek: Optional[int]) -> Optional[Dict[str, Any]]:
         """Fetch manager picks with in-memory TTL caching."""
+        if not gameweek or gameweek < 1:
+            return None
+
         cache_key = (entry_id, gameweek)
         now = time.time()
         if cache_key in _PICKS_CACHE:
@@ -86,14 +89,16 @@ class LeagueScanner:
     def scan_league(
         self,
         league_id: int,
-        gameweek: int,
+        gameweek: Optional[int] = None,
         my_team_ids: Optional[Set[int]] = None,
         bootstrap_data: Optional[Dict[str, Any]] = None,
     ) -> LeagueAnalysis:
         """
         Scan all managers in the specified mini-league concurrently for the target gameweek.
+        If gameweek is None or <= 0, scans standings without fetching manager picks.
         """
         my_team_set = my_team_ids or set()
+        gw = gameweek or 0
 
         if not bootstrap_data:
             bootstrap_data = self.client.get_bootstrap_static()
@@ -110,7 +115,7 @@ class LeagueScanner:
             return LeagueAnalysis(
                 league_id=league_id,
                 league_name="Mini-League",
-                gameweek=gameweek,
+                gameweek=gw,
                 total_managers=0,
             )
 
@@ -122,7 +127,7 @@ class LeagueScanner:
             return LeagueAnalysis(
                 league_id=league_id,
                 league_name=league_name,
-                gameweek=gameweek,
+                gameweek=gw,
                 total_managers=0,
             )
 
@@ -132,22 +137,22 @@ class LeagueScanner:
         captain_counts: Dict[str, int] = {}
         rivals_list: List[RivalManager] = []
 
-        # Concurrent retrieval of rival squad picks
-        manager_entries = [m.get("entry") for m in results if m.get("entry")]
+        # Concurrent retrieval of rival squad picks (only when a valid gameweek is requested)
         picks_results: Dict[int, Optional[Dict[str, Any]]] = {}
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(manager_entries) or 1)) as executor:
-            future_to_entry = {
-                executor.submit(self._fetch_manager_picks, entry_id, gameweek): entry_id
-                for entry_id in manager_entries
-            }
-            for future in concurrent.futures.as_completed(future_to_entry):
-                eid = future_to_entry[future]
-                try:
-                    picks_results[eid] = future.result()
-                except Exception as exc:
-                    logger.debug(f"Picks future failed for entry {eid}: {exc}")
-                    picks_results[eid] = None
+        if gameweek and gameweek >= 1:
+            manager_entries = [m.get("entry") for m in results if m.get("entry")]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(manager_entries) or 1)) as executor:
+                future_to_entry = {
+                    executor.submit(self._fetch_manager_picks, entry_id, gameweek): entry_id
+                    for entry_id in manager_entries
+                }
+                for future in concurrent.futures.as_completed(future_to_entry):
+                    eid = future_to_entry[future]
+                    try:
+                        picks_results[eid] = future.result()
+                    except Exception as exc:
+                        logger.debug(f"Picks future failed for entry {eid}: {exc}")
+                        picks_results[eid] = None
 
         for manager in results:
             entry_id = manager.get("entry")

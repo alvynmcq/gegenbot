@@ -38,7 +38,7 @@ class AIDirector:
         model: Optional[str] = None,
         timeout: int = 15,
     ):
-        self.api_key = api_key or os.getenv("LLM_API_KEY", "").strip()
+        self.api_key = api_key if api_key is not None else os.getenv("LLM_API_KEY", "").strip()
         self.base_url = (base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
         self.timeout = timeout

@@ -581,6 +581,56 @@ def test_league_scanner_threat_matrix(mock_bootstrap_data):
         assert 25 in vuln_ids
 
 
+def test_get_latest_live_gameweek():
+    """Test get_latest_live_gameweek identifies past deadlines and handles pre-season."""
+    from src.main import get_latest_live_gameweek
+
+    # Case 1: GW1 deadline in past, GW2 deadline in future
+    events_in_season = [
+        {"id": 1, "deadline_time": "2020-01-01T10:00:00Z", "finished": True, "is_previous": True},
+        {"id": 2, "deadline_time": "2099-01-01T10:00:00Z", "finished": False, "is_next": True},
+    ]
+    assert get_latest_live_gameweek(events_in_season) == 1
+
+    # Case 2: Pre-season (all deadlines in future)
+    events_preseason = [
+        {"id": 1, "deadline_time": "2099-01-01T10:00:00Z", "finished": False, "is_next": True},
+        {"id": 2, "deadline_time": "2099-01-08T10:00:00Z", "finished": False, "is_next": False},
+    ]
+    assert get_latest_live_gameweek(events_preseason) is None
+
+
+def test_league_scanner_preseason_without_picks(mock_bootstrap_data):
+    """Test mini-league scanning before season starts (gameweek=None) scans standings without pick errors."""
+    mock_standings = {
+        "league": {"id": 999, "name": "Preseason League"},
+        "standings": {
+            "results": [
+                {"entry": 101, "player_name": "Alice", "entry_name": "Alice XI", "rank": 1, "total": 0},
+                {"entry": 102, "player_name": "Bob", "entry_name": "Bob FC", "rank": 2, "total": 0},
+            ]
+        },
+    }
+    client = FPLClient()
+
+    with patch.object(client, "get_league_standings", return_value=mock_standings), \
+         patch.object(client, "get_entry_picks") as mock_picks:
+
+        scanner = LeagueScanner(client)
+        analysis = scanner.scan_league(
+            league_id=999,
+            gameweek=None,
+            my_team_ids={1, 2},
+            bootstrap_data=mock_bootstrap_data,
+        )
+
+        assert analysis.total_managers == 2
+        assert len(analysis.rivals) == 2
+        assert analysis.raw_eo == {}
+        # Ensure get_entry_picks was NOT called in pre-season mode
+        mock_picks.assert_not_called()
+
+
 # ==========================================
 # 5. AI Director & Fallback Tests
 # ==========================================
