@@ -42,16 +42,31 @@ load_dotenv()
 
 
 def get_active_gameweek(events: List[Dict[str, Any]]) -> tuple[int, str, bool]:
-    """Identify current or next gameweek and its deadline."""
+    """Identify the next actionable gameweek and its deadline."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    # 1. Look for event marked is_next (the upcoming editable gameweek)
     for ev in events:
         if ev.get("is_next"):
             return ev.get("id", 1), ev.get("deadline_time", ""), True
+
+    # 2. Check if is_current is still before its deadline
+    for ev in events:
         if ev.get("is_current") and not ev.get("finished"):
-            return ev.get("id", 1), ev.get("deadline_time", ""), False
-    # Fallback to first unfinished or event 1
+            deadline_str = ev.get("deadline_time", "")
+            if deadline_str:
+                try:
+                    deadline_dt = datetime.datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+                    if deadline_dt > now_utc:
+                        return ev.get("id", 1), deadline_str, False
+                except Exception:
+                    pass
+
+    # 3. Fallback to first unfinished event with a future deadline
     for ev in events:
         if not ev.get("finished", False):
             return ev.get("id", 1), ev.get("deadline_time", ""), True
+
     return 1, "", True
 
 
