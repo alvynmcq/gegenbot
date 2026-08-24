@@ -88,6 +88,11 @@ class TelegramNotifier:
 
         active_chip_line = f"⚡ *Active Chip:* `{cand.active_chip.upper()}`\n" if cand.active_chip else ""
 
+        news_block = ""
+        if decision.news_alerts:
+            alerts_str = "\n".join([f"• 🚨 {a}" for a in decision.news_alerts[:3]])
+            news_block = f"📰 *PRESS CONFERENCE & NEWS ALERTS:*\n{alerts_str}\n\n"
+
         message = (
             f"{status_tag}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -98,6 +103,7 @@ class TelegramNotifier:
             f"{active_chip_line}"
             f"{tx_block}\n"
             f"💰 *Bank Remaining:* £{cand.bank_remaining_m:.1f}m | *Hit Cost:* -{cand.hit_cost} pts\n\n"
+            f"{news_block}"
             f"🧠 *AI DIRECTOR RATIONALE:*\n"
             f"_{decision.rationale}_\n\n"
             f"👥 *STARTING XI ({cand.formation}):*\n"

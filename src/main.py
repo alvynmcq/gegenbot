@@ -25,6 +25,7 @@ from src.engine.metrics import calculate_player_metrics
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
 from src.notifier.telegram import TelegramNotifier
 from src.tracker.league_scanner import LeagueAnalysis, LeagueScanner
+from src.tracker.news_tracker import NewsTracker
 
 # Configure logging
 logging.basicConfig(
@@ -219,10 +220,29 @@ def run_pipeline(
             rec = opt_result.chip_evaluation.recommended_chip
             logger.info(f"💡 Chip recommendation available ({rec}), but ENABLE_AUTO_CHIPS is false.")
 
-    # 6. AI Decision Director Evaluation
+    # 6. Gather News Intelligence & AI Decision Director Evaluation
+    logger.info("Gathering live press conference & news intelligence...")
+    news_tracker = NewsTracker()
+    focal_player_ids: Set[int] = set()
+    for cand in opt_result.candidates:
+        if cand.captain:
+            focal_player_ids.add(cand.captain.id)
+        if cand.vice_captain:
+            focal_player_ids.add(cand.vice_captain.id)
+        for t in cand.transfers:
+            focal_player_ids.add(t.player_in.id)
+            focal_player_ids.add(t.player_out.id)
+        for s in cand.starters:
+            focal_player_ids.add(s.id)
+
+    news_intel = news_tracker.extract_focal_players_from_bootstrap(
+        bootstrap_data=bootstrap,
+        focal_player_ids=focal_player_ids,
+    )
+
     logger.info("Consulting AI Decision Director...")
     director = AIDirector()
-    decision = director.evaluate_and_decide(opt_result, league_analysis)
+    decision = director.evaluate_and_decide(opt_result, league_analysis, news_intel)
 
     # Attach active chip to final selected candidate if triggered
     if active_chip:
@@ -246,6 +266,10 @@ def run_pipeline(
     logger.info(f"Armband: {decision.captain_name} (C) | Vice: {decision.vice_captain_name} (VC)")
     logger.info(f"Projected Net xP: {decision.projected_net_xp:.2f}")
     logger.info(f"Director Rationale: \"{decision.rationale}\"")
+    if decision.news_alerts:
+        logger.info("Press Conference / News Alerts:")
+        for alert in decision.news_alerts:
+            logger.info(f"  🚨 {alert}")
     logger.info("=" * 60)
 
     # 7. Live Execution (if requested)
@@ -332,6 +356,7 @@ def run_pipeline(
         "active_chip": active_chip,
         "chip_triggered": triggered_chip_eval,
         "league_analysis": league_analysis.model_dump() if league_analysis else None,
+        "news_intelligence": [v.model_dump() for v in news_intel.values()] if news_intel else [],
     }
 
     with open(state_file, "w", encoding="utf-8") as f:

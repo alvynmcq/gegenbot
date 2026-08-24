@@ -389,6 +389,34 @@
             </div>
         </div>
 
+        {% if data.decision.news_alerts and data.decision.news_alerts|length > 0 %}
+        <!-- Breaking Press Conference & News Alerts Card -->
+        <div class="bg-slate-900/90 border border-amber-500/30 rounded-2xl p-5 shadow-lg relative overflow-hidden">
+            <div class="flex items-start space-x-3">
+                <div class="p-2.5 bg-amber-500/10 rounded-xl border border-amber-500/20 text-xl shrink-0">
+                    📰
+                </div>
+                <div class="space-y-2 flex-1">
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-xs font-bold text-amber-400 tracking-wider uppercase flex items-center gap-1.5">
+                            <span>Press Conference & Injury Intelligence</span>
+                            <span class="bg-amber-950 text-amber-300 text-[10px] px-2 py-0.5 rounded border border-amber-800/60 font-mono">Live Grounding</span>
+                        </h3>
+                        <span class="text-[11px] text-slate-400 font-mono">{{ data.decision.news_alerts|length }} active alert(s)</span>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                        {% for alert in data.decision.news_alerts %}
+                        <div class="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-300 flex items-start space-x-2">
+                            <span class="text-amber-400 mt-0.5">⚠️</span>
+                            <span class="leading-relaxed">{{ alert }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
         <!-- Main Layout: Pitch on Left, Threat Matrix / Leagues on Right -->
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
             
