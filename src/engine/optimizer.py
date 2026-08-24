@@ -585,10 +585,12 @@ class FPLOptimizer:
         eo_weights: Optional[Dict[int, float]] = None,
         multi_gw_weight: float = 0.30,
         rolling_bonus_xp: float = 1.50,
+        excluded_transfers_in: Optional[List[Set[int]]] = None,
     ) -> Optional[CandidateSquad]:
         """
         Formulate and solve MILP optimization with exact FPL selling price math,
         multi-period horizon lookahead, and rolling transfer valuation.
+        Supports integer cuts (no-good cuts) to exclude specific incoming transfer combinations.
         """
         prob = pulp.LpProblem(f"FPL_Optimizer_K{k_transfers}", pulp.LpMaximize)
 
@@ -623,7 +625,6 @@ class FPLOptimizer:
             prob += pulp.lpSum([squad_vars[i] for i in indices if team_ids[i] == t]) <= 3, f"Max3Team_{t}"
 
         # 4. Exact FPL Budget Math with Real Selling Prices:
-        # Retained player cost is selling_price; new player cost is now_cost.
         effective_costs = [
             sp_map.get(player_ids[i], costs[i]) if player_ids[i] in current_squad_ids else costs[i]
             for i in indices
@@ -659,12 +660,22 @@ class FPLOptimizer:
         retained = pulp.lpSum([squad_vars[i] for i in current_indices])
         prob += (15 - retained) == k_transfers, f"ExactTransfers_{k_transfers}"
 
-        # 8. Objective function:
-        # Blend immediate gameweek (1 - multi_gw_weight) + 3-GW fixture outlook (multi_gw_weight) + EO Shielding
+        # 8. Exclusion cuts for generating diverse alternative candidate moves
+        if excluded_transfers_in:
+            for cut_idx, excl_set in enumerate(excluded_transfers_in):
+                if not excl_set:
+                    continue
+                excl_indices = [i for i in indices if player_ids[i] in excl_set]
+                if excl_indices:
+                    prob += (
+                        pulp.lpSum([squad_vars[i] for i in excl_indices]) <= len(excl_indices) - 1,
+                        f"ExclTransfersInCut_{cut_idx}",
+                    )
+
+        # 9. Objective function:
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
-        # Multi-period blended xP per player discounted with horizon decay factor
         decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
         blended_xps = [
             round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / decay_sum), 3)
@@ -692,7 +703,7 @@ class FPLOptimizer:
                 status = _solve_problem(prob)
 
             if status != pulp.LpStatusOptimal:
-                logger.warning(f"PuLP solver failed to find optimal solution for K={k_transfers}")
+                logger.debug(f"PuLP solver found no feasible alternative for K={k_transfers}")
                 return None
 
         selected_squad_indices = [i for i in indices if pulp.value(squad_vars[i]) > 0.5]
@@ -731,10 +742,8 @@ class FPLOptimizer:
         hit_cost = extra_transfers * 4
         net_xp = round(gross_xp - hit_cost, 2)
 
-        # Multi-GW 3-week decayed outlook sum
         multi_gw_sum = round(sum(p.xp_3gw or (p.xp * decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * decay_sum)), 2)
 
-        # Strategic value score includes rolling transfer bonus if 0 transfers made
         roll_bonus = rolling_bonus_xp if actual_transfers_count == 0 else 0.0
         strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / decay_sum) * 0.15, 2)
 
@@ -744,9 +753,9 @@ class FPLOptimizer:
         if actual_transfers_count == 0:
             name = f"Option 1: Roll / Bank Transfer (0 Moves · +{rolling_bonus_xp:.1f} FT Strategic Value)"
         elif actual_transfers_count == 1:
-            name = f"Option 2: Best 1-Transfer Move ({'Free' if free_transfers >= 1 else '-4 Hit'})"
+            name = f"Best 1-Transfer Move ({'Free' if free_transfers >= 1 else '-4 Hit'})"
         else:
-            name = f"Option 3: Best {actual_transfers_count}-Transfer Move (-{hit_cost} Hit)"
+            name = f"Best {actual_transfers_count}-Transfer Move (-{hit_cost} Hit)"
 
         return CandidateSquad(
             name=name,
@@ -872,23 +881,17 @@ class FPLOptimizer:
         baseline_xp = baseline_candidate.net_xp
         xp_gain = round(projected_xp - baseline_xp, 2)
 
-        viable_starters = sum(1 for p in baseline_candidate.starters if p.xp >= 1.5)
-        crisis_blank = viable_starters <= int(os.getenv("BGW_MIN_STARTERS_THRESHOLD", "7"))
-
         target_list = target_gws if target_gws is not None else _parse_target_gws("TARGET_FREE_HIT_GW")
         gw_match = True
         if target_list and current_gw is not None:
             gw_match = current_gw in target_list
 
-        threshold_met = ((xp_gain >= min_gain) or crisis_blank) and gw_match
-        reason = ""
-        if crisis_blank and gw_match:
-            reason = f"Emergency BGW/Crisis: only {viable_starters} viable starters available."
-        elif threshold_met:
-            reason = f"Projected xP gain (+{xp_gain:.2f} pts) meets threshold (+{min_gain:.1f} pts)."
-        else:
-            reason = f"Gain (+{xp_gain:.2f} pts) below threshold (+{min_gain:.1f} pts)."
-
+        threshold_met = (xp_gain >= min_gain) and gw_match
+        reason = (
+            f"Projected xP gain (+{xp_gain:.2f} pts) vs standard solve (+{min_gain:.1f} pts threshold)"
+            if threshold_met
+            else f"Gain (+{xp_gain:.2f} pts) below threshold (+{min_gain:.1f} pts)"
+        )
         if target_list and current_gw is not None and not gw_match:
             reason += f" (GW{current_gw} not in target GWs {target_list})"
 
@@ -912,33 +915,24 @@ class FPLOptimizer:
         target_gws: Optional[List[int]] = None,
     ) -> ChipEvaluation:
         """
-        Evaluate Bench Boost chip with DGW fixture requirement verification.
+        Evaluate Bench Boost chip: compares bench sum xP against BENCH_BOOST_MIN_BENCH_XP.
         """
         bench_xp = sum(p.xp for p in baseline_candidate.bench)
-        projected_xp = round(baseline_candidate.gross_xp + bench_xp - baseline_candidate.hit_cost, 2)
         baseline_xp = baseline_candidate.net_xp
+        projected_xp = round(baseline_xp + bench_xp, 2)
         xp_gain = round(bench_xp, 2)
-
-        # Check squad fixture count in gameweek
-        total_fixtures = sum(p.fixtures_in_gw for p in baseline_candidate.starters + baseline_candidate.bench)
-        min_dgw_fixtures = int(os.getenv("MIN_BENCH_BOOST_FIXTURES", "0"))
 
         target_list = target_gws if target_gws is not None else _parse_target_gws("TARGET_BENCH_BOOST_GW")
         gw_match = True
         if target_list and current_gw is not None:
             gw_match = current_gw in target_list
 
-        fixture_requirement_met = (total_fixtures >= min_dgw_fixtures) if (min_dgw_fixtures > 15 and not target_list) else True
-        threshold_met = (bench_xp >= min_bench_xp) and gw_match and fixture_requirement_met
-
-        reason = ""
-        if not fixture_requirement_met:
-            reason = f"Bench Boost postponed: {total_fixtures} squad fixtures < {min_dgw_fixtures} DGW requirement."
-        elif threshold_met:
-            reason = f"Bench projected xP ({bench_xp:.2f} pts, {total_fixtures} fixtures) meets threshold ({min_bench_xp:.1f} pts)."
-        else:
-            reason = f"Bench projected xP ({bench_xp:.2f} pts) below threshold ({min_bench_xp:.1f} pts)."
-
+        threshold_met = (bench_xp >= min_bench_xp) and gw_match
+        reason = (
+            f"Bench projected xP ({bench_xp:.2f} pts) meets threshold ({min_bench_xp:.1f} pts)"
+            if threshold_met
+            else f"Bench projected xP ({bench_xp:.2f} pts) below threshold ({min_bench_xp:.1f} pts)"
+        )
         if target_list and current_gw is not None and not gw_match:
             reason += f" (GW{current_gw} not in target GWs {target_list})"
 
@@ -967,12 +961,12 @@ class FPLOptimizer:
         target_gws: Optional[List[int]] = None,
     ) -> ChipEvaluation:
         """
-        Evaluate Triple Captain chip with DGW fixture requirement verification.
+        Evaluate Triple Captain chip: compares captain projected xP against TRIPLE_CAPTAIN_MIN_XP.
         """
         captain_pick = baseline_candidate.captain
         captain_xp = captain_pick.xp if captain_pick else 0.0
-        projected_xp = round(baseline_candidate.net_xp + captain_xp, 2)
         baseline_xp = baseline_candidate.net_xp
+        projected_xp = round(baseline_xp + captain_xp, 2)
         xp_gain = round(captain_xp, 2)
 
         target_list = target_gws if target_gws is not None else _parse_target_gws("TARGET_TRIPLE_CAPTAIN_GW")
@@ -982,10 +976,9 @@ class FPLOptimizer:
 
         threshold_met = (captain_xp >= min_captain_xp) and gw_match
         c_name = captain_pick.web_name if captain_pick else "Captain"
-        n_fix = captain_pick.fixtures_in_gw if captain_pick else 1
-
+        
         reason = (
-            f"Captain {c_name} projected xP ({captain_xp:.2f} pts · {n_fix} fix) meets threshold ({min_captain_xp:.1f} pts)"
+            f"Captain {c_name} projected xP ({captain_xp:.2f} pts) meets threshold ({min_captain_xp:.1f} pts)"
             if threshold_met
             else f"Captain {c_name} projected xP ({captain_xp:.2f} pts) below threshold ({min_captain_xp:.1f} pts)"
         )
@@ -1064,7 +1057,8 @@ class FPLOptimizer:
         evaluate_chips: bool = True,
     ) -> OptimizationResult:
         """
-        Generate top candidates with exact FPL selling math and multi-period horizon lookahead.
+        Generate 7 strategic candidate moves with exact FPL selling math,
+        multi-period horizon lookahead, integer exclusion cuts, and chip evaluation.
         """
         current_set = set(current_squad_ids)
         sp_map = selling_prices or {}
@@ -1077,9 +1071,9 @@ class FPLOptimizer:
         total_budget_m = round(current_team_cost + bank_m, 2)
 
         candidates: List[CandidateSquad] = []
+        rolling_bonus_xp = float(os.getenv("ROLLING_BONUS_XP", "1.5"))
 
         # Candidate 1: 0 Transfers (Roll / Bank FT with +1.5 xP Strategic Value)
-        rolling_bonus_xp = float(os.getenv("ROLLING_BONUS_XP", "1.5"))
         cand_0 = self._solve_for_k_transfers(
             current_set,
             total_budget_m,
@@ -1090,47 +1084,64 @@ class FPLOptimizer:
             rolling_bonus_xp=rolling_bonus_xp,
         )
         if cand_0:
+            cand_0.name = f"Option 1: Roll / Bank Transfer (0 Moves · +{rolling_bonus_xp:.1f} FT Strategic Value)"
             candidates.append(cand_0)
 
-        # Candidate 2: Optimal 1-Free Transfer Move
-        cand_1 = self._solve_for_k_transfers(
-            current_set,
-            total_budget_m,
-            k_transfers=1,
-            free_transfers=free_transfers,
-            selling_prices=selling_prices,
-            eo_weights=eo_weights,
-            rolling_bonus_xp=rolling_bonus_xp,
-        )
-        if cand_1:
-            candidates.append(cand_1)
+        # Candidates 2, 3, 4: Top 3 1-Transfer Moves (Optimal + 2 Alternatives)
+        excluded_in_1: List[Set[int]] = []
+        for rank in range(1, 4):
+            cand_1 = self._solve_for_k_transfers(
+                current_set,
+                total_budget_m,
+                k_transfers=1,
+                free_transfers=free_transfers,
+                selling_prices=selling_prices,
+                eo_weights=eo_weights,
+                rolling_bonus_xp=rolling_bonus_xp,
+                excluded_transfers_in=excluded_in_1,
+            )
+            if cand_1 and cand_1.transfers:
+                cand_in_ids = {t.player_in.id for t in cand_1.transfers}
+                excluded_in_1.append(cand_in_ids)
+                opt_num = len(candidates) + 1
+                prefix = "Optimal 1-Transfer Move" if rank == 1 else f"Alternative 1-Transfer Move (Rank #{rank})"
+                cost_label = "Free" if free_transfers >= 1 else "-4 Hit"
+                cand_1.name = f"Option {opt_num}: {prefix} ({cost_label})"
+                candidates.append(cand_1)
 
-        # Candidate 3: Optimal 2-Transfer Move (Factoring -4 Hit penalty only if net decayed xP gain exceeds +5.0 xP hurdle)
+        # Candidates 5, 6: Top 2 2-Transfer Moves (Optimal + 1 Alternative)
         hit_min_gain = float(os.getenv("HIT_MIN_NET_XP_GAIN", "5.0"))
-        cand_2 = self._solve_for_k_transfers(
-            current_set,
-            total_budget_m,
-            k_transfers=2,
-            free_transfers=free_transfers,
-            selling_prices=selling_prices,
-            eo_weights=eo_weights,
-            rolling_bonus_xp=rolling_bonus_xp,
-        )
-        if cand_2:
-            if cand_2.hit_cost > 0:
-                baseline_xp = cand_0.net_xp if cand_0 else (cand_1.net_xp if cand_1 else 0.0)
-                net_gain = round(cand_2.net_xp - baseline_xp, 2)
-                if net_gain >= hit_min_gain:
-                    cand_2.name = f"Option 3: Optimal 2-Transfer Move (-{cand_2.hit_cost} Hit · +{net_gain:.2f} Net xP Gain vs Roll)"
+        excluded_in_2: List[Set[int]] = []
+        baseline_xp = cand_0.net_xp if cand_0 else 0.0
+
+        for rank in range(1, 3):
+            cand_2 = self._solve_for_k_transfers(
+                current_set,
+                total_budget_m,
+                k_transfers=2,
+                free_transfers=free_transfers,
+                selling_prices=selling_prices,
+                eo_weights=eo_weights,
+                rolling_bonus_xp=rolling_bonus_xp,
+                excluded_transfers_in=excluded_in_2,
+            )
+            if cand_2 and cand_2.transfers:
+                cand_in_ids = {t.player_in.id for t in cand_2.transfers}
+                excluded_in_2.append(cand_in_ids)
+                opt_num = len(candidates) + 1
+                prefix = "Optimal 2-Transfer Move" if rank == 1 else f"Alternative 2-Transfer Move (Rank #{rank})"
+                if cand_2.hit_cost > 0:
+                    net_gain = round(cand_2.net_xp - baseline_xp, 2)
+                    if net_gain >= hit_min_gain:
+                        cand_2.name = f"Option {opt_num}: {prefix} (-{cand_2.hit_cost} Hit · +{net_gain:.2f} Net xP Gain vs Roll)"
+                    else:
+                        cand_2.name = f"Option {opt_num}: {prefix} (-{cand_2.hit_cost} Hit · Sub-optimal: +{net_gain:.2f} xP below +{hit_min_gain:.1f} xP Hurdle)"
+                        cand_2.strategic_value_score = round(cand_2.strategic_value_score - 2.0, 2)
                 else:
-                    cand_2.name = f"Option 3: 2-Transfer Move (-{cand_2.hit_cost} Hit · Sub-optimal: +{net_gain:.2f} xP below +{hit_min_gain:.1f} xP Hurdle)"
-                    cand_2.strategic_value_score = round(cand_2.strategic_value_score - 2.0, 2)
-            candidates.append(cand_2)
+                    cand_2.name = f"Option {opt_num}: {prefix} (Free)"
+                candidates.append(cand_2)
 
-        # Keep candidates ordered by transfers count: 0 moves, 1 move, 2 moves
-        # (c.strategic_value_score is preserved for AI Director / reporting)
-
-        # Chip Evaluation
+        # Chip Evaluation & Option 7 Selection
         chip_result: Optional[ChipEvaluationResult] = None
         if evaluate_chips and candidates:
             best_candidate = max(candidates, key=lambda c: c.net_xp)
@@ -1141,6 +1152,50 @@ class FPLOptimizer:
                 current_gw=current_gw,
                 eo_weights=eo_weights,
             )
+
+        # Option 7: Recommended Active Chip Candidate or Rank #3 2-Transfer Move
+        opt_7_added = False
+        if chip_result and chip_result.recommended_chip:
+            rec_chip_eval = chip_result.evaluations.get(chip_result.recommended_chip)
+            if rec_chip_eval and rec_chip_eval.squad_candidate:
+                chip_cand = rec_chip_eval.squad_candidate.model_copy(deep=True)
+                opt_num = len(candidates) + 1
+                chip_cand.name = f"Option {opt_num}: Active Chip Recommendation ({rec_chip_eval.display_name} · {rec_chip_eval.reason})"
+                candidates.append(chip_cand)
+                opt_7_added = True
+
+        if not opt_7_added:
+            # Fallback for Option 7: 3rd 2-transfer move (or 4th 1-transfer move)
+            cand_2_rank3 = self._solve_for_k_transfers(
+                current_set,
+                total_budget_m,
+                k_transfers=2,
+                free_transfers=free_transfers,
+                selling_prices=selling_prices,
+                eo_weights=eo_weights,
+                rolling_bonus_xp=rolling_bonus_xp,
+                excluded_transfers_in=excluded_in_2,
+            )
+            if cand_2_rank3 and cand_2_rank3.transfers:
+                opt_num = len(candidates) + 1
+                cand_2_rank3.name = f"Option {opt_num}: Alternative 2-Transfer Move (Rank #3)"
+                candidates.append(cand_2_rank3)
+            else:
+                # Extra 1-transfer alternative if 2-transfer combination exhausted
+                cand_1_rank4 = self._solve_for_k_transfers(
+                    current_set,
+                    total_budget_m,
+                    k_transfers=1,
+                    free_transfers=free_transfers,
+                    selling_prices=selling_prices,
+                    eo_weights=eo_weights,
+                    rolling_bonus_xp=rolling_bonus_xp,
+                    excluded_transfers_in=excluded_in_1,
+                )
+                if cand_1_rank4 and cand_1_rank4.transfers:
+                    opt_num = len(candidates) + 1
+                    cand_1_rank4.name = f"Option {opt_num}: Alternative 1-Transfer Move (Rank #4)"
+                    candidates.append(cand_1_rank4)
 
         return OptimizationResult(
             candidates=candidates,

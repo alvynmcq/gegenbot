@@ -197,12 +197,13 @@ class AIDirector:
                 elif isinstance(item, dict):
                     news_list.append(str(item))
 
+        max_idx = len(candidates) - 1
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
                 "Evaluate the mathematical MILP candidates, mini-league threat dynamics, and breaking press conference / injury news. "
-                "Select the single best move option (candidate_index: 0, 1, or 2). "
-                "Avoid transferring in or captaining players flagged with significant late injury doubts or rotation risks from press conferences. "
+                f"Select the single best move option (candidate_index: 0 to {max_idx}). "
+                "Carefully consider alternative moves if the top-ranked transfer target carries late injury, rotation, or minutes risk from press conferences. "
                 "Provide your tactical rationale in EXACTLY two concise, impactful sentences balancing "
                 "expected points (xP), injury safety from latest news, and defensive shielding vs differential upside. "
                 "Respond in strictly valid JSON format matching the schema."
@@ -211,7 +212,7 @@ class AIDirector:
             "league_threats": threats_summary,
             "breaking_news_and_injuries": news_list[:15],
             "schema": {
-                "selected_candidate_index": "int (0, 1, or 2)",
+                "selected_candidate_index": f"int (0 to {max_idx})",
                 "rationale": "str (concise 2-sentence tactical rationale)"
             }
         }

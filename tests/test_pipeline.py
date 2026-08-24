@@ -447,22 +447,39 @@ def test_optimizer_candidate_options(mock_bootstrap_data, mock_fixtures_data):
         free_transfers=1,
     )
 
-    assert len(opt_result.candidates) == 3
+    # Verifies 7 strategic candidate options
+    assert len(opt_result.candidates) == 7
     cand_0 = opt_result.candidates[0]
     cand_1 = opt_result.candidates[1]
     cand_2 = opt_result.candidates[2]
+    cand_3 = opt_result.candidates[3]
+    cand_4 = opt_result.candidates[4]
+    cand_5 = opt_result.candidates[5]
+    cand_6 = opt_result.candidates[6]
 
     # Candidate 0: Roll (0 transfers)
     assert cand_0.transfers_count == 0
     assert cand_0.hit_cost == 0
 
-    # Candidate 1: 1 transfer
-    assert cand_1.transfers_count <= 1
+    # Candidates 1, 2, 3: 1-transfer moves (Optimal + 2 Alternatives)
+    assert cand_1.transfers_count == 1
+    assert cand_2.transfers_count == 1
+    assert cand_3.transfers_count == 1
+    # Verify distinct transfer in targets
+    transfers_in_1 = {t.player_in.id for t in cand_1.transfers}
+    transfers_in_2 = {t.player_in.id for t in cand_2.transfers}
+    transfers_in_3 = {t.player_in.id for t in cand_3.transfers}
+    assert transfers_in_1 != transfers_in_2
+    assert transfers_in_2 != transfers_in_3
 
-    # Candidate 2: 2 transfers
-    assert cand_2.transfers_count <= 2
-    if cand_2.transfers_count == 2:
-        assert cand_2.hit_cost == 4  # 1 FT used, 1 extra transfer = -4
+    # Candidates 4, 5: 2-transfer moves (Optimal + Alternative)
+    assert cand_4.transfers_count == 2
+    assert cand_5.transfers_count == 2
+    if cand_4.transfers_count == 2:
+        assert cand_4.hit_cost == 4  # 1 FT used, 1 extra transfer = -4
+
+    # Candidate 6: Active chip or alternative move
+    assert cand_6 is not None
 
 
 def test_pulp_optimizer_with_fplreview_objective(mock_bootstrap_data, mock_fixtures_data):
@@ -1257,7 +1274,7 @@ def test_multi_gameweek_decay_factor_in_optimizer():
 
 
 def test_diverse_candidates_generation_and_hit_hurdle(mock_bootstrap_data, mock_fixtures_data):
-    """Test generation of 3 distinct candidates with rolling value and hit hurdle logic."""
+    """Test generation of 7 distinct candidates with rolling value and hit hurdle logic."""
     players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
     optimizer = FPLOptimizer(players_df)
     initial_squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
@@ -1269,8 +1286,10 @@ def test_diverse_candidates_generation_and_hit_hurdle(mock_bootstrap_data, mock_
         evaluate_chips=False,
     )
 
-    assert len(opt_result.candidates) == 3
-    cand_0, cand_1, cand_2 = opt_result.candidates
+    assert len(opt_result.candidates) == 7
+    cand_0 = opt_result.candidates[0]
+    cand_1 = opt_result.candidates[1]
+    cand_4 = opt_result.candidates[4]
 
     # Candidate 1: 0 Transfers (Roll)
     assert cand_0.transfers_count == 0
@@ -1281,12 +1300,12 @@ def test_diverse_candidates_generation_and_hit_hurdle(mock_bootstrap_data, mock_
     assert cand_1.transfers_count <= 1
     assert cand_1.hit_cost == 0
 
-    # Candidate 3: 2-Transfer Move
-    assert cand_2.transfers_count <= 2
-    if cand_2.transfers_count == 2:
-        assert cand_2.hit_cost == 4
+    # Candidate 5: 2-Transfer Move
+    assert cand_4.transfers_count <= 2
+    if cand_4.transfers_count == 2:
+        assert cand_4.hit_cost == 4
         # Verify candidate name contains hit details or hurdle evaluation
-        assert "-4 Hit" in cand_2.name
+        assert "-4 Hit" in cand_4.name
 
 
 def test_local_csv_priority_and_html_fallback(tmp_path, mock_bootstrap_data, mock_fixtures_data):
