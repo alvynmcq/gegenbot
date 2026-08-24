@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
-from src.data_fetcher import FPLReviewFetcher
+from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher
 from src.engine.metrics import calculate_player_metrics
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
 from src.notifier.telegram import TelegramNotifier
@@ -84,24 +84,24 @@ def run_pipeline(
     except Exception as e:
         logger.warning(f"Could not fetch fixtures: {e}. Using baseline FDR ratings.")
 
-    # 2. Ingest external FPL Review Expected Points (xP) projections
-    logger.info("Fetching external FPL Review Expected Points (xP) projections...")
-    fplreview_fetcher = FPLReviewFetcher()
-    fplreview_df = fplreview_fetcher.fetch_projections()
-    if fplreview_df is not None and not fplreview_df.empty:
-        logger.info(f"Loaded {len(fplreview_df)} player projections from FPL Review data feed.")
+    # 2. Ingest external FPL Core Insights dataset (olbauday/FPL-Core-Insights)
+    logger.info("Fetching FPL Core Insights dataset (olbauday/FPL-Core-Insights)...")
+    core_fetcher = FPLCoreInsightsFetcher()
+    core_insights_df = core_fetcher.fetch_projections()
+    if core_insights_df is not None and not core_insights_df.empty:
+        logger.info(f"Loaded {len(core_insights_df)} player records from FPL Core Insights data feed.")
     else:
         logger.warning(
-            "External FPL Review projections unavailable. Seamlessly falling back to default FPL expected points (ep_next / baseline)."
+            "External FPL Core Insights unavailable. Seamlessly falling back to default FPL expected points (ep_next / baseline)."
         )
 
-    # 3. Enrich player metrics with xP (FPL Review xP with fallback to default FPL ep_next)
+    # 3. Enrich player metrics with xP (FPL Core Insights with fallback to default FPL ep_next)
     logger.info("Computing expected points (xP) and FDR weighting...")
     players_df = calculate_player_metrics(
         bootstrap,
         fixtures,
         current_event=gw_id,
-        fplreview_df=fplreview_df,
+        fplreview_df=core_insights_df,
     )
 
     # 3. Retrieve current squad, selling prices, and bank

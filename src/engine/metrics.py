@@ -190,24 +190,28 @@ def calculate_player_metrics(
             default_fpl_xp = heuristic_xp
             default_source = "fpl_heuristic"
 
-        # Check FPL Review projection
+        # Check FPL Core Insights / External projection
         fplreview_val: Optional[float] = None
         fplreview_3gw_val: Optional[float] = None
         decay_factor = float(os.getenv("DECAY_FACTOR", "0.85"))
         decay_sum = 1.0 + decay_factor + (decay_factor ** 2)
+        source_tag = "fpl_core_insights"
+
         if player_id in fplreview_map:
             entry = fplreview_map[player_id]
             if isinstance(entry, dict):
                 fplreview_val = entry.get("fplreview_xp")
                 fplreview_3gw_val = entry.get("fplreview_xp_3gw")
+                source_tag = entry.get("source", "fpl_core_insights")
             elif isinstance(entry, (int, float)):
                 fplreview_val = float(entry)
                 fplreview_3gw_val = round(fplreview_val * decay_sum, 2)
+                source_tag = "fplreview"
 
         if fplreview_val is not None:
             # Respect availability if fully unavailable (injured/suspended)
             xp = round(max(0.0, fplreview_val * availability), 2) if availability == 0.0 else fplreview_val
-            xp_source = "fplreview"
+            xp_source = source_tag
         else:
             xp = default_fpl_xp
             xp_source = default_source

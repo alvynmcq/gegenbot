@@ -1,4 +1,4 @@
-"""Data ingestion and mapping helper for external FPL Review Expected Points (xP) projections."""
+"""Data ingestion and mapping helper for external FPL Core Insights and expected points datasets."""
 
 import io
 import logging
@@ -41,17 +41,25 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", clean_name)
 
 
-class FPLReviewFetcher:
-    """Fetches, parses, and maps free FPL Review projections to official FPL element IDs."""
+class FPLCoreInsightsFetcher:
+    """
+    Fetches, parses, and maps FPL Core Insights (olbauday/FPL-Core-Insights)
+    dataset with direct official FPL element ID alignment.
+    Supports local CSV fallback and legacy FPL Review projection schemas.
+    """
 
-    DEFAULT_CSV_PATH = Path("data/fplreview.csv")
+    DEFAULT_CSV_PATH = Path("data/playerstats.csv")
     LOCAL_CANDIDATE_PATHS = [
+        Path("data/playerstats.csv"),
+        Path("data/fpl_core_insights.csv"),
         Path("data/fplreview.csv"),
         Path("data/projections.csv"),
+        Path("playerstats.csv"),
         Path("fplreview.csv"),
         Path("projections.csv"),
     ]
-    DEFAULT_PROJECTIONS_URL = "https://fplreview.com/free-planner/"
+    PRIMARY_GITHUB_URL = "https://raw.githubusercontent.com/olbauday/FPL-Core-Insights/main/data/2026-2027/playerstats.csv"
+    FALLBACK_GITHUB_URL = "https://raw.githubusercontent.com/olbauday/FPL-Core-Insights/main/data/2025-2026/playerstats.csv"
 
     def __init__(
         self,
@@ -59,8 +67,19 @@ class FPLReviewFetcher:
         file_path: Optional[Union[str, Path]] = None,
         timeout: int = 10,
     ):
-        self.url = url or os.getenv("FPLREVIEW_PROJECTIONS_URL") or os.getenv("FPLREVIEW_CSV_URL") or self.DEFAULT_PROJECTIONS_URL
-        self.file_path = file_path or os.getenv("FPLREVIEW_CSV_PATH") or self.DEFAULT_CSV_PATH
+        self.url = (
+            url
+            or os.getenv("FPL_CORE_INSIGHTS_URL")
+            or os.getenv("FPLREVIEW_PROJECTIONS_URL")
+            or os.getenv("FPLREVIEW_CSV_URL")
+            or self.PRIMARY_GITHUB_URL
+        )
+        self.file_path = (
+            file_path
+            or os.getenv("FPL_CORE_INSIGHTS_CSV_PATH")
+            or os.getenv("FPLREVIEW_CSV_PATH")
+            or self.DEFAULT_CSV_PATH
+        )
         if isinstance(self.file_path, str):
             self.file_path = Path(self.file_path)
         self.timeout = timeout
@@ -71,14 +90,12 @@ class FPLReviewFetcher:
         force_url: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch and parse FPL Review projections CSV from string content, local file, or remote URL.
-        Local CSV files (data/fplreview.csv or data/projections.csv) take priority over remote scraping.
-        Returns a DataFrame if successful, or None on failure/timeout without interrupting the pipeline.
+        Fetch and parse projections CSV from string content, local file, or remote URL.
+        Local CSV files take priority over remote scraping.
         """
         # 1. Direct CSV content provided (e.g. in unit tests or memory cache)
         if csv_content is not None:
             try:
-                # Check for HTML error payload passed as string
                 trimmed = csv_content.strip()
                 if trimmed.startswith("<!DOCTYPE") or trimmed.startswith("<html"):
                     logger.warning("Provided CSV content contains HTML markup. Ignoring.")
@@ -113,61 +130,59 @@ class FPLReviewFetcher:
                 except Exception as e:
                     logger.warning(f"Failed to read local FPL projections CSV ({candidate}): {e}")
 
-        # 3. Remote HTTP Fetch (Fallback when no valid local CSV found)
-        target_url = force_url or self.url
-        if target_url:
-            logger.info(f"Fetching FPL Review projections from remote endpoint: {target_url}")
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/csv, application/json, text/plain, */*",
-            }
+        # 3. Remote HTTP Fetch from GitHub / configured endpoint
+        target_urls = []
+        if force_url:
+            target_urls.append(force_url)
+        elif self.url:
+            target_urls.append(self.url)
+            if self.FALLBACK_GITHUB_URL not in target_urls:
+                target_urls.append(self.FALLBACK_GITHUB_URL)
+
+        headers = {
+            "User-Agent": "Gegenbot-FPL-Engine/2.0",
+            "Accept": "text/csv, application/json, text/plain, */*",
+        }
+
+        for target_url in target_urls:
+            logger.info(f"Fetching FPL Core Insights dataset from remote endpoint: {target_url}")
             try:
                 resp = requests.get(target_url, headers=headers, timeout=self.timeout)
                 if resp.status_code == 200:
                     text_content = resp.text.strip()
-                    # Check if response is valid CSV (not HTML 404/error page)
                     if text_content and not text_content.startswith("<!DOCTYPE") and not text_content.startswith("<html"):
                         try:
                             df = pd.read_csv(io.StringIO(text_content))
                             if not df.empty:
-                                logger.info(f"Successfully fetched and parsed {len(df)} projections from {target_url}")
+                                logger.info(f"Successfully fetched and parsed {len(df)} records from {target_url}")
                                 return df
                         except Exception as parse_err:
                             logger.warning(f"Could not parse response from {target_url} as CSV: {parse_err}")
-                    else:
-                        logger.warning(f"Remote endpoint {target_url} returned HTML or non-CSV payload.")
                 else:
-                    logger.warning(f"Remote projections fetch failed with HTTP status {resp.status_code}.")
+                    logger.warning(f"Remote fetch from {target_url} returned HTTP {resp.status_code}.")
             except requests.exceptions.Timeout:
                 logger.warning(f"Remote fetch from {target_url} timed out after {self.timeout}s.")
-            except requests.exceptions.RequestException as exc:
-                logger.warning(f"Network error while fetching FPL Review projections: {exc}")
             except Exception as exc:
-                logger.warning(f"Unexpected error during FPL Review projections fetch: {exc}")
+                logger.warning(f"Error fetching from {target_url}: {exc}")
 
         return None
 
     def map_to_bootstrap(
         self,
-        fplreview_df: pd.DataFrame,
+        df: pd.DataFrame,
         bootstrap_data: Dict[str, Any],
         current_event: int = 1,
         decay_factor: Optional[float] = None,
-    ) -> Dict[int, Dict[str, float]]:
+    ) -> Dict[int, Dict[str, Any]]:
         """
-        Map FPL Review projection rows to official FPL element IDs.
-        Calculates multi-gameweek discounted expected points:
-            xP_effective = xP_t + (gamma * xP_{t+1}) + (gamma^2 * xP_{t+2})
-        Returns: {element_id: {"fplreview_xp": float, "fplreview_xp_3gw": float}}
+        Map dataset rows to official FPL element IDs.
+        Supports both FPL-Core-Insights (direct `id` match + xGI/CBIT) and legacy FPL Review schemas.
         """
-        if fplreview_df is None or fplreview_df.empty:
+        if df is None or df.empty:
             return {}
 
         gamma = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
+        decay_sum = 1.0 + gamma + (gamma ** 2)
 
         elements = bootstrap_data.get("elements", [])
         teams = bootstrap_data.get("teams", [])
@@ -177,67 +192,44 @@ class FPLReviewFetcher:
         team_id_to_short = {t["id"]: t["short_name"].lower() for t in teams}
 
         # Normalize column names in projections DataFrame
-        col_map = {col: str(col).strip() for col in fplreview_df.columns}
-        df = fplreview_df.rename(columns=col_map)
+        col_map = {col: str(col).strip() for col in df.columns}
+        cols_lower = {str(col).strip().lower(): col for col in df.columns}
 
-        # Identify key columns in projections DataFrame
-        id_col = None
-        name_col = None
-        team_col = None
-        pos_col = None
+        # Identify candidate columns for ID, Name, Team, and Gameweek points
+        id_col = next((c for c in df.columns if str(c).strip().lower() in ["id", "fpl_id", "element_id", "code"]), None)
+        name_col = next((c for c in df.columns if str(c).strip().lower() in ["name", "player", "web_name", "full_name"]), None)
+        team_col = next((c for c in df.columns if str(c).strip().lower() in ["team", "club", "team_name", "team_short"]), None)
 
-        for col in df.columns:
-            low = str(col).lower()
-            if low in ["id", "fpl_id", "element", "code"]:
-                id_col = col
-            elif low in ["name", "player", "web_name", "full_name"]:
-                name_col = col
-            elif low in ["team", "team_name", "club"]:
-                team_col = col
-            elif low in ["pos", "position", "element_type", "type"]:
-                pos_col = col
-
-        # Identify gameweek projection column
-        gw_col = None
-        candidates = [
-            f"{current_event}_Pts",
-            f"{current_event}_pts",
-            f"{current_event}_xP",
-            f"{current_event}_xp",
-            f"GW{current_event}_Pts",
-            f"GW{current_event}",
-            f"GW_{current_event}",
-            f"{current_event}_Points",
-            f"{current_event}_EV",
-            "fplreview_xp",
-            "xP",
-            "xp",
-            "EV",
-            "ev",
-            "Pts",
-            "pts",
-            "points",
-            "Points",
-            "ep_next",
-            "proj_points",
+        # Identify GW columns for current and future events
+        gw_col_patterns = [
+            re.compile(rf"^(gw)?{current_event}(_pts|_xp|_points)?$", re.IGNORECASE),
+            re.compile(rf"^pts_{current_event}$", re.IGNORECASE),
+            re.compile(rf"^ep_next$", re.IGNORECASE),
+            re.compile(rf"^xp$", re.IGNORECASE),
+            re.compile(rf"^expected_points$", re.IGNORECASE),
+            re.compile(rf"^points$", re.IGNORECASE),
         ]
-        for cand in candidates:
-            if cand in df.columns:
-                gw_col = cand
+        gw_col = None
+        for pattern in gw_col_patterns:
+            for col in df.columns:
+                if pattern.match(str(col).strip()):
+                    gw_col = col
+                    break
+            if gw_col:
                 break
 
-        # If no standard name found, look for any column matching '{gw}_' pattern or numeric
-        if not gw_col:
+        if gw_col is None:
+            # Fallback to first numeric column that might represent projections
             for col in df.columns:
-                if re.match(rf"^{current_event}_", str(col), re.IGNORECASE) or re.match(rf"^gw{current_event}", str(col), re.IGNORECASE):
+                if col not in [id_col, name_col, team_col] and pd.api.types.is_numeric_dtype(df[col]):
                     gw_col = col
                     break
 
-        if not gw_col:
-            logger.warning("Could not identify Gameweek xP projection column in FPL Review data.")
+        if gw_col is None and "ep_next" not in cols_lower:
+            logger.warning("Projections DataFrame does not contain recognizable ID, Name, or xP columns.")
             return {}
 
-        # Also identify next 3 gameweeks for discounted 3GW projection
+        # Also identify next 2 gameweeks for discounted 3GW projection
         gw_plus_1_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 1}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
         gw_plus_2_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 2}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
 
@@ -264,16 +256,28 @@ class FPLReviewFetcher:
                 if t_name:
                     official_by_team_and_name[f"{t_name}:{n}"] = el
 
-        mapped_projections: Dict[int, Dict[str, float]] = {}
+        mapped_projections: Dict[int, Dict[str, Any]] = {}
 
         for _, row in df.iterrows():
-            # Extract raw points projection for current gameweek
-            try:
-                raw_xp = float(row[gw_col])
-                if pd.isna(raw_xp):
-                    continue
-                xp_val = round(max(0.0, raw_xp), 2)
-            except (ValueError, TypeError):
+            xp_val: Optional[float] = None
+
+            if gw_col and gw_col in row:
+                try:
+                    raw_xp = float(row[gw_col])
+                    if not pd.isna(raw_xp):
+                        xp_val = round(max(0.0, raw_xp), 2)
+                except (ValueError, TypeError):
+                    pass
+
+            if xp_val is None and "ep_next" in cols_lower:
+                try:
+                    raw_ep = float(row[cols_lower["ep_next"]])
+                    if not pd.isna(raw_ep):
+                        xp_val = round(max(0.0, raw_ep), 2)
+                except (ValueError, TypeError):
+                    pass
+
+            if xp_val is None:
                 continue
 
             # Calculate discounted multi-week projection: xP_t + (gamma * xP_{t+1}) + (gamma^2 * xP_{t+2})
@@ -299,8 +303,6 @@ class FPLReviewFetcher:
             if has_future_cols:
                 xp_3gw_val = round(multi_gw_sum, 2)
             else:
-                # Horizon decay over 3-gameweek baseline lookahead
-                decay_sum = 1.0 + gamma + (gamma ** 2)
                 xp_3gw_val = round(xp_val * decay_sum, 2)
 
             matched_element_id: Optional[int] = None
@@ -308,7 +310,7 @@ class FPLReviewFetcher:
             # 1. Match by numeric ID
             if id_col and id_col in row and not pd.isna(row[id_col]):
                 try:
-                    cand_id = int(row[id_col])
+                    cand_id = int(float(row[id_col]))
                     if cand_id in official_by_id:
                         matched_element_id = cand_id
                 except (ValueError, TypeError):
@@ -320,19 +322,16 @@ class FPLReviewFetcher:
                 norm_name = _normalize_name(raw_name)
                 raw_team = str(row[team_col]).lower().strip() if team_col and team_col in row and not pd.isna(row[team_col]) else ""
 
-                # Try exact team + name match
                 if raw_team:
                     key = f"{raw_team}:{norm_name}"
                     if key in official_by_team_and_name:
                         matched_element_id = official_by_team_and_name[key]["id"]
 
-                # Try fuzzy/name-only match if unambiguous
                 if matched_element_id is None and norm_name in official_by_norm_name:
                     candidates_list = official_by_norm_name[norm_name]
                     if len(candidates_list) == 1:
                         matched_element_id = candidates_list[0]["id"]
                     elif raw_team:
-                        # Disambiguate by team name or team short name
                         for c in candidates_list:
                             c_tid = c.get("team", 1)
                             if team_id_to_short.get(c_tid) == raw_team or team_id_to_name.get(c_tid) == raw_team:
@@ -340,13 +339,29 @@ class FPLReviewFetcher:
                                 break
 
             if matched_element_id is not None:
+                xg_90 = float(row.get(cols_lower.get("expected_goals_per_90", ""), 0.0) or 0.0) if "expected_goals_per_90" in cols_lower else 0.0
+                xa_90 = float(row.get(cols_lower.get("expected_assists_per_90", ""), 0.0) or 0.0) if "expected_assists_per_90" in cols_lower else 0.0
+                xgi_90 = float(row.get(cols_lower.get("expected_goal_involvements_per_90", ""), 0.0) or 0.0) if "expected_goal_involvements_per_90" in cols_lower else (xg_90 + xa_90)
+                def_contrib = float(row.get(cols_lower.get("defensive_contribution_per_90", ""), 0.0) or 0.0) if "defensive_contribution_per_90" in cols_lower else 0.0
+
+                source = "fpl_core_insights" if "expected_goals_per_90" in cols_lower or "defensive_contribution_per_90" in cols_lower else "fplreview"
+
                 mapped_projections[matched_element_id] = {
                     "fplreview_xp": xp_val,
                     "fplreview_xp_3gw": xp_3gw_val,
+                    "xg_90": xg_90,
+                    "xa_90": xa_90,
+                    "xgi_90": xgi_90,
+                    "def_contrib": def_contrib,
+                    "source": source,
                 }
 
-        logger.info(f"Mapped {len(mapped_projections)} FPL Review projections to official FPL element IDs.")
+        logger.info(f"Mapped {len(mapped_projections)} projections to official FPL element IDs.")
         return mapped_projections
+
+
+# Retain FPLReviewFetcher alias for full backward compatibility
+FPLReviewFetcher = FPLCoreInsightsFetcher
 
 
 def calculate_fallback_xp(
@@ -423,9 +438,12 @@ def fetch_fplreview_projections(
     csv_content: Optional[str] = None,
     timeout: int = 10,
 ) -> Optional[pd.DataFrame]:
-    """Helper function to fetch FPL Review projections DataFrame."""
-    fetcher = FPLReviewFetcher(url=url, file_path=file_path, timeout=timeout)
+    """Helper function to fetch projections DataFrame."""
+    fetcher = FPLCoreInsightsFetcher(url=url, file_path=file_path, timeout=timeout)
     return fetcher.fetch_projections(csv_content=csv_content)
+
+
+fetch_core_insights_projections = fetch_fplreview_projections
 
 
 def map_fplreview_to_elements(
@@ -433,9 +451,9 @@ def map_fplreview_to_elements(
     bootstrap_data: Dict[str, Any],
     current_event: int = 1,
     decay_factor: Optional[float] = None,
-) -> Dict[int, Dict[str, float]]:
-    """Helper function to map FPL Review projections to official element IDs."""
-    fetcher = FPLReviewFetcher()
+) -> Dict[int, Dict[str, Any]]:
+    """Helper function to map projections to official element IDs."""
+    fetcher = FPLCoreInsightsFetcher()
     return fetcher.map_to_bootstrap(
         fplreview_df,
         bootstrap_data,
@@ -443,3 +461,5 @@ def map_fplreview_to_elements(
         decay_factor=decay_factor,
     )
 
+
+map_core_insights_to_elements = map_fplreview_to_elements
