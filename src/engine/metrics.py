@@ -223,6 +223,15 @@ def calculate_player_metrics(
             fdr_3gw_mult = max(0.6, 1.0 + (3.0 - avg_fdr) * 0.08)
             xp_3gw = round(max(0.0, base_xp * fdr_3gw_mult * availability * decay_sum), 2)
 
+        try:
+            transfers_in_event = int(el.get("transfers_in_event", 0) or 0)
+            transfers_out_event = int(el.get("transfers_out_event", 0) or 0)
+            # Normalise to a -1..+1 momentum score; capped at ±100k transfers
+            net_transfers = transfers_in_event - transfers_out_event
+            price_momentum = round(max(-1.0, min(1.0, net_transfers / 100_000.0)), 3)
+        except (ValueError, TypeError):
+            price_momentum = 0.0
+
         records.append({
             "id": player_id,
             "web_name": web_name,
@@ -247,7 +256,9 @@ def calculate_player_metrics(
             "xp": xp,
             "xp_3gw": xp_3gw,
             "xp_source": xp_source,
+            "price_momentum": price_momentum,
         })
+
 
     df = pd.DataFrame(records)
     return df

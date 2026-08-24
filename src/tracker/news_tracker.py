@@ -1,5 +1,6 @@
 """Live News & Press Conference Tracker for FPL Players."""
 
+import datetime
 import logging
 import os
 import re
@@ -21,12 +22,18 @@ class PlayerNewsIntel(BaseModel):
     news_added: Optional[str] = None
     live_search_snippets: List[str] = Field(default_factory=list)
     risk_level: str = "CLEARED"  # "CLEARED", "DOUBT_75", "DOUBT_50", "RULED_OUT", "MONITOR"
+    news_freshness_hours: Optional[float] = None  # Hours since news_added timestamp; None if no timestamp
+    sentiment_score: float = 0.0  # -1.0 (bad news), 0.0 (neutral), +1.0 (good news)
 
     def summary(self) -> str:
         """One-line concise summary of player news state."""
         parts = [f"{self.web_name} ({self.team_name}) - Risk: {self.risk_level}"]
         if self.chance_of_playing_next_round is not None:
             parts.append(f"[{self.chance_of_playing_next_round}% chance]")
+        if self.news_freshness_hours is not None:
+            age_label = f"{self.news_freshness_hours:.0f}h ago" if self.news_freshness_hours < 72 else "3d+ ago"
+            sentiment_label = "(+)" if self.sentiment_score > 0.2 else "(-)" if self.sentiment_score < -0.2 else "(~)"
+            parts.append(f"News: {age_label} {sentiment_label}")
         if self.official_fpl_news:
             parts.append(f"FPL: {self.official_fpl_news}")
         if self.live_search_snippets:
@@ -124,6 +131,27 @@ class NewsTracker:
         self._cache[cache_key] = snippets
         return snippets
 
+    @staticmethod
+    def _compute_sentiment(text: str) -> float:
+        """Lightweight keyword-based sentiment scorer. Returns -1 (bad) to +1 (good)."""
+        bad_words = [
+            "ruled out", "out for", "hamstring", "injury", "injured", "doubt",
+            "scan", "knock", "miss", "concern", "unavailable", "suspended",
+        ]
+        good_words = [
+            "fit", "trained", "fully fit", "back", "available", "cleared",
+            "no concerns", "should be fine", "returns", "ready",
+        ]
+        text_l = text.lower()
+        score = 0.0
+        for w in bad_words:
+            if w in text_l:
+                score -= 0.25
+        for w in good_words:
+            if w in text_l:
+                score += 0.25
+        return round(max(-1.0, min(1.0, score)), 2)
+
     def build_player_intel(
         self,
         player_id: int,
@@ -143,6 +171,20 @@ class NewsTracker:
         if fetch_live_web and (risk != "CLEARED" or official_fpl_news):
             snippets = self._search_web_snippets(web_name, team_name)
 
+        # Compute freshness in hours from news_added ISO timestamp
+        freshness_hours: Optional[float] = None
+        if news_added:
+            try:
+                added_dt = datetime.datetime.fromisoformat(news_added.replace("Z", "+00:00"))
+                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                freshness_hours = round((now_dt - added_dt).total_seconds() / 3600.0, 1)
+            except Exception:
+                pass
+
+        # Compute sentiment from all available text
+        combined_text = " ".join([official_fpl_news] + snippets)
+        sentiment = self._compute_sentiment(combined_text) if combined_text.strip() else 0.0
+
         return PlayerNewsIntel(
             player_id=player_id,
             web_name=web_name,
@@ -153,6 +195,8 @@ class NewsTracker:
             news_added=news_added,
             live_search_snippets=snippets,
             risk_level=risk,
+            news_freshness_hours=freshness_hours,
+            sentiment_score=sentiment,
         )
 
     def extract_focal_players_from_bootstrap(

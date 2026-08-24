@@ -136,10 +136,12 @@ class AIDirector:
         optimization_result: OptimizationResult,
         league_analysis: Optional[LeagueAnalysis] = None,
         news_intel: Optional[Union[Dict[int, PlayerNewsIntel], List[PlayerNewsIntel]]] = None,
+        competitive_context: Optional[Dict[str, Any]] = None,
+        chip_season_plan: Optional[Dict[str, Any]] = None,
     ) -> DecisionOutput:
         """
         Send prompt to LLM containing solver candidates, mini-league threat matrix,
-        and live press conference / injury intelligence.
+        live press conference / injury intelligence, competitive rank context, and chip season plan.
         Fallback to PuLP top net xP candidate on error or missing API key.
         """
         candidates = optimization_result.candidates
@@ -156,6 +158,17 @@ class AIDirector:
             c_name = cand.captain.web_name if cand.captain else "N/A"
             vc_name = cand.vice_captain.web_name if cand.vice_captain else "N/A"
             tx_list = [f"OUT: {t.player_out.web_name} (£{t.player_out.cost_m}m) ➔ IN: {t.player_in.web_name} (£{t.player_in.cost_m}m)" for t in cand.transfers]
+
+            # xP confidence flags for transfer targets
+            xp_flags = []
+            for t in cand.transfers:
+                conf = t.player_in.xp_confidence
+                if conf != "HIGH":
+                    xp_flags.append(f"{t.player_in.web_name} xP confidence: {conf}")
+                if abs(t.player_in.price_momentum) >= 0.1:
+                    direction = "rising" if t.player_in.price_momentum > 0 else "falling"
+                    xp_flags.append(f"{t.player_in.web_name} price {direction} (momentum: {t.player_in.price_momentum:+.2f})")
+
             bench_summary = [f"{p.web_name} (Sub #{p.bench_order})" for p in cand.bench]
             candidate_summaries.append({
                 "candidate_index": idx,
@@ -165,6 +178,7 @@ class AIDirector:
                 "formation": cand.formation,
                 "captain": c_name,
                 "vice_captain": vc_name,
+                "vice_captain_strategy": cand.vice_captain_strategy,
                 "bench_order": bench_summary,
                 "gross_xp": cand.gross_xp,
                 "hit_cost": cand.hit_cost,
@@ -172,6 +186,7 @@ class AIDirector:
                 "multi_gw_xp": cand.multi_gw_xp,
                 "strategic_value_score": cand.strategic_value_score,
                 "bank_remaining_m": cand.bank_remaining_m,
+                "xp_data_flags": xp_flags if xp_flags else [],
             })
 
         # Format Threat Matrix
@@ -198,16 +213,27 @@ class AIDirector:
                     news_list.append(str(item))
 
         max_idx = len(candidates) - 1
+        risk_mode = (competitive_context or {}).get("risk_mode", "NEUTRAL")
+        risk_note = (competitive_context or {}).get("risk_mode_note", "")
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
                 "Evaluate the mathematical MILP candidates, mini-league threat dynamics, and breaking press conference / injury news. "
                 f"Select the single best move option (candidate_index: 0 to {max_idx}). "
+                f"CRITICAL: The current competitive risk mode is '{risk_mode}'. {risk_note} "
+                "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
+                "If risk_mode is CHASE: consider hits and differentials to gain ground. "
+                "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "
                 "Carefully consider alternative moves if the top-ranked transfer target carries late injury, rotation, or minutes risk from press conferences. "
+                "Pay attention to vice_captain_strategy — validate or override if news changes risk profile. "
+                "Treat xP_data_flags as warnings: LOW confidence or FALLING price momentum should reduce preference for that transfer. "
                 "Provide your tactical rationale in EXACTLY two concise, impactful sentences balancing "
-                "expected points (xP), injury safety from latest news, and defensive shielding vs differential upside. "
+                "expected points (xP), injury safety from latest news, defensive shielding vs differential upside, "
+                "and your competitive position. "
                 "Respond in strictly valid JSON format matching the schema."
             ),
+            "competitive_context": competitive_context or {},
+            "chip_season_plan": chip_season_plan or {},
             "candidates": candidate_summaries,
             "league_threats": threats_summary,
             "breaking_news_and_injuries": news_list[:15],
@@ -279,3 +305,4 @@ class AIDirector:
         except Exception as exc:
             logger.warning(f"LLM Director call failed ({exc}). Engaging automated mathematical fallback.")
             return self._build_fallback_decision(optimization_result, f"LLM error: {exc}", news_intel)
+

@@ -55,6 +55,166 @@ def get_active_gameweek(events: List[Dict[str, Any]]) -> tuple[int, str, bool]:
     return 1, "", True
 
 
+def _build_competitive_context(
+    entry_history: Dict[str, Any],
+    rivals: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Derive DEFEND / NEUTRAL / CHASE risk mode from entry history and league standings.
+    Returns a dict ready to inject into the LLM prompt.
+    """
+    current_season = entry_history.get("current", [])
+    if not current_season:
+        return {}
+
+    # Most recent GW entry is last in the list
+    latest = current_season[-1]
+    my_total_points = latest.get("total_points", 0)
+    overall_rank = latest.get("overall_rank")
+    rank_in_mini_league: Optional[int] = None
+    points_behind_leader: Optional[int] = None
+    points_ahead_last: Optional[int] = None
+
+    if rivals:
+        sorted_rivals = sorted(rivals, key=lambda r: -r.get("total", 0))
+        for idx, r in enumerate(sorted_rivals):
+            if r.get("total", 0) <= my_total_points:
+                rank_in_mini_league = idx + 1
+                points_behind_leader = sorted_rivals[0].get("total", 0) - my_total_points
+                if idx + 1 < len(sorted_rivals):
+                    points_ahead_last = my_total_points - sorted_rivals[idx + 1].get("total", 0)
+                break
+
+    # Determine risk mode
+    gws_remaining = max(1, 38 - len(current_season))
+    if points_behind_leader is not None and points_ahead_last is not None:
+        if points_behind_leader <= 5:
+            risk_mode = "DEFEND"
+        elif points_behind_leader >= 30 and gws_remaining <= 10:
+            risk_mode = "CHASE"
+        else:
+            risk_mode = "NEUTRAL"
+    else:
+        risk_mode = "NEUTRAL"
+
+    return {
+        "overall_rank": overall_rank,
+        "my_total_points": my_total_points,
+        "rank_in_mini_league": rank_in_mini_league,
+        "points_behind_leader": points_behind_leader,
+        "points_ahead_next_rival_below": points_ahead_last,
+        "gameweeks_remaining": gws_remaining,
+        "risk_mode": risk_mode,
+        "risk_mode_note": {
+            "DEFEND": "Within 5 pts of league leader — protect rank, avoid hits and differentials.",
+            "CHASE": "15+ pts behind with limited GWs left — be aggressive, take hits, play differentials.",
+            "NEUTRAL": "Mid-table — balance risk vs reward, take free hits, avoid unnecessary -4s.",
+        }.get(risk_mode, ""),
+    }
+
+
+def _build_chip_season_plan(
+    entry_history: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    current_gw: int,
+) -> Dict[str, Any]:
+    """
+    Build a season-long chip plan from available chips and upcoming DGW/BGW events.
+    Returned as a dict injected into the director prompt.
+    """
+    chips_raw = entry_history.get("chips", [])
+    used_chip_names = {c.get("name") for c in chips_raw}
+    all_chips = {"wildcard", "wildcard2", "bboost", "3xc", "freehit"}
+    chips_remaining = list(all_chips - used_chip_names)
+
+    # Detect DGW/BGW from events (events with more/fewer fixtures than usual)
+    upcoming_dgw: List[int] = []
+    upcoming_bgw: List[int] = []
+    for ev in events:
+        ev_id = ev.get("id", 0)
+        if ev_id <= current_gw:
+            continue
+        # chip_plays is available in some FPL seasons as a heuristic; use average as proxy
+        # FPL API marks BGW events with very low average_entry_score sometimes, but the most
+        # reliable approach is checking the event fixture count from the fixtures endpoint.
+        # Here we use the 'most_selected' field absence as a BGW hint (unavailable in BGWs)
+        chip_plays = ev.get("chip_plays", [])
+        if not chip_plays and ev.get("id"):
+            upcoming_bgw.append(ev_id)
+
+    # Build plain-English guidance for each chip still available
+    recommendations: Dict[str, str] = {}
+    if "wildcard" in chips_remaining or "wildcard2" in chips_remaining:
+        recommendations["Wildcard"] = (
+            "Best played before a DGW to maximise double-fixture players. "
+            "Can also rescue a badly-structured squad mid-season."
+        )
+    if "freehit" in chips_remaining:
+        recommendations["Free Hit"] = (
+            "Optimal for a BGW with many blanking key assets — temp full squad rebuild, reverts next GW."
+        )
+    if "bboost" in chips_remaining:
+        recommendations["Bench Boost"] = (
+            "Save for a high-fixture DGW where your bench has strong double-gameweek coverage."
+        )
+    if "3xc" in chips_remaining:
+        recommendations["Triple Captain"] = (
+            "Best in a DGW where a top premium asset plays twice — typically a striker vs weak opposition."
+        )
+
+    return {
+        "chips_remaining": chips_remaining,
+        "chips_used": list(used_chip_names),
+        "upcoming_dgw_gameweeks": upcoming_dgw,
+        "upcoming_bgw_gameweeks": upcoming_bgw,
+        "chip_guidance": recommendations,
+    }
+
+
+def _append_decision_history(
+    decision: "DecisionOutput",
+    gameweek: int,
+    opt_result: "OptimizationResult",
+) -> None:
+    """
+    Append this GW's decision to data/decisions_history.json for autonomous performance tracking.
+    Only writes predicted xP — actual score should be patched post-deadline by a scheduled job.
+    """
+    history_file = Path("data/decisions_history.json")
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+
+    history: List[Dict[str, Any]] = []
+    if history_file.exists():
+        try:
+            with open(history_file, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+
+    # Avoid duplicate entries for the same GW
+    history = [h for h in history if h.get("gameweek") != gameweek]
+
+    chosen = decision.selected_candidate
+    history.append({
+        "gameweek": gameweek,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "decision_source": decision.source,
+        "chosen_move": decision.chosen_move_name,
+        "captain": decision.captain_name,
+        "vice_captain": decision.vice_captain_name,
+        "transfers_count": chosen.transfers_count,
+        "hit_cost": chosen.hit_cost,
+        "predicted_net_xp": decision.projected_net_xp,
+        "strategic_value_score": chosen.strategic_value_score,
+        "rationale": decision.rationale,
+        "actual_gw_score": None,  # Patched by post-deadline job
+        "actual_overall_rank_change": None,
+    })
+
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"Decision appended to {history_file} (GW{gameweek})")
+
 
 
 def run_pipeline(
@@ -145,6 +305,34 @@ def run_pipeline(
         bank_m = 0.5
         free_transfers = 1
 
+    # 3b. Fetch entry history for competitive context + chip season plan
+    entry_history_data: Dict[str, Any] = {}
+    competitive_context: Dict[str, Any] = {}
+    chip_season_plan: Dict[str, Any] = {}
+    if team_id_str:
+        try:
+            raw_history = client.get_entry_history(int(team_id_str))
+            # Guard: only use if the API returned a proper dict
+            if isinstance(raw_history, dict):
+                entry_history_data = raw_history
+                competitive_context = _build_competitive_context(
+                    entry_history_data,
+                    rivals=None,  # Populated after league scan below
+                )
+                chip_season_plan = _build_chip_season_plan(
+                    entry_history_data,
+                    events=events,
+                    current_gw=gw_id,
+                )
+                logger.info(
+                    f"Competitive context: Rank #{competitive_context.get('overall_rank', 'N/A')} | "
+                    f"Risk mode: {competitive_context.get('risk_mode', 'NEUTRAL')} | "
+                    f"Chips remaining: {chip_season_plan.get('chips_remaining', [])}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not fetch entry history for context: {e}")
+
+
     # 4. Mini-League Threat Matrix Scanning (Pre-Optimization for EO-Aware Solving)
     league_analysis: Optional[LeagueAnalysis] = None
     eo_weights: Optional[Dict[int, float]] = None
@@ -169,6 +357,22 @@ def run_pipeline(
             )
         except Exception as e:
             logger.warning(f"Mini-league scan failed: {e}")
+
+    # Enrich competitive context with mini-league rank once rivals are available
+    if league_analysis and league_analysis.rivals and entry_history_data:
+        try:
+            rival_standings = [
+                {"total": r.total_points}
+                for r in league_analysis.rivals
+            ]
+            competitive_context = _build_competitive_context(entry_history_data, rivals=rival_standings)
+            logger.info(
+                f"Mini-league rank: #{competitive_context.get('rank_in_mini_league', 'N/A')} | "
+                f"Behind leader: {competitive_context.get('points_behind_leader', 'N/A')} pts | "
+                f"Risk mode: {competitive_context.get('risk_mode', 'NEUTRAL')}"
+            )
+        except Exception as e:
+            logger.warning(f"Could not enrich competitive context with league standings: {e}")
 
     # 5. PuLP MILP Optimization & Automated Chip Evaluation
     logger.info("Running PuLP MILP solver (Multi-Period Horizon, Real Selling Prices & EO Shielding)...")
@@ -242,7 +446,13 @@ def run_pipeline(
 
     logger.info("Consulting AI Decision Director...")
     director = AIDirector()
-    decision = director.evaluate_and_decide(opt_result, league_analysis, news_intel)
+    decision = director.evaluate_and_decide(
+        opt_result,
+        league_analysis,
+        news_intel,
+        competitive_context=competitive_context or None,
+        chip_season_plan=chip_season_plan or None,
+    )
 
     # Attach active chip to final selected candidate if triggered
     if active_chip:
@@ -362,6 +572,9 @@ def run_pipeline(
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump(output_payload, f, indent=2)
     logger.info(f"State persisted to {state_file}")
+
+    # 8b. Append to decision history log for autonomous performance tracking
+    _append_decision_history(decision, gw_id, opt_result)
 
     # 9. Send Telegram Alerts
     notifier = TelegramNotifier()

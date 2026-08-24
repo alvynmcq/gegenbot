@@ -193,10 +193,25 @@ class LeagueScanner:
             eo_percentages[pid] = round((weighted_val / total_managers) * 100.0, 1)
             ownership_percentages[pid] = round((player_ownership_count.get(pid, 0) / total_managers) * 100.0, 1)
 
-        # Build Threat Matrix
+        # Build Threat Matrix lists
         shields: List[ThreatPlayer] = []
         vulnerabilities: List[ThreatPlayer] = []
         daggers: List[ThreatPlayer] = []
+
+        # Dynamic EO thresholds scaled to league sample size.
+        # Smaller samples have lower signal so thresholds are relaxed.
+        if total_managers >= 40:
+            shield_threshold = 40.0
+            vulnerability_threshold = 35.0
+            dagger_threshold = 25.0
+        elif total_managers >= 20:
+            shield_threshold = 30.0
+            vulnerability_threshold = 25.0
+            dagger_threshold = 20.0
+        else:
+            shield_threshold = 20.0
+            vulnerability_threshold = 15.0
+            dagger_threshold = 15.0
 
         for pid, eo in eo_percentages.items():
             el = elements.get(pid, {})
@@ -207,7 +222,7 @@ class LeagueScanner:
 
             is_owned_by_me = pid in my_team_set
 
-            if is_owned_by_me and eo >= 40.0:
+            if is_owned_by_me and eo >= shield_threshold:
                 shields.append(ThreatPlayer(
                     id=pid,
                     web_name=web_name,
@@ -218,7 +233,7 @@ class LeagueScanner:
                     category="SHIELD",
                     risk_upside_note=f"High league EO ({eo}%). Owned: protects current rank.",
                 ))
-            elif not is_owned_by_me and eo >= 35.0:
+            elif not is_owned_by_me and eo >= vulnerability_threshold:
                 vulnerabilities.append(ThreatPlayer(
                     id=pid,
                     web_name=web_name,
@@ -229,7 +244,7 @@ class LeagueScanner:
                     category="VULNERABILITY",
                     risk_upside_note=f"High rival EO ({eo}%). Unowned: major danger to rank if scoring.",
                 ))
-            elif is_owned_by_me and eo <= 25.0:
+            elif is_owned_by_me and eo <= dagger_threshold:
                 daggers.append(ThreatPlayer(
                     id=pid,
                     web_name=web_name,

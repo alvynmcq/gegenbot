@@ -118,6 +118,8 @@ class PlayerPick(BaseModel):
     chance_of_playing_next_round: Optional[int] = None
     fplreview_xp: Optional[float] = None
     xp_source: Optional[str] = None
+    xp_confidence: str = "HIGH"  # "HIGH", "MEDIUM", "LOW" — based on source agreement
+    price_momentum: float = 0.0  # -1.0 (falling) to +1.0 (rising); from event transfer volume
     is_starter: bool = False
     is_captain: bool = False
     is_vice_captain: bool = False
@@ -149,6 +151,7 @@ class CandidateSquad(BaseModel):
     total_cost_m: float
     bank_remaining_m: float
     active_chip: Optional[str] = None  # e.g. "wildcard", "freehit", "bboost", "3xc"
+    vice_captain_strategy: str = ""  # e.g. "Safety Net (Haaland VC backs differential Mbeumo C)"
 
 
 class ChipEvaluation(BaseModel):
@@ -259,6 +262,24 @@ class FPLOptimizer:
         chance_int = int(chance_val) if chance_val is not None and not pd.isna(chance_val) else None
         n_fix = int(info.get("fixtures_in_gw", 1))
 
+        # xP confidence: compare external projection vs FPL ep_next
+        ep_next_val = info.get("ep_next")
+        xp_confidence = "HIGH"
+        if rev_xp is not None and not pd.isna(rev_xp) and ep_next_val is not None and not pd.isna(ep_next_val):
+            ep_next_f = float(ep_next_val)
+            rev_xp_f = float(rev_xp)
+            if ep_next_f > 0 and rev_xp_f > 0:
+                divergence = abs(rev_xp_f - ep_next_f) / max(ep_next_f, rev_xp_f)
+                if divergence > 0.50:
+                    xp_confidence = "LOW"
+                elif divergence > 0.30:
+                    xp_confidence = "MEDIUM"
+        elif rev_xp is None or (rev_xp is not None and pd.isna(rev_xp)):
+            # No external projection — relying on FPL ep_next alone
+            xp_confidence = "MEDIUM"
+
+        price_momentum_val = float(info.get("price_momentum", 0.0))
+
         return PlayerPick(
             id=player_id,
             web_name=info["web_name"],
@@ -277,6 +298,8 @@ class FPLOptimizer:
             chance_of_playing_next_round=chance_int,
             fplreview_xp=float(rev_xp) if rev_xp is not None and not pd.isna(rev_xp) else None,
             xp_source=info.get("xp_source"),
+            xp_confidence=xp_confidence,
+            price_momentum=price_momentum_val,
             is_starter=is_starter,
             is_captain=is_captain,
             is_vice_captain=is_vice_captain,
@@ -757,6 +780,32 @@ class FPLOptimizer:
         else:
             name = f"Best {actual_transfers_count}-Transfer Move (-{hit_cost} Hit)"
 
+        # VC strategy label: helps LLM understand the tactical pairing intent
+        vc_strategy = ""
+        if captain_pick and vc_pick:
+            c_xp = captain_pick.xp
+            vc_xp = vc_pick.xp
+            # Use selected_by_percent from player_map as global ownership proxy
+            c_ownership = float(self.player_map.get(captain_pick.id, {}).get("selected_by_percent", 20.0))
+            vc_ownership = float(self.player_map.get(vc_pick.id, {}).get("selected_by_percent", 20.0))
+            c_is_differential = c_ownership < 15.0
+            vc_is_template = vc_ownership >= 30.0
+            if c_is_differential and vc_is_template:
+                vc_strategy = (
+                    f"Safety Net: {vc_pick.web_name} ({vc_ownership:.0f}% global sel.) backs "
+                    f"differential captain {captain_pick.web_name} ({c_ownership:.0f}% sel.)"
+                )
+            elif not c_is_differential and not (vc_ownership >= 30.0):
+                vc_strategy = (
+                    f"Differential Pair: {vc_pick.web_name} ({vc_ownership:.0f}% sel.) extends "
+                    f"template captain {captain_pick.web_name} ({c_ownership:.0f}% sel.) for double upside"
+                )
+            else:
+                vc_strategy = (
+                    f"Balanced: {captain_pick.web_name} (C, {c_xp:.1f} xP) | "
+                    f"{vc_pick.web_name} (VC, {vc_xp:.1f} xP)"
+                )
+
         return CandidateSquad(
             name=name,
             transfers_count=actual_transfers_count,
@@ -773,6 +822,7 @@ class FPLOptimizer:
             strategic_value_score=strategic_value_score,
             total_cost_m=total_cost_m,
             bank_remaining_m=bank_remaining_m,
+            vice_captain_strategy=vc_strategy,
         )
 
     # ==========================================
