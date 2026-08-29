@@ -235,3 +235,62 @@ def test_telegram_notifier_renders_news_alerts():
     assert "PRESS CONFERENCE & NEWS ALERTS:" in alert_msg
     assert "Saka (Arsenal) - Risk: DOUBT_75" in alert_msg
     assert "AI DIRECTOR RATIONALE:" in alert_msg
+
+
+def test_ai_director_captain_override_and_veto_output():
+    director = AIDirector(api_key="mock_key")
+
+    saka = _create_mock_player(10, "Saka", is_captain=True)
+    havertz = _create_mock_player(12, "Havertz", is_vc=True)
+    bench_p = _create_mock_player(13, "Raya", pos="GKP", is_starter=False)
+
+    cand = CandidateSquad(
+        name="Candidate 1",
+        transfers_count=0,
+        transfers=[],
+        starters=[saka, havertz],
+        bench=[bench_p],
+        captain=saka,
+        vice_captain=havertz,
+        formation="3-5-2",
+        gross_xp=15.0,
+        hit_cost=0,
+        net_xp=15.0,
+        total_cost_m=80.0,
+        bank_remaining_m=1.0,
+    )
+
+    opt_result = OptimizationResult(
+        candidates=[cand],
+        current_team_value_m=100.0,
+        bank_m=1.0,
+        free_transfers=1,
+    )
+
+    mock_llm_response = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"selected_candidate_index": 0, "captain_override": "Havertz", "vice_captain_override": "Saka", "veto_player_ids": [99], "veto_reason": "Late presser confirmed out", "rationale": "Switched captaincy to Havertz due to late presser."}'
+                }
+            }
+        ]
+    }
+
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = mock_llm_response
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        decision = director.evaluate_and_decide(
+            optimization_result=opt_result,
+        )
+
+        assert decision.source == "LLM_DIRECTOR"
+        assert decision.captain_name == "Havertz"
+        assert decision.vice_captain_name == "Saka"
+        assert decision.selected_candidate.captain.web_name == "Havertz"
+        assert decision.selected_candidate.vice_captain.web_name == "Saka"
+        assert decision.veto_player_ids == [99]
+        assert decision.veto_reason == "Late presser confirmed out"

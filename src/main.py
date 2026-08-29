@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
-from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher
+from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher, VaastavDataFetcher
 from src.engine.metrics import calculate_player_metrics
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
 from src.notifier.telegram import TelegramNotifier
@@ -285,7 +285,7 @@ def run_pipeline(
     except Exception as e:
         logger.warning(f"Could not fetch fixtures: {e}. Using baseline FDR ratings.")
 
-    # 2. Ingest external FPL Core Insights dataset (olbauday/FPL-Core-Insights)
+    # 2. Ingest external datasets (olbauday/FPL-Core-Insights & vaastav/Fantasy-Premier-League)
     logger.info("Fetching FPL Core Insights dataset (olbauday/FPL-Core-Insights)...")
     core_fetcher = FPLCoreInsightsFetcher()
     core_insights_df = core_fetcher.fetch_projections()
@@ -296,13 +296,27 @@ def run_pipeline(
             "External FPL Core Insights unavailable. Seamlessly falling back to default FPL expected points (ep_next / baseline)."
         )
 
-    # 3. Enrich player metrics with xP (FPL Core Insights with fallback to default FPL ep_next)
-    logger.info("Computing expected points (xP) and FDR weighting...")
+    # Ingest Vaastav dataset for underlying stats (xGI/90, xGC/90, minutes tracking)
+    vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None
+    enable_vaastav = os.getenv("VAASTAV_DATA_ENABLED", "true").lower() in ("true", "1", "yes")
+    if enable_vaastav:
+        try:
+            logger.info("Fetching Vaastav FPL dataset (vaastav/Fantasy-Premier-League)...")
+            vaastav_fetcher = VaastavDataFetcher()
+            vaastav_stats = vaastav_fetcher.calculate_player_underlying_metrics()
+            if vaastav_stats:
+                logger.info(f"Loaded underlying metrics for {len(vaastav_stats)} players from Vaastav dataset.")
+        except Exception as e:
+            logger.warning(f"Could not load Vaastav FPL dataset: {e}. Continuing with standard projections.")
+
+    # 3. Enrich player metrics with xP and underlying stats
+    logger.info("Computing expected points (xP), underlying form, and FDR weighting...")
     players_df = calculate_player_metrics(
         bootstrap,
         fixtures,
         current_event=gw_id,
         fplreview_df=core_insights_df,
+        vaastav_stats=vaastav_stats,
     )
 
     # 3. Retrieve current squad, selling prices, and bank
@@ -442,7 +456,7 @@ def run_pipeline(
 
     # Automated Chip Strategy Evaluation
     enable_auto_chips = os.getenv("ENABLE_AUTO_CHIPS", "false").lower() in ("true", "1", "yes")
-    active_chip: Optional[str] = None
+    recommended_chip: Optional[str] = None
     triggered_chip_eval: Optional[Dict[str, Any]] = None
 
     if opt_result.chip_evaluation:
@@ -456,8 +470,8 @@ def run_pipeline(
             )
 
         if enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
-            active_chip = opt_result.chip_evaluation.recommended_chip
-            c_eval = opt_result.chip_evaluation.evaluations[active_chip]
+            recommended_chip = opt_result.chip_evaluation.recommended_chip
+            c_eval = opt_result.chip_evaluation.evaluations[recommended_chip]
             triggered_chip_eval = c_eval.model_dump()
             logger.info(
                 f"⚡ AUTOMATED CHIP ACTIVATED: {c_eval.display_name} "
@@ -466,7 +480,8 @@ def run_pipeline(
             logger.info(f"   Rationale: {c_eval.reason}")
 
             # If Wildcard or Free Hit, inject optimal scratch squad candidate
-            if active_chip in ("wildcard", "freehit") and c_eval.squad_candidate:
+            if recommended_chip in ("wildcard", "freehit") and c_eval.squad_candidate:
+                c_eval.squad_candidate.active_chip = recommended_chip
                 opt_result.candidates.insert(0, c_eval.squad_candidate)
         elif not enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
             rec = opt_result.chip_evaluation.recommended_chip
@@ -474,18 +489,16 @@ def run_pipeline(
 
     # 6. Gather News Intelligence & AI Decision Director Evaluation
     logger.info("Gathering live press conference & news intelligence...")
-    news_tracker = NewsTracker()
+    news_tracker = NewsTracker(search_timeout=3)
     focal_player_ids: Set[int] = set()
-    for cand in opt_result.candidates:
+    # Prioritize captains and transfer-in targets from top options
+    for cand in opt_result.candidates[:5]:
         if cand.captain:
             focal_player_ids.add(cand.captain.id)
         if cand.vice_captain:
             focal_player_ids.add(cand.vice_captain.id)
         for t in cand.transfers:
             focal_player_ids.add(t.player_in.id)
-            focal_player_ids.add(t.player_out.id)
-        for s in cand.starters:
-            focal_player_ids.add(s.id)
 
     news_intel = news_tracker.extract_focal_players_from_bootstrap(
         bootstrap_data=bootstrap,
@@ -502,8 +515,46 @@ def run_pipeline(
         chip_season_plan=chip_season_plan or None,
     )
 
-    # Attach active chip to final selected candidate if triggered
-    if active_chip:
+    # Check for AI Director Late Breaking News Veto & Instant Re-Solve
+    if decision.veto_player_ids:
+        logger.warning(
+            f"⚠️ AI Director issued late news emergency veto on player IDs: {decision.veto_player_ids}. "
+            f"Reason: {decision.veto_reason or 'Late injury/rotation doubt'}. Re-running MILP solver..."
+        )
+        for pid in decision.veto_player_ids:
+            if pid in optimizer.player_map:
+                optimizer.player_map[pid]["injury_multiplier"] = 0.0
+                optimizer.player_map[pid]["discounted_xp"] = 0.0
+                optimizer.player_map[pid]["xp"] = 0.0
+            optimizer.df.loc[optimizer.df["id"] == pid, "injury_multiplier"] = 0.0
+            optimizer.df.loc[optimizer.df["id"] == pid, "discounted_xp"] = 0.0
+            optimizer.df.loc[optimizer.df["id"] == pid, "xp"] = 0.0
+
+        opt_result = optimizer.optimize(
+            current_squad_ids=current_squad_ids,
+            bank_m=bank_m,
+            free_transfers=free_transfers,
+            selling_prices=selling_prices,
+            eo_weights=eo_weights,
+            current_gw=gw_id,
+            evaluate_chips=True,
+        )
+        logger.info(f"Re-solved! Generated {len(opt_result.candidates)} clean candidate options without vetoed players.")
+
+        decision = director.evaluate_and_decide(
+            opt_result,
+            league_analysis,
+            news_intel,
+            competitive_context=competitive_context or None,
+            chip_season_plan=chip_season_plan or None,
+        )
+
+    # Determine the actual active chip:
+    # 1) If the chosen candidate already carries a chip (e.g. Wildcard / Free Hit rebuild candidate), use it.
+    # 2) If a lineup chip (bboost, 3xc) was recommended & enabled, apply it to the chosen candidate.
+    active_chip: Optional[str] = decision.selected_candidate.active_chip
+    if enable_auto_chips and recommended_chip in ("bboost", "3xc") and not active_chip:
+        active_chip = recommended_chip
         decision.selected_candidate.active_chip = active_chip
         if active_chip == "bboost":
             bench_xp = sum(p.xp for p in decision.selected_candidate.bench)
@@ -626,7 +677,7 @@ def run_pipeline(
 
     # 9. Send Telegram Alerts
     notifier = TelegramNotifier()
-    if active_chip and triggered_chip_eval:
+    if active_chip and triggered_chip_eval and triggered_chip_eval.get("chip_name") == active_chip:
         notifier.notify_chip_triggered(
             chip_name=active_chip,
             display_name=triggered_chip_eval["display_name"],

@@ -1091,6 +1091,127 @@ def test_pipeline_with_auto_chip_execution(tmp_path, mock_bootstrap_data, mock_f
         assert call_args[1]["chip"] == result["active_chip"]
 
 
+def test_pipeline_wildcard_recommended_but_standard_move_selected(tmp_path, mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that when Wildcard threshold is met, but Director chooses a 1-transfer move, active_chip remains None."""
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "true")
+    monkeypatch.setenv("WILDCARD_MIN_XP_GAIN", "0.01")  # Low threshold to trigger Wildcard recommendation
+    monkeypatch.setenv("TRIPLE_CAPTAIN_MIN_XP", "999.0")
+    monkeypatch.setenv("BENCH_BOOST_MIN_BENCH_XP", "999.0")
+    monkeypatch.setenv("FREE_HIT_MIN_XP_GAIN", "999.0")
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = True
+    mock_client.validate_auth.return_value = (True, "Auth OK")
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    mock_client.get_entry_history.return_value = {}
+    mock_client.get_my_team.return_value = {
+        # Squad with low form players so Wildcard scratch squad provides massive xP gain
+        "picks": [{"element": i, "selling_price": 65} for i in [3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 27, 28, 29]],
+        "transfers": {"bank": 100, "limit": 1},
+    }
+    mock_client.post_transfers.return_value = {"status": "ok"}
+    mock_client.post_lineup.return_value = {"status": "ok"}
+
+    from src.main import run_pipeline
+
+    with patch("src.main.AIDirector") as mock_director_cls, patch("src.main.TelegramNotifier") as mock_notifier_cls:
+        mock_director = MagicMock()
+        mock_director_cls.return_value = mock_director
+        mock_notifier = MagicMock()
+        mock_notifier_cls.return_value = mock_notifier
+
+        # Simulate Director choosing Candidate 1 (the standard move, not the rebuild at candidate 0)
+        def mock_evaluate(opt_res, *args, **kwargs):
+            chosen = opt_res.candidates[1]
+            return DecisionOutput(
+                selected_candidate_index=1,
+                selected_candidate=chosen,
+                chosen_move_name=chosen.name,
+                transfers_description="Standard Move",
+                captain_name="GK_1",
+                vice_captain_name="GK_2",
+                projected_net_xp=chosen.net_xp,
+                rationale="Prefer saving Wildcard and making standard move.",
+                source="LLM_DIRECTOR",
+            )
+        mock_director.evaluate_and_decide.side_effect = mock_evaluate
+
+        result = run_pipeline(mock_client, dry_run=False, execute=True)
+
+        assert result["status"] == "success"
+        # Wildcard was NOT selected by the Director, so active_chip must be None!
+        assert result["active_chip"] is None
+        assert result["decision"]["selected_candidate"]["active_chip"] is None
+        # Telegram chip alert must NOT be dispatched
+        assert not mock_notifier.notify_chip_triggered.called
+        # Transfers must not include chips="wildcard"
+        if mock_client.post_transfers.called:
+            tx_call_args = mock_client.post_transfers.call_args[0]
+            assert tx_call_args[0].get("chips") is None
+
+
+def test_pipeline_wildcard_recommended_and_rebuild_selected(tmp_path, mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that when Wildcard threshold is met and Director selects Candidate 0, active_chip is wildcard."""
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "true")
+    monkeypatch.setenv("WILDCARD_MIN_XP_GAIN", "0.01")
+    monkeypatch.setenv("TRIPLE_CAPTAIN_MIN_XP", "999.0")
+    monkeypatch.setenv("BENCH_BOOST_MIN_BENCH_XP", "999.0")
+    monkeypatch.setenv("FREE_HIT_MIN_XP_GAIN", "999.0")
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = True
+    mock_client.validate_auth.return_value = (True, "Auth OK")
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    mock_client.get_entry_history.return_value = {}
+    mock_client.get_my_team.return_value = {
+        # Squad with low form players so Wildcard scratch squad provides massive xP gain
+        "picks": [{"element": i, "selling_price": 65} for i in [3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 27, 28, 29]],
+        "transfers": {"bank": 100, "limit": 1},
+    }
+    mock_client.post_transfers.return_value = {"status": "ok"}
+    mock_client.post_lineup.return_value = {"status": "ok"}
+
+    from src.main import run_pipeline
+
+    with patch("src.main.AIDirector") as mock_director_cls, patch("src.main.TelegramNotifier") as mock_notifier_cls:
+        mock_director = MagicMock()
+        mock_director_cls.return_value = mock_director
+        mock_notifier = MagicMock()
+        mock_notifier_cls.return_value = mock_notifier
+
+        # Simulate Director choosing Candidate 0 (the Wildcard rebuild squad)
+        def mock_evaluate(opt_res, *args, **kwargs):
+            chosen = opt_res.candidates[0]
+            return DecisionOutput(
+                selected_candidate_index=0,
+                selected_candidate=chosen,
+                chosen_move_name=chosen.name,
+                transfers_description="Full Rebuild",
+                captain_name="GK_1",
+                vice_captain_name="GK_2",
+                projected_net_xp=chosen.net_xp,
+                rationale="Full squad overhaul needed.",
+                source="LLM_DIRECTOR",
+            )
+        mock_director.evaluate_and_decide.side_effect = mock_evaluate
+
+        result = run_pipeline(mock_client, dry_run=False, execute=True)
+
+        assert result["status"] == "success"
+        assert result["active_chip"] == "wildcard"
+        assert result["decision"]["selected_candidate"]["active_chip"] == "wildcard"
+        assert mock_notifier.notify_chip_triggered.called
+        assert mock_client.post_transfers.called
+        tx_call_args = mock_client.post_transfers.call_args[0]
+        assert tx_call_args[0]["chips"] == "wildcard"
+
+
 # ==========================================
 # 9. Injury Discounting & Bench Ordering Tests
 # ==========================================
@@ -1417,6 +1538,70 @@ def test_calculate_fallback_xp_helper():
     assert fb["xp"] == 5.5
     assert fb["xp_source"] == "fpl_ep_next"
     assert fb["xp_3gw"] > fb["xp"]
+
+
+def test_decay_weights_and_horizon_length_in_optimizer():
+    """Test calculate_decay_weights helper and configurable horizon length."""
+    from src.engine.optimizer import calculate_decay_weights
+
+    # Horizon 1
+    w1, s1 = calculate_decay_weights(horizon_length=1, decay_factor=0.85)
+    assert w1 == [1.0]
+    assert s1 == 1.0
+
+    # Horizon 3
+    w3, s3 = calculate_decay_weights(horizon_length=3, decay_factor=0.85)
+    assert w3 == [1.0, 0.85, 0.7225]
+    assert s3 == 2.5725
+
+    # Horizon 5
+    w5, s5 = calculate_decay_weights(horizon_length=5, decay_factor=0.85)
+    assert len(w5) == 5
+    assert s5 == round(1.0 + 0.85 + 0.7225 + 0.6141 + 0.5220, 4)
+
+    raw_df = pd.DataFrame([{
+        "id": 1,
+        "web_name": "TestMID",
+        "element_type": 3,
+        "position": "MID",
+        "team_id": 1,
+        "team_name": "Team 1",
+        "team_code": "T01",
+        "cost_m": 6.0,
+        "xp": 10.0,
+        "status": "a",
+        "chance_of_playing_next_round": 100,
+    }])
+
+    opt_h5 = FPLOptimizer(raw_df, decay_factor=0.85, horizon_length=5, bench_weight=0.15)
+    assert opt_h5.horizon_length == 5
+    assert opt_h5.bench_weight == 0.15
+    assert opt_h5.decay_sum == s5
+    assert opt_h5.df.iloc[0]["discounted_3gw"] == round(10.0 * s5, 2)
+
+
+def test_bench_weight_sub_factor_in_optimizer(mock_bootstrap_data, mock_fixtures_data):
+    """Test that bench_weight (sub factor) affects MILP optimization properly."""
+    players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+    
+    # Custom sub factor = 0.20
+    optimizer = FPLOptimizer(players_df, bench_weight=0.20)
+    assert optimizer.bench_weight == 0.20
+    
+    initial_squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
+    opt_result = optimizer.optimize(
+        current_squad_ids=initial_squad,
+        bank_m=2.0,
+        free_transfers=1,
+        evaluate_chips=False,
+    )
+    assert len(opt_result.candidates) >= 1
+    # Check that lineup and bench are properly constructed
+    for cand in opt_result.candidates:
+        assert len(cand.starters) == 11
+        assert len(cand.bench) == 4
+        assert cand.formation in ["3-5-2", "3-4-3", "4-4-2", "4-3-3", "4-5-1", "5-3-2", "5-4-1", "5-2-3"]
+
 
 
 

@@ -70,10 +70,11 @@ def calculate_player_metrics(
     current_event: Optional[int] = None,
     fplreview_df: Optional[pd.DataFrame] = None,
     fplreview_xp_map: Optional[Dict[int, Any]] = None,
+    vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """
-    Process raw FPL bootstrap data, fixtures, and optional external FPL Review projections
-    into an enriched DataFrame with expected points (xP).
+    Process raw FPL bootstrap data, fixtures, optional external FPL Review projections,
+    and vaastav/Fantasy-Premier-League match logs into an enriched DataFrame with expected points (xP).
     Uses FPL Review xP when available, with a sensible fallback to official FPL ep_next or FDR baseline.
     """
     from src.data_fetcher import map_fplreview_to_elements
@@ -193,8 +194,10 @@ def calculate_player_metrics(
         # Check FPL Core Insights / External projection
         fplreview_val: Optional[float] = None
         fplreview_3gw_val: Optional[float] = None
+        n_horizon = int(os.getenv("HORIZON_LENGTH", "3"))
         decay_factor = float(os.getenv("DECAY_FACTOR", "0.85"))
-        decay_sum = 1.0 + decay_factor + (decay_factor ** 2)
+        decay_weights = [round(decay_factor ** t, 4) for t in range(max(1, n_horizon))]
+        decay_sum = sum(decay_weights)
         source_tag = "fpl_core_insights"
 
         if player_id in fplreview_map:
@@ -232,6 +235,25 @@ def calculate_player_metrics(
         except (ValueError, TypeError):
             price_momentum = 0.0
 
+        # Vaastav underlying statistics
+        v_data = (vaastav_stats or {}).get(player_id, {})
+        rolling_xgi_90 = v_data.get("rolling_xgi_90", 0.0)
+        rolling_xgc_90 = v_data.get("rolling_xgc_90", 0.0)
+        rolling_minutes_avg = v_data.get("rolling_minutes_avg", 90.0)
+        starts_ratio = v_data.get("starts_ratio", 1.0)
+        recent_matches_count = v_data.get("recent_matches_count", 0)
+
+        # Minutes reliability assessment
+        if recent_matches_count >= 2:
+            if starts_ratio < 0.50 or rolling_minutes_avg < 45:
+                minutes_reliability = "LOW"
+            elif starts_ratio < 0.75 or rolling_minutes_avg < 65:
+                minutes_reliability = "MEDIUM"
+            else:
+                minutes_reliability = "HIGH"
+        else:
+            minutes_reliability = "HIGH"
+
         records.append({
             "id": player_id,
             "web_name": web_name,
@@ -257,8 +279,12 @@ def calculate_player_metrics(
             "xp_3gw": xp_3gw,
             "xp_source": xp_source,
             "price_momentum": price_momentum,
+            "rolling_xgi_90": rolling_xgi_90,
+            "rolling_xgc_90": rolling_xgc_90,
+            "rolling_minutes_avg": rolling_minutes_avg,
+            "starts_ratio": starts_ratio,
+            "minutes_reliability": minutes_reliability,
         })
-
 
     df = pd.DataFrame(records)
     return df

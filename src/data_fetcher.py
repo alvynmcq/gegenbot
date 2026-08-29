@@ -173,6 +173,7 @@ class FPLCoreInsightsFetcher:
         bootstrap_data: Dict[str, Any],
         current_event: int = 1,
         decay_factor: Optional[float] = None,
+        horizon_length: Optional[int] = None,
     ) -> Dict[int, Dict[str, Any]]:
         """
         Map dataset rows to official FPL element IDs.
@@ -181,8 +182,10 @@ class FPLCoreInsightsFetcher:
         if df is None or df.empty:
             return {}
 
+        n_horizon = int(horizon_length if horizon_length is not None else os.getenv("HORIZON_LENGTH", "3"))
         gamma = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
-        decay_sum = 1.0 + gamma + (gamma ** 2)
+        decay_weights = [round(gamma ** t, 4) for t in range(max(1, n_horizon))]
+        decay_sum = sum(decay_weights)
 
         elements = bootstrap_data.get("elements", [])
         teams = bootstrap_data.get("teams", [])
@@ -229,9 +232,23 @@ class FPLCoreInsightsFetcher:
             logger.warning("Projections DataFrame does not contain recognizable ID, Name, or xP columns.")
             return {}
 
-        # Also identify next 2 gameweeks for discounted 3GW projection
-        gw_plus_1_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 1}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
-        gw_plus_2_col = next((c for c in df.columns if re.match(rf"^(gw)?{current_event + 2}(_pts|_xp|_points)?$", str(c), re.IGNORECASE)), None)
+        # Dynamically identify future gameweek columns up to horizon_length
+        future_gw_cols: List[Tuple[int, str]] = []
+        for t in range(1, max(1, n_horizon)):
+            target_gw = current_event + t
+            target_col = None
+            for pattern in [
+                re.compile(rf"^(gw)?{target_gw}(_pts|_xp|_points)?$", re.IGNORECASE),
+                re.compile(rf"^pts_{target_gw}$", re.IGNORECASE),
+            ]:
+                for col in df.columns:
+                    if pattern.match(str(col).strip()):
+                        target_col = col
+                        break
+                if target_col:
+                    break
+            if target_col:
+                future_gw_cols.append((t, target_col))
 
         # Build lookup tables for official FPL elements
         official_by_id = {el["id"]: el for el in elements}
@@ -248,13 +265,20 @@ class FPLCoreInsightsFetcher:
             t_short = team_id_to_short.get(team_id, "")
             t_name = team_id_to_name.get(team_id, "")
 
-            # Index by normalized name variants
-            for n in filter(None, [web_norm, second_norm, full_norm]):
-                official_by_norm_name.setdefault(n, []).append(el)
-                if t_short:
-                    official_by_team_and_name[f"{t_short}:{n}"] = el
-                if t_name:
-                    official_by_team_and_name[f"{t_name}:{n}"] = el
+            official_by_id[el_id] = el
+            if web_norm:
+                official_by_norm_name.setdefault(web_norm, []).append(el)
+            if full_norm and full_norm != web_norm:
+                official_by_norm_name.setdefault(full_norm, []).append(el)
+
+            if t_short and web_norm:
+                official_by_team_and_name[f"{t_short}:{web_norm}"] = el
+            if t_name and web_norm:
+                official_by_team_and_name[f"{t_name}:{web_norm}"] = el
+            if t_short and full_norm:
+                official_by_team_and_name[f"{t_short}:{full_norm}"] = el
+            if t_name and full_norm:
+                official_by_team_and_name[f"{t_name}:{full_norm}"] = el
 
         mapped_projections: Dict[int, Dict[str, Any]] = {}
 
@@ -263,9 +287,9 @@ class FPLCoreInsightsFetcher:
 
             if gw_col and gw_col in row:
                 try:
-                    raw_xp = float(row[gw_col])
-                    if not pd.isna(raw_xp):
-                        xp_val = round(max(0.0, raw_xp), 2)
+                    raw_val = float(row[gw_col])
+                    if not pd.isna(raw_val):
+                        xp_val = round(max(0.0, raw_val), 2)
                 except (ValueError, TypeError):
                     pass
 
@@ -280,25 +304,18 @@ class FPLCoreInsightsFetcher:
             if xp_val is None:
                 continue
 
-            # Calculate discounted multi-week projection: xP_t + (gamma * xP_{t+1}) + (gamma^2 * xP_{t+2})
+            # Calculate discounted multi-week projection with dynamic decay weighting
             multi_gw_sum = xp_val
             has_future_cols = False
-            if gw_plus_1_col and gw_plus_1_col in row:
-                try:
-                    p1 = float(row[gw_plus_1_col])
-                    if not pd.isna(p1):
-                        multi_gw_sum += gamma * max(0.0, p1)
-                        has_future_cols = True
-                except (ValueError, TypeError):
-                    pass
-            if gw_plus_2_col and gw_plus_2_col in row:
-                try:
-                    p2 = float(row[gw_plus_2_col])
-                    if not pd.isna(p2):
-                        multi_gw_sum += (gamma ** 2) * max(0.0, p2)
-                        has_future_cols = True
-                except (ValueError, TypeError):
-                    pass
+            for t_idx, col_name in future_gw_cols:
+                if col_name in row:
+                    try:
+                        p_future = float(row[col_name])
+                        if not pd.isna(p_future):
+                            multi_gw_sum += decay_weights[t_idx] * max(0.0, p_future)
+                            has_future_cols = True
+                    except (ValueError, TypeError):
+                        pass
 
             if has_future_cols:
                 xp_3gw_val = round(multi_gw_sum, 2)
@@ -371,13 +388,16 @@ def calculate_fallback_xp(
     avg_fdr: float = 3.0,
     availability: float = 1.0,
     decay_factor: Optional[float] = None,
+    horizon_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Calculate fallback baseline expected points for an individual player using
     ep_next, player form, points per game, and FDR rating without interrupting the pipeline.
     """
+    n_horizon = int(horizon_length if horizon_length is not None else os.getenv("HORIZON_LENGTH", "3"))
     gamma = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
-    decay_sum = 1.0 + gamma + (gamma ** 2)
+    decay_weights = [round(gamma ** t, 4) for t in range(max(1, n_horizon))]
+    decay_sum = sum(decay_weights)
 
     try:
         form = float(element.get("form", 0.0) or 0.0)
@@ -451,6 +471,7 @@ def map_fplreview_to_elements(
     bootstrap_data: Dict[str, Any],
     current_event: int = 1,
     decay_factor: Optional[float] = None,
+    horizon_length: Optional[int] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Helper function to map projections to official element IDs."""
     fetcher = FPLCoreInsightsFetcher()
@@ -459,7 +480,206 @@ def map_fplreview_to_elements(
         bootstrap_data,
         current_event=current_event,
         decay_factor=decay_factor,
+        horizon_length=horizon_length,
     )
 
 
 map_core_insights_to_elements = map_fplreview_to_elements
+
+
+class VaastavDataFetcher:
+    """
+    Fetches, parses, and aggregates match logs and underlying statistics
+    from the vaastav/Fantasy-Premier-League repository.
+    Supplies rolling xGI/90, xGC/90, actual minutes, and start reliability.
+    """
+    DEFAULT_SEASON = "2026-27"
+    FALLBACK_SEASONS = ["2026-27", "2025-26", "2024-25"]
+    BASE_GITHUB_RAW = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+
+    def __init__(
+        self,
+        season: Optional[str] = None,
+        base_url: Optional[str] = None,
+        local_dir: Optional[Union[str, Path]] = None,
+        timeout: int = 10,
+    ):
+        self.season = season or os.getenv("VAASTAV_SEASON", self.DEFAULT_SEASON)
+        self.base_url = (base_url or os.getenv("VAASTAV_DATA_URL") or f"{self.BASE_GITHUB_RAW}/{self.season}").rstrip("/")
+        self.local_dir = Path(local_dir or os.getenv("VAASTAV_LOCAL_DIR", "data"))
+        self.timeout = timeout
+
+    def fetch_merged_gw(self) -> Optional[pd.DataFrame]:
+        """Fetch merged_gw.csv from local cache or remote GitHub repository."""
+        candidate_paths = [
+            self.local_dir / "vaastav_merged_gw.csv",
+            self.local_dir / "merged_gw.csv",
+            Path("data/vaastav_merged_gw.csv"),
+            Path("data/merged_gw.csv"),
+        ]
+        for p in candidate_paths:
+            if p.exists() and p.is_file():
+                try:
+                    df = pd.read_csv(p)
+                    if not df.empty:
+                        logger.info(f"Loaded {len(df)} records from local Vaastav merged_gw file: {p}")
+                        return df
+                except Exception as e:
+                    logger.warning(f"Failed to read local Vaastav merged_gw CSV ({p}): {e}")
+
+        target_urls = [f"{self.base_url}/gws/merged_gw.csv"]
+        for s in self.FALLBACK_SEASONS:
+            fallback_url = f"{self.BASE_GITHUB_RAW}/{s}/gws/merged_gw.csv"
+            if fallback_url not in target_urls:
+                target_urls.append(fallback_url)
+
+        headers = {"User-Agent": "Gegenbot-FPL-Engine/2.0", "Accept": "text/csv, text/plain, */*"}
+        for url in target_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=self.timeout)
+                if resp.status_code == 200 and resp.text.strip() and not resp.text.strip().startswith("<!DOCTYPE") and not resp.text.strip().startswith("<html"):
+                    df = pd.read_csv(io.StringIO(resp.text))
+                    if not df.empty:
+                        logger.info(f"Successfully fetched {len(df)} Vaastav gameweek records from {url}")
+                        try:
+                            self.local_dir.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(self.local_dir / "vaastav_merged_gw.csv", index=False)
+                        except Exception:
+                            pass
+                        return df
+            except Exception as e:
+                logger.debug(f"Could not fetch Vaastav merged_gw from {url}: {e}")
+
+        return None
+
+    def fetch_players_raw(self) -> Optional[pd.DataFrame]:
+        """Fetch players_raw.csv from local cache or remote GitHub repository."""
+        candidate_paths = [
+            self.local_dir / "vaastav_players_raw.csv",
+            self.local_dir / "players_raw.csv",
+            Path("data/vaastav_players_raw.csv"),
+            Path("data/players_raw.csv"),
+        ]
+        for p in candidate_paths:
+            if p.exists() and p.is_file():
+                try:
+                    df = pd.read_csv(p)
+                    if not df.empty:
+                        logger.info(f"Loaded {len(df)} records from local Vaastav players_raw file: {p}")
+                        return df
+                except Exception as e:
+                    logger.warning(f"Failed to read local Vaastav players_raw CSV ({p}): {e}")
+
+        target_urls = [f"{self.base_url}/players_raw.csv"]
+        for s in self.FALLBACK_SEASONS:
+            fallback_url = f"{self.BASE_GITHUB_RAW}/{s}/players_raw.csv"
+            if fallback_url not in target_urls:
+                target_urls.append(fallback_url)
+
+        headers = {"User-Agent": "Gegenbot-FPL-Engine/2.0", "Accept": "text/csv, text/plain, */*"}
+        for url in target_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=self.timeout)
+                if resp.status_code == 200 and resp.text.strip() and not resp.text.strip().startswith("<!DOCTYPE") and not resp.text.strip().startswith("<html"):
+                    df = pd.read_csv(io.StringIO(resp.text))
+                    if not df.empty:
+                        logger.info(f"Successfully fetched {len(df)} Vaastav players_raw records from {url}")
+                        try:
+                            self.local_dir.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(self.local_dir / "vaastav_players_raw.csv", index=False)
+                        except Exception:
+                            pass
+                        return df
+            except Exception as e:
+                logger.debug(f"Could not fetch Vaastav players_raw from {url}: {e}")
+
+        return None
+
+    def calculate_player_underlying_metrics(
+        self,
+        merged_gw_df: Optional[pd.DataFrame] = None,
+        players_raw_df: Optional[pd.DataFrame] = None,
+        lookback_gws: int = 4,
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Calculate rolling player-level underlying form and minutes reliability:
+        - rolling_xgi_90: Expected Goal Involvements per 90 in recent GWs
+        - rolling_xgc_90: Expected Goals Conceded per 90 in recent GWs
+        - rolling_minutes_avg: Average minutes in recent GWs
+        - starts_ratio: Ratio of starts in recent appearances
+        - season_xgi_90: Overall season xGI/90 from players_raw
+        """
+        if merged_gw_df is None:
+            merged_gw_df = self.fetch_merged_gw()
+        if players_raw_df is None:
+            players_raw_df = self.fetch_players_raw()
+
+        results: Dict[int, Dict[str, Any]] = {}
+
+        # 1. Process players_raw for baseline per-90 metrics
+        if players_raw_df is not None and not players_raw_df.empty:
+            id_col = "id" if "id" in players_raw_df.columns else None
+            for _, row in players_raw_df.iterrows():
+                try:
+                    p_id = int(row[id_col]) if id_col else None
+                    if p_id is None:
+                        continue
+                    xgi_90 = float(row.get("expected_goal_involvements_per_90", 0.0) or 0.0)
+                    xg_90 = float(row.get("expected_goals_per_90", 0.0) or 0.0)
+                    xa_90 = float(row.get("expected_assists_per_90", 0.0) or 0.0)
+                    xgc_90 = float(row.get("expected_goals_conceded_per_90", 0.0) or 0.0)
+                    def_contrib_90 = float(row.get("defensive_contribution_per_90", 0.0) or 0.0)
+                    results[p_id] = {
+                        "season_xgi_90": round(xgi_90 or (xg_90 + xa_90), 2),
+                        "season_xg_90": round(xg_90, 2),
+                        "season_xa_90": round(xa_90, 2),
+                        "season_xgc_90": round(xgc_90, 2),
+                        "def_contrib_90": round(def_contrib_90, 2),
+                        "rolling_xgi_90": round(xgi_90 or (xg_90 + xa_90), 2),
+                        "rolling_xgc_90": round(xgc_90, 2),
+                        "rolling_minutes_avg": float(row.get("minutes", 0) or 0),
+                        "starts_ratio": 1.0,
+                        "recent_matches_count": 0,
+                    }
+                except Exception:
+                    continue
+
+        # 2. Process merged_gw for recent rolling match stats
+        if merged_gw_df is not None and not merged_gw_df.empty:
+            element_col = "element" if "element" in merged_gw_df.columns else ("id" if "id" in merged_gw_df.columns else None)
+            round_col = "round" if "round" in merged_gw_df.columns else ("GW" if "GW" in merged_gw_df.columns else None)
+
+            if element_col and round_col:
+                max_round = merged_gw_df[round_col].max()
+                min_round = max(1, max_round - lookback_gws + 1)
+                recent_df = merged_gw_df[merged_gw_df[round_col] >= min_round]
+
+                for element_id, group in recent_df.groupby(element_col):
+                    try:
+                        p_id = int(element_id)
+                        total_mins = float(group["minutes"].sum() if "minutes" in group.columns else 0)
+                        total_xgi = float(group["expected_goal_involvements"].sum() if "expected_goal_involvements" in group.columns else 0.0)
+                        total_xgc = float(group["expected_goals_conceded"].sum() if "expected_goals_conceded" in group.columns else 0.0)
+                        total_starts = float(group["starts"].sum() if "starts" in group.columns else (group["minutes"] >= 60).sum())
+                        matches_count = len(group)
+
+                        rolling_xgi_90 = round((total_xgi / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgi_90", 0.0))
+                        rolling_xgc_90 = round((total_xgc / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgc_90", 0.0))
+                        avg_mins = round(total_mins / matches_count, 1) if matches_count > 0 else 0.0
+                        starts_ratio = round(total_starts / matches_count, 2) if matches_count > 0 else 1.0
+
+                        if p_id not in results:
+                            results[p_id] = {}
+                        results[p_id].update({
+                            "rolling_xgi_90": rolling_xgi_90,
+                            "rolling_xgc_90": rolling_xgc_90,
+                            "rolling_minutes_avg": avg_mins,
+                            "starts_ratio": starts_ratio,
+                            "recent_matches_count": matches_count,
+                        })
+                    except Exception:
+                        continue
+
+        logger.info(f"Computed Vaastav underlying form metrics for {len(results)} players.")
+        return results
+

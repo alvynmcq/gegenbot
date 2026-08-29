@@ -162,13 +162,14 @@ class NewsTracker:
         official_fpl_news: str = "",
         news_added: Optional[str] = None,
         fetch_live_web: bool = True,
+        is_focal: bool = False,
     ) -> PlayerNewsIntel:
         """Create a PlayerNewsIntel record with live search grounding if warranted."""
         risk = self._determine_risk_level(status, chance_of_playing_next_round, official_fpl_news)
         snippets: List[str] = []
 
-        # Only query web search if player is flagged or is a high-priority target
-        if fetch_live_web and (risk != "CLEARED" or official_fpl_news):
+        # Query web search if player is flagged or is an active focal target/captain
+        if fetch_live_web and (risk != "CLEARED" or official_fpl_news or is_focal):
             snippets = self._search_web_snippets(web_name, team_name)
 
         # Compute freshness in hours from news_added ISO timestamp
@@ -184,6 +185,10 @@ class NewsTracker:
         # Compute sentiment from all available text
         combined_text = " ".join([official_fpl_news] + snippets)
         sentiment = self._compute_sentiment(combined_text) if combined_text.strip() else 0.0
+
+        # If live snippets indicate bad news even without official FPL flag, adjust risk level
+        if risk == "CLEARED" and sentiment <= -0.50:
+            risk = "MONITOR"
 
         return PlayerNewsIntel(
             player_id=player_id,
@@ -234,6 +239,7 @@ class NewsTracker:
                     official_fpl_news=news,
                     news_added=news_added,
                     fetch_live_web=is_focal,
+                    is_focal=is_focal,
                 )
                 intel_map[p_id] = intel
 

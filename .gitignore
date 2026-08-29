@@ -11,8 +11,8 @@ venv/
 # App runtime & data
 logs/
 *.log
-data/fplreview.csv
-data/*.json
+data/
+!data/.gitkeep
 
 # IDEs & System
 .DS_Store

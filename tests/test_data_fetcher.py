@@ -70,3 +70,82 @@ def test_fpl_core_insights_html_rejection():
 
     df = fetcher.fetch_projections(csv_content=html_content)
     assert df is None
+
+
+def test_vaastav_fetcher_rolling_metrics():
+    from src.data_fetcher import VaastavDataFetcher
+
+    players_raw_df = pd.DataFrame([
+        {
+            "id": 1,
+            "web_name": "Saka",
+            "expected_goals_per_90": 0.35,
+            "expected_assists_per_90": 0.25,
+            "expected_goal_involvements_per_90": 0.60,
+            "expected_goals_conceded_per_90": 0.80,
+            "minutes": 180,
+        },
+        {
+            "id": 2,
+            "web_name": "Haaland",
+            "expected_goals_per_90": 0.85,
+            "expected_assists_per_90": 0.15,
+            "expected_goal_involvements_per_90": 1.00,
+            "expected_goals_conceded_per_90": 0.70,
+            "minutes": 180,
+        },
+    ])
+
+    merged_gw_df = pd.DataFrame([
+        # GW1
+        {"element": 1, "round": 1, "minutes": 90, "expected_goal_involvements": 0.80, "expected_goals_conceded": 0.50, "starts": 1},
+        {"element": 2, "round": 1, "minutes": 90, "expected_goal_involvements": 1.20, "expected_goals_conceded": 0.40, "starts": 1},
+        # GW2
+        {"element": 1, "round": 2, "minutes": 90, "expected_goal_involvements": 0.40, "expected_goals_conceded": 0.60, "starts": 1},
+        {"element": 2, "round": 2, "minutes": 90, "expected_goal_involvements": 0.80, "expected_goals_conceded": 0.50, "starts": 1},
+    ])
+
+    fetcher = VaastavDataFetcher()
+    stats = fetcher.calculate_player_underlying_metrics(merged_gw_df=merged_gw_df, players_raw_df=players_raw_df)
+
+    assert 1 in stats
+    assert 2 in stats
+    assert stats[1]["rolling_xgi_90"] == 0.60  # (1.20 / (180/90)) = 0.60
+    assert stats[2]["rolling_xgi_90"] == 1.00  # (2.00 / (180/90)) = 1.00
+    assert stats[1]["starts_ratio"] == 1.0
+    assert stats[1]["rolling_minutes_avg"] == 90.0
+
+
+def test_vaastav_enrichment_in_calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data):
+    vaastav_stats = {
+        1: {
+            "rolling_xgi_90": 0.75,
+            "rolling_xgc_90": 0.40,
+            "rolling_minutes_avg": 90.0,
+            "starts_ratio": 1.0,
+            "recent_matches_count": 3,
+        },
+        2: {
+            "rolling_xgi_90": 0.05,
+            "rolling_xgc_90": 1.80,
+            "rolling_minutes_avg": 30.0,
+            "starts_ratio": 0.33,
+            "recent_matches_count": 3,
+        }
+    }
+
+    players_df = calculate_player_metrics(
+        mock_bootstrap_data,
+        mock_fixtures_data,
+        current_event=1,
+        vaastav_stats=vaastav_stats,
+    )
+
+    p1 = players_df[players_df["id"] == 1].iloc[0]
+    p2 = players_df[players_df["id"] == 2].iloc[0]
+
+    assert p1["rolling_xgi_90"] == 0.75
+    assert p1["minutes_reliability"] == "HIGH"
+
+    assert p2["rolling_xgi_90"] == 0.05
+    assert p2["minutes_reliability"] == "LOW"

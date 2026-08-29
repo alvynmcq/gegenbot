@@ -21,11 +21,28 @@ logger = logging.getLogger(__name__)
 
 def get_solver(msg: bool = False, time_limit: Optional[int] = None) -> pulp.LpSolver:
     """
-    Return the HiGHS solver backend with graceful fallback to PULP_CBC_CMD.
-    HiGHS provides superior linear and mixed-integer programming performance.
-    Gracefully falls back on ARM64 / Raspberry Pi or when highspy is not available.
+    Return the optimal MILP solver backend:
+    1. Gurobi (if SOLVER_BACKEND=gurobi or gurobipy is installed and licensed)
+    2. HiGHS (highspy direct API or HiGHS_CMD binary) — state-of-the-art open-source default
+    3. PULP_CBC_CMD (graceful fallback)
     """
-    # 1. Attempt HiGHS direct Python API
+    backend = os.getenv("SOLVER_BACKEND", "highs").lower().strip()
+
+    # 1. Attempt Gurobi if explicitly requested or if gurobipy is available
+    if backend == "gurobi":
+        try:
+            if hasattr(pulp, "GUROBI"):
+                solver = pulp.GUROBI(msg=msg, timeLimit=time_limit)
+                if solver.available():
+                    return solver
+            if hasattr(pulp, "GUROBI_CMD"):
+                solver = pulp.GUROBI_CMD(msg=msg, timeLimit=time_limit)
+                if solver.available():
+                    return solver
+        except Exception as exc:
+            logger.debug(f"Gurobi solver requested but not available ({exc}). Falling back to HiGHS.")
+
+    # 2. Attempt HiGHS direct Python API (Default open-source solver)
     try:
         if hasattr(pulp, "getSolver"):
             solver = pulp.getSolver("HiGHS", msg=msg, timeLimit=time_limit)
@@ -34,7 +51,7 @@ def get_solver(msg: bool = False, time_limit: Optional[int] = None) -> pulp.LpSo
     except Exception as exc:
         logger.debug(f"HiGHS solver via getSolver not available: {exc}")
 
-    # 2. Attempt HiGHS_CMD binary solver
+    # 3. Attempt HiGHS_CMD binary solver
     try:
         if hasattr(pulp, "HiGHS_CMD"):
             solver = pulp.HiGHS_CMD(msg=msg, timeLimit=time_limit)
@@ -43,7 +60,7 @@ def get_solver(msg: bool = False, time_limit: Optional[int] = None) -> pulp.LpSo
     except Exception as exc:
         logger.debug(f"HiGHS_CMD binary solver not available: {exc}")
 
-    # 3. Graceful fallback to PULP_CBC_CMD
+    # 4. Graceful fallback to PULP_CBC_CMD
     logger.debug("Using PULP_CBC_CMD solver fallback.")
     return pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit)
 
@@ -120,6 +137,10 @@ class PlayerPick(BaseModel):
     xp_source: Optional[str] = None
     xp_confidence: str = "HIGH"  # "HIGH", "MEDIUM", "LOW" — based on source agreement
     price_momentum: float = 0.0  # -1.0 (falling) to +1.0 (rising); from event transfer volume
+    rolling_xgi_90: Optional[float] = None  # Expected Goal Involvements per 90 from Vaastav dataset
+    rolling_xgc_90: Optional[float] = None  # Expected Goals Conceded per 90 from Vaastav dataset
+    minutes_reliability: Optional[str] = None  # "HIGH", "MEDIUM", "LOW" based on recent start/sub frequency
+    starts_ratio: Optional[float] = None  # Ratio of recent matches started
     is_starter: bool = False
     is_captain: bool = False
     is_vice_captain: bool = False
@@ -196,25 +217,46 @@ def _parse_target_gws(env_var_name: str) -> List[int]:
     return targets
 
 
+def calculate_decay_weights(horizon_length: int = 3, decay_factor: float = 0.85) -> Tuple[List[float], float]:
+    """
+    Calculate exponential decay weights [gamma^0, gamma^1, ..., gamma^(N-1)] and their sum.
+    e.g. For horizon=3, decay=0.85: [1.0, 0.85, 0.7225], sum = 2.5725.
+    """
+    n = max(1, horizon_length)
+    weights = [round(decay_factor ** t, 4) for t in range(n)]
+    return weights, round(sum(weights), 4)
+
+
 class FPLOptimizer:
     """Advanced MILP solver for FPL squad optimization with Multi-Period Horizon and Game Theory."""
 
-    def __init__(self, players_df: pd.DataFrame, decay_factor: Optional[float] = None):
+    def __init__(
+        self,
+        players_df: pd.DataFrame,
+        decay_factor: Optional[float] = None,
+        horizon_length: Optional[int] = None,
+        bench_weight: Optional[float] = None,
+    ):
         """
         Initialize optimizer with player DataFrame and apply injury/rotation status discounting.
-        Incorporates configurable horizon decay factor (gamma) for multi-gameweek lookahead.
+        Incorporates configurable horizon decay factor (gamma), horizon lookahead length (N),
+        and bench strength auto-sub weighting factor.
         Expected columns: id, web_name, element_type, position, team_id, team_name, team_code, cost_m, xp
         Optional columns: xp_3gw, status, chance_of_playing_next_round, fixtures_in_gw
         """
         self.df = players_df.copy().reset_index(drop=True)
         self.decay_factor = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
-        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
+        self.horizon_length = int(horizon_length if horizon_length is not None else os.getenv("HORIZON_LENGTH", "3"))
+        self.bench_weight = float(
+            bench_weight if bench_weight is not None else os.getenv("BENCH_WEIGHT_FACTOR", os.getenv("SUB_FACTOR", "0.10"))
+        )
+        self.decay_weights, self.decay_sum = calculate_decay_weights(self.horizon_length, self.decay_factor)
 
         if "raw_xp" not in self.df.columns:
             self.df["raw_xp"] = self.df["xp"]
 
         if "xp_3gw" not in self.df.columns:
-            self.df["xp_3gw"] = self.df["xp"] * decay_sum
+            self.df["xp_3gw"] = self.df["xp"] * self.decay_sum
 
         if "fixtures_in_gw" not in self.df.columns:
             self.df["fixtures_in_gw"] = 1
@@ -230,7 +272,7 @@ class FPLOptimizer:
             raw = float(row.get("raw_xp", row.get("xp", 0.0)))
             disc = round(raw * mult, 2)
             discounted_xps.append(disc)
-            raw_3gw = float(row.get("xp_3gw", raw * decay_sum))
+            raw_3gw = float(row.get("xp_3gw", raw * self.decay_sum))
             discounted_3gw.append(round(raw_3gw * mult, 2))
 
         self.df["injury_multiplier"] = multipliers
@@ -255,8 +297,7 @@ class FPLOptimizer:
         rev_xp = info.get("fplreview_xp")
         raw_xp = float(info.get("raw_xp", info["xp"]))
         disc_xp = float(info.get("discounted_xp", info["xp"]))
-        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
-        xp_3gw_val = float(info.get("discounted_3gw", disc_xp * decay_sum))
+        xp_3gw_val = float(info.get("discounted_3gw", disc_xp * self.decay_sum))
         mult = float(info.get("injury_multiplier", 1.0))
         chance_val = info.get("chance_of_playing_next_round")
         chance_int = int(chance_val) if chance_val is not None and not pd.isna(chance_val) else None
@@ -279,6 +320,10 @@ class FPLOptimizer:
             xp_confidence = "MEDIUM"
 
         price_momentum_val = float(info.get("price_momentum", 0.0))
+        rolling_xgi_val = float(info["rolling_xgi_90"]) if "rolling_xgi_90" in info and not pd.isna(info["rolling_xgi_90"]) else None
+        rolling_xgc_val = float(info["rolling_xgc_90"]) if "rolling_xgc_90" in info and not pd.isna(info["rolling_xgc_90"]) else None
+        minutes_reliability_val = str(info["minutes_reliability"]) if "minutes_reliability" in info and info["minutes_reliability"] else None
+        starts_ratio_val = float(info["starts_ratio"]) if "starts_ratio" in info and not pd.isna(info["starts_ratio"]) else None
 
         return PlayerPick(
             id=player_id,
@@ -300,6 +345,10 @@ class FPLOptimizer:
             xp_source=info.get("xp_source"),
             xp_confidence=xp_confidence,
             price_momentum=price_momentum_val,
+            rolling_xgi_90=rolling_xgi_val,
+            rolling_xgc_90=rolling_xgc_val,
+            minutes_reliability=minutes_reliability_val,
+            starts_ratio=starts_ratio_val,
             is_starter=is_starter,
             is_captain=is_captain,
             is_vice_captain=is_vice_captain,
@@ -377,33 +426,38 @@ class FPLOptimizer:
         fwd_count = 0
         for i in selected_starter_indices:
             p_id = player_ids[i]
-            pos = self.df.loc[i, "position"]
-            if pos == "DEF":
+            pos_type = elem_types[i]
+            if pos_type == 2:
                 def_count += 1
-            elif pos == "MID":
+            elif pos_type == 3:
                 mid_count += 1
-            elif pos == "FWD":
+            elif pos_type == 4:
                 fwd_count += 1
-
             starters.append(self._build_player_pick(
                 p_id,
                 is_starter=True,
-                is_captain=(i == captain_idx),
-                is_vice_captain=False,
                 selling_price_m=sp_map.get(p_id),
             ))
 
-        starters.sort(key=lambda p: (p.element_type, -p.xp))
         formation = f"{def_count}-{mid_count}-{fwd_count}"
 
-        captain_pick = next((p for p in starters if p.is_captain), starters[0])
+        # Captain
+        captain_pid = player_ids[captain_idx]
+        captain_pick: Optional[PlayerPick] = None
+        for p in starters:
+            if p.id == captain_pid:
+                p.is_captain = True
+                captain_pick = p
+                break
+        if captain_pick is None:
+            captain_pick = starters[0]
+            captain_pick.is_captain = True
 
-        # 2. Vice-Captain Safety Rule:
-        # Highest xP outfield starter who is 100% available
+        # 2. Vice-Captain with strict 100% availability rule:
         outfield_starters = [p for p in starters if p.element_type != 1 and p.id != captain_pick.id]
         safe_candidates = [
             p for p in outfield_starters
-            if (p.status == "a" and (p.chance_of_playing_next_round == 100 or p.chance_of_playing_next_round is None) and p.injury_multiplier >= 1.0)
+            if p.injury_multiplier == 1.0 and (p.chance_of_playing_next_round is None or p.chance_of_playing_next_round == 100)
         ]
 
         if safe_candidates:
@@ -422,9 +476,6 @@ class FPLOptimizer:
             vc_pick = starters[0]
 
         # 3. Bench Priority Ordering (Picks 12 to 15):
-        # Pick 12 (bench_order 0): Substitute Goalkeeper
-        # Picks 13, 14, 15 (bench_order 1, 2, 3): Outfield subs in descending order of discounted xP.
-        # Tie-breakers: higher fixture difficulty rating or expected minutes/form.
         bench_indices = [i for i in indices if player_ids[i] in selected_squad_ids and i not in selected_starter_indices]
         bench_gkp_idx = next(i for i in bench_indices if elem_types[i] == 1)
         bench_outfield_indices = [i for i in bench_indices if elem_types[i] != 1]
@@ -521,14 +572,14 @@ class FPLOptimizer:
 
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
-        # 7. Objective with optional EO shield weighting
+        # 7. Objective with optional EO shield weighting and sub factor bench weighting
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
         prob += pulp.lpSum([
             starter_vars[i] * (xps[i] + eo_boosts[i])
             + captain_vars[i] * xps[i]
-            + (squad_vars[i] - starter_vars[i]) * 0.01 * xps[i]
+            + (squad_vars[i] - starter_vars[i]) * self.bench_weight * xps[i]
             for i in indices
         ]), "TotalXP"
 
@@ -573,8 +624,7 @@ class FPLOptimizer:
         net_xp = gross_xp
 
         # Multi-GW decayed outlook sum (3-GW)
-        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
-        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * decay_sum)), 2)
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * self.decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * self.decay_sum)), 2)
 
         total_cost_m = round(sum(self.player_map[pid]["cost_m"] for pid in selected_squad_ids), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
@@ -699,16 +749,15 @@ class FPLOptimizer:
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
-        decay_sum = 1.0 + self.decay_factor + (self.decay_factor ** 2)
         blended_xps = [
-            round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / decay_sum), 3)
+            round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / self.decay_sum), 3)
             for i in indices
         ]
 
         prob += pulp.lpSum([
             starter_vars[i] * (blended_xps[i] + eo_boosts[i])
             + captain_vars[i] * blended_xps[i]
-            + (squad_vars[i] - starter_vars[i]) * 0.01 * blended_xps[i]
+            + (squad_vars[i] - starter_vars[i]) * self.bench_weight * blended_xps[i]
             for i in indices
         ]), "TotalXP"
 
@@ -760,15 +809,14 @@ class FPLOptimizer:
 
         starters_xp_sum = sum(p.xp for p in starters)
         gross_xp = round(starters_xp_sum + captain_pick.xp, 2)
-
-        extra_transfers = max(0, actual_transfers_count - free_transfers)
-        hit_cost = extra_transfers * 4
+        paid_transfers = max(0, actual_transfers_count - free_transfers)
+        hit_cost = paid_transfers * 4
         net_xp = round(gross_xp - hit_cost, 2)
 
-        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * decay_sum)), 2)
+        multi_gw_sum = round(sum(p.xp_3gw or (p.xp * self.decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * self.decay_sum)), 2)
 
         roll_bonus = rolling_bonus_xp if actual_transfers_count == 0 else 0.0
-        strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / decay_sum) * 0.15, 2)
+        strategic_value_score = round(net_xp + roll_bonus + (multi_gw_sum / self.decay_sum) * 0.15, 2)
 
         total_cost_m = round(sum(effective_costs[i] for i in selected_squad_indices), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)

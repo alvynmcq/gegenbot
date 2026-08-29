@@ -26,6 +26,10 @@ class DecisionOutput(BaseModel):
     rationale: str
     source: str  # "LLM_DIRECTOR" or "MATHEMATICAL_FALLBACK"
     news_alerts: List[str] = Field(default_factory=list)
+    captain_override: Optional[str] = None
+    vice_captain_override: Optional[str] = None
+    veto_player_ids: List[int] = Field(default_factory=list)
+    veto_reason: Optional[str] = None
 
 
 class AIDirector:
@@ -91,7 +95,6 @@ class AIDirector:
         if not candidates:
             raise ValueError("No candidates available for fallback decision.")
 
-        # Sort candidates by strategic value score descending (accounting for FT banking and hit hurdle)
         best_candidate_idx = 0
         best_score = -999.0
         for idx, cand in enumerate(candidates):
@@ -115,7 +118,6 @@ class AIDirector:
         )
 
         logger.info(f"Fallback decision made: Option {best_candidate_idx + 1} ({chosen.name})")
-
         news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
 
         return DecisionOutput(
@@ -159,7 +161,7 @@ class AIDirector:
             vc_name = cand.vice_captain.web_name if cand.vice_captain else "N/A"
             tx_list = [f"OUT: {t.player_out.web_name} (£{t.player_out.cost_m}m) ➔ IN: {t.player_in.web_name} (£{t.player_in.cost_m}m)" for t in cand.transfers]
 
-            # xP confidence flags for transfer targets
+            # xP confidence flags and underlying Vaastav stats for transfer targets
             xp_flags = []
             for t in cand.transfers:
                 conf = t.player_in.xp_confidence
@@ -168,14 +170,20 @@ class AIDirector:
                 if abs(t.player_in.price_momentum) >= 0.1:
                     direction = "rising" if t.player_in.price_momentum > 0 else "falling"
                     xp_flags.append(f"{t.player_in.web_name} price {direction} (momentum: {t.player_in.price_momentum:+.2f})")
+                if t.player_in.rolling_xgi_90 is not None and t.player_in.rolling_xgi_90 >= 0.40:
+                    xp_flags.append(f"{t.player_in.web_name} strong underlying attacking threat ({t.player_in.rolling_xgi_90:.2f} xGI/90)")
+                if t.player_in.minutes_reliability == "LOW":
+                    xp_flags.append(f"{t.player_in.web_name} minutes risk (recent starts/mins below threshold)")
 
             bench_summary = [f"{p.web_name} (Sub #{p.bench_order})" for p in cand.bench]
+            starter_names = [p.web_name for p in cand.starters]
             candidate_summaries.append({
                 "candidate_index": idx,
                 "option_name": cand.name,
                 "transfers_count": cand.transfers_count,
                 "transfers": tx_list if tx_list else ["Roll / No transfers"],
                 "formation": cand.formation,
+                "starters": starter_names,
                 "captain": c_name,
                 "vice_captain": vc_name,
                 "vice_captain_strategy": cand.vice_captain_strategy,
@@ -215,6 +223,13 @@ class AIDirector:
         max_idx = len(candidates) - 1
         risk_mode = (competitive_context or {}).get("risk_mode", "NEUTRAL")
         risk_note = (competitive_context or {}).get("risk_mode_note", "")
+
+        manager_decryption_rubric = {
+            "high_rotation_or_cameo_risk": "Phrases like 'felt something in training', 'assess in the morning', 'touch and go', 'illness', 'managing his load', 'European game coming'. Action: Avoid captaincy; ensure reliable vice-captain; favor alternative candidates.",
+            "cleared_solid_starter": "Phrases like 'trained fully all week', 'ready to go', 'cleared by medical team', 'no concerns'. Action: Full confidence.",
+            "emergency_veto_rule": "If breaking news reveals a target in the solver's top candidates is definitively OUT or benched, specify veto_player_ids to trigger an instant mathematical re-solve."
+        }
+
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
@@ -224,14 +239,14 @@ class AIDirector:
                 "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
                 "If risk_mode is CHASE: consider hits and differentials to gain ground. "
                 "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "
-                "Carefully consider alternative moves if the top-ranked transfer target carries late injury, rotation, or minutes risk from press conferences. "
-                "Pay attention to vice_captain_strategy — validate or override if news changes risk profile. "
-                "Treat xP_data_flags as warnings: LOW confidence or FALLING price momentum should reduce preference for that transfer. "
+                "Decide whether to accept or override the solver's Captain / Vice-Captain based on manager press conference quotes. "
+                "If breaking news reveals that a transfer target is unexpectedly injured or benched, you may issue a 'veto_player_ids' to trigger a clean re-solve. "
                 "Provide your tactical rationale in EXACTLY two concise, impactful sentences balancing "
                 "expected points (xP), injury safety from latest news, defensive shielding vs differential upside, "
                 "and your competitive position. "
                 "Respond in strictly valid JSON format matching the schema."
             ),
+            "manager_decryption_rubric": manager_decryption_rubric,
             "competitive_context": competitive_context or {},
             "chip_season_plan": chip_season_plan or {},
             "candidates": candidate_summaries,
@@ -239,6 +254,10 @@ class AIDirector:
             "breaking_news_and_injuries": news_list[:15],
             "schema": {
                 "selected_candidate_index": f"int (0 to {max_idx})",
+                "captain_override": "optional str (web_name of starter to captain, or null)",
+                "vice_captain_override": "optional str (web_name of starter to vice-captain, or null)",
+                "veto_player_ids": "optional list[int] (player IDs to veto due to late breaking news)",
+                "veto_reason": "optional str",
                 "rationale": "str (concise 2-sentence tactical rationale)"
             }
         }
@@ -270,7 +289,35 @@ class AIDirector:
                 chosen_idx = 0
             rationale_text = parsed.get("rationale", "").strip()
 
+            captain_override = parsed.get("captain_override")
+            vice_captain_override = parsed.get("vice_captain_override")
+            veto_player_ids = [int(pid) for pid in parsed.get("veto_player_ids", []) if str(pid).isdigit()]
+            veto_reason = parsed.get("veto_reason")
+
             chosen = candidates[chosen_idx]
+
+            # Process Captain Override if valid starter in chosen squad
+            if captain_override and isinstance(captain_override, str):
+                target_norm = captain_override.strip().lower()
+                for p in chosen.starters:
+                    if p.web_name.lower() == target_norm:
+                        for s in chosen.starters:
+                            s.is_captain = (s.id == p.id)
+                        chosen.captain = p
+                        logger.info(f"AI Director overrode captain to: {p.web_name}")
+                        break
+
+            # Process Vice-Captain Override if valid starter in chosen squad
+            if vice_captain_override and isinstance(vice_captain_override, str):
+                target_norm = vice_captain_override.strip().lower()
+                for p in chosen.starters:
+                    if p.web_name.lower() == target_norm and not p.is_captain:
+                        for s in chosen.starters:
+                            s.is_vice_captain = (s.id == p.id)
+                        chosen.vice_captain = p
+                        logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
+                        break
+
             c_name = chosen.captain.web_name if chosen.captain else "Unknown"
             vc_name = chosen.vice_captain.web_name if chosen.vice_captain else "Unknown"
 
@@ -286,7 +333,6 @@ class AIDirector:
                 )
 
             logger.info(f"AI Director decision received: Option {chosen_idx + 1} ({chosen.name})")
-
             news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
 
             return DecisionOutput(
@@ -300,6 +346,10 @@ class AIDirector:
                 rationale=rationale_text,
                 source="LLM_DIRECTOR",
                 news_alerts=news_alerts,
+                captain_override=captain_override,
+                vice_captain_override=vice_captain_override,
+                veto_player_ids=veto_player_ids,
+                veto_reason=veto_reason,
             )
 
         except Exception as exc:
