@@ -478,11 +478,6 @@ def run_pipeline(
                 f"(Gain: +{c_eval.xp_gain:.2f} xP | Total: {c_eval.projected_xp:.2f} pts)"
             )
             logger.info(f"   Rationale: {c_eval.reason}")
-
-            # If Wildcard or Free Hit, inject optimal scratch squad candidate
-            if recommended_chip in ("wildcard", "freehit") and c_eval.squad_candidate:
-                c_eval.squad_candidate.active_chip = recommended_chip
-                opt_result.candidates.insert(0, c_eval.squad_candidate)
         elif not enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
             rec = opt_result.chip_evaluation.recommended_chip
             logger.info(f"💡 Chip recommendation available ({rec}), but ENABLE_AUTO_CHIPS is false.")
