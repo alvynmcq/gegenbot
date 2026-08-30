@@ -1185,11 +1185,11 @@ def test_pipeline_wildcard_recommended_and_rebuild_selected(tmp_path, mock_boots
         mock_notifier = MagicMock()
         mock_notifier_cls.return_value = mock_notifier
 
-        # Simulate Director choosing Candidate 0 (the Wildcard rebuild squad)
+        # Simulate Director choosing Option 7 (the recommended Wildcard rebuild candidate)
         def mock_evaluate(opt_res, *args, **kwargs):
-            chosen = opt_res.candidates[0]
+            chosen = opt_res.candidates[-1]
             return DecisionOutput(
-                selected_candidate_index=0,
+                selected_candidate_index=len(opt_res.candidates) - 1,
                 selected_candidate=chosen,
                 chosen_move_name=chosen.name,
                 transfers_description="Full Rebuild",

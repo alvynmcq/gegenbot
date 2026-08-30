@@ -117,7 +117,7 @@ class AIDirector:
             f"Handing armband to {c_name} with {vc_name} as vice-captain to maximize expected points."
         )
 
-        logger.info(f"Fallback decision made: Option {best_candidate_idx + 1} ({chosen.name})")
+        logger.info(f"Fallback decision made: {chosen.name}")
         news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
 
         return DecisionOutput(
@@ -287,11 +287,12 @@ class AIDirector:
             chosen_idx = int(parsed.get("selected_candidate_index", 0))
             if chosen_idx < 0 or chosen_idx >= len(candidates):
                 chosen_idx = 0
-            rationale_text = parsed.get("rationale", "").strip()
+            rationale_text = str(parsed.get("rationale") or "").strip()
 
             captain_override = parsed.get("captain_override")
             vice_captain_override = parsed.get("vice_captain_override")
-            veto_player_ids = [int(pid) for pid in parsed.get("veto_player_ids", []) if str(pid).isdigit()]
+            raw_veto_ids = parsed.get("veto_player_ids") or []
+            veto_player_ids = [int(pid) for pid in raw_veto_ids if str(pid).isdigit()]
             veto_reason = parsed.get("veto_reason")
 
             chosen = candidates[chosen_idx]
@@ -332,7 +333,7 @@ class AIDirector:
                     f"Captaincy assigned to {c_name} to capitalize on favorable fixture metrics."
                 )
 
-            logger.info(f"AI Director decision received: Option {chosen_idx + 1} ({chosen.name})")
+            logger.info(f"AI Director decision received: {chosen.name}")
             news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
 
             return DecisionOutput(

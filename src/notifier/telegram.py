@@ -27,7 +27,7 @@ class TelegramNotifier:
         return bool(self.bot_token and self.chat_id)
 
     def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
-        """Send message to Telegram chat with error handling."""
+        """Send message to Telegram chat with error handling and automatic plain-text fallback."""
         if not self.is_configured:
             logger.info("Telegram notifier not configured (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing).")
             logger.info(f"Notification Preview:\n{text}")
@@ -47,8 +47,16 @@ class TelegramNotifier:
             logger.info("Telegram notification successfully dispatched.")
             return True
         except Exception as e:
-            logger.error(f"Failed to dispatch Telegram message: {e}")
-            return False
+            logger.warning(f"Telegram dispatch with parse_mode={parse_mode} failed ({e}). Retrying with plain text fallback...")
+            try:
+                payload.pop("parse_mode", None)
+                resp = requests.post(url, json=payload, timeout=10)
+                resp.raise_for_status()
+                logger.info("Telegram notification successfully dispatched (plain text fallback).")
+                return True
+            except Exception as e2:
+                logger.error(f"Failed to dispatch Telegram message: {e2}")
+                return False
 
     def build_pre_deadline_alert(
         self,
@@ -90,8 +98,13 @@ class TelegramNotifier:
 
         news_block = ""
         if decision.news_alerts:
-            alerts_str = "\n".join([f"• 🚨 {a}" for a in decision.news_alerts[:3]])
+            import re
+            cleaned_alerts = [f"• 🚨 {re.sub(r'[_*`]', ' ', a)}" for a in decision.news_alerts[:3]]
+            alerts_str = "\n".join(cleaned_alerts)
             news_block = f"📰 *PRESS CONFERENCE & NEWS ALERTS:*\n{alerts_str}\n\n"
+
+        import re
+        clean_rationale = re.sub(r"[_*`]", " ", decision.rationale)
 
         message = (
             f"{status_tag}\n"
@@ -105,7 +118,7 @@ class TelegramNotifier:
             f"💰 *Bank Remaining:* £{cand.bank_remaining_m:.1f}m | *Hit Cost:* -{cand.hit_cost} pts\n\n"
             f"{news_block}"
             f"🧠 *AI DIRECTOR RATIONALE:*\n"
-            f"_{decision.rationale}_\n\n"
+            f"_{clean_rationale}_\n\n"
             f"👥 *STARTING XI ({cand.formation}):*\n"
             + "\n".join(starters_lines)
             + f"\n\n🪑 *BENCH HIERARCHY:*\n"

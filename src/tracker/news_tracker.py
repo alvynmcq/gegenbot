@@ -87,14 +87,16 @@ class NewsTracker:
 
         snippets: List[str] = []
 
-        # 1. Tavily Search API if configured
+        # 1. Tavily Search API if configured (strictly filtered to recent 7 days news)
         if self.tavily_api_key:
             try:
                 resp = requests.post(
                     "https://api.tavily.com/search",
                     json={
                         "api_key": self.tavily_api_key,
-                        "query": f"{player_name} {team_name} injury update press conference FPL news",
+                        "query": f"{player_name} {team_name} press conference team news injury update",
+                        "topic": "news",
+                        "days": 7,
                         "search_depth": "basic",
                         "max_results": 2,
                     },
@@ -110,11 +112,11 @@ class NewsTracker:
             except Exception as e:
                 logger.debug(f"Tavily search failed for {player_name}: {e}")
 
-        # 2. Free DuckDuckGo Lite / HTML search fallback
+        # 2. Free DuckDuckGo Lite / HTML search fallback (strictly past week &df=w)
         if not snippets:
             try:
-                query = f"{player_name} {team_name} injury press conference FPL"
-                url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+                query = f"{player_name} {team_name} press conference team news"
+                url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&df=w"
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 resp = requests.get(url, headers=headers, timeout=self.search_timeout)
                 if resp.status_code == 200:
@@ -186,9 +188,13 @@ class NewsTracker:
         combined_text = " ".join([official_fpl_news] + snippets)
         sentiment = self._compute_sentiment(combined_text) if combined_text.strip() else 0.0
 
-        # If live snippets indicate bad news even without official FPL flag, adjust risk level
-        if risk == "CLEARED" and sentiment <= -0.50:
-            risk = "MONITOR"
+        # If live snippets indicate definitive breaking news even without official FPL flag, adjust risk level
+        if risk == "CLEARED" and snippets:
+            # Check for strong negative sentiment or explicit absence phrases
+            severe_phrases = ["ruled out", "will miss", "out of action", "surgery", "broken", "fracture", "torn", "not available"]
+            has_severe = any(p in combined_text.lower() for p in severe_phrases)
+            if sentiment <= -0.75 or (has_severe and sentiment < 0):
+                risk = "MONITOR"
 
         return PlayerNewsIntel(
             player_id=player_id,
