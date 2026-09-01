@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,7 +90,7 @@ class FPLAuth:
             return False
 
     def save_state(self) -> bool:
-        """Persist active token state to auth_state.json."""
+        """Persist active token state to auth_state.json atomically."""
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -97,8 +100,10 @@ class FPLAuth:
                 "token_type": "Bearer",
                 "updated_at": time.time(),
             }
-            with open(self.state_file, "w", encoding="utf-8") as f:
+            tmp_path = self.state_file.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
+            tmp_path.replace(self.state_file)
             logger.info(f"Saved active authentication tokens to {self.state_file}")
             return True
         except Exception as e:
