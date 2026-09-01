@@ -78,7 +78,7 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 * **Proactive Injury & Minutes Reliability Multipliers:** Dynamically scales availability ($75\% \rightarrow 0.8\times$, $50\% \rightarrow 0.4\times$, $25\% \rightarrow 0.1\times$, $0\% \rightarrow 0.0\times$) and flags minutes fragility.
 
 ### 4. Expanded AI Decision Director
-* **Manager Press Conference Decryption:** Decodes nuanced managerial quotes (e.g. Pep, Arteta, Emery) for key targets and captains.
+* **Manager Press Conference Decryption:** Decodes nuanced managerial quotes (e.g. Arteta, Slot, Emery, Maresca) for key targets and captains.
 * **Emergency Veto & Instant Re-Solve Loop:** If late-breaking news reveals an unexpected injury or benching, the Director issues an emergency veto and the HiGHS solver instantly re-solves in 15ms for a clean alternative.
 * **Armband Authority & Moneyball Intelligence:** Intelligently validates or overrides Captain and Vice-Captain picks based on late weather, press quotes, Moneyball regression tags, and mini-league risk mode (`DEFEND`, `CHASE`, `NEUTRAL`).
 
