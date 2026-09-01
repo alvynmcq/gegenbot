@@ -37,8 +37,11 @@ logger = logging.getLogger("fpl-orchestrator")
 
 
 def load_environment():
-    """Load environment variables from .env file."""
-load_dotenv()
+    """Load environment variables from .env file with override enabled."""
+    load_dotenv(override=True)
+
+
+load_environment()
 
 
 def get_active_gameweek(events: List[Dict[str, Any]]) -> tuple[int, str, bool]:
@@ -412,10 +415,36 @@ def run_pipeline(
     # 4. Mini-League Threat Matrix Scanning (Pre-Optimization for EO-Aware Solving)
     league_analysis: Optional[LeagueAnalysis] = None
     eo_weights: Optional[Dict[int, float]] = None
-    league_id_str = os.getenv("LEAGUE_ID", "").strip()
+    league_id_str = (
+        os.getenv("LEAGUE_ID")
+        or os.getenv("FPL_LEAGUE_ID")
+        or os.getenv("MINI_LEAGUE_ID")
+        or ""
+    ).strip()
+
+    league_id: Optional[int] = None
     if league_id_str:
         try:
             league_id = int(league_id_str)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid LEAGUE_ID string '{league_id_str}' in environment.")
+
+    # Auto-discovery fallback if league_id is not explicitly configured
+    if league_id is None and team_id_str:
+        try:
+            res = client.session.get(f"{client.base_url}entry/{team_id_str}/", timeout=8)
+            if res.status_code == 200:
+                e_data = res.json()
+                for l_item in e_data.get("leagues", {}).get("classic", []):
+                    if l_item.get("league_type") == "x":
+                        league_id = int(l_item["id"])
+                        logger.info(f"Auto-discovered private mini-league '{l_item.get('name')}' (ID: {league_id}) from user profile.")
+                        break
+        except Exception as e:
+            logger.debug(f"Mini-league auto-discovery fallback skipped: {e}")
+
+    if league_id:
+        try:
             # Before target GW deadline, target GW picks are unpublished (return 404).
             # Scan the latest completed/live gameweek to assess rival squads.
             scan_gw = get_latest_live_gameweek(events)
@@ -433,7 +462,7 @@ def run_pipeline(
             )
             eo_weights = league_analysis.raw_eo
             logger.info(
-                f"Mini-league scanned: {league_analysis.total_managers} managers | "
+                f"Mini-league '{league_analysis.league_name}' (ID: {league_id}) scanned: {league_analysis.total_managers} managers | "
                 f"Shields: {len(league_analysis.threat_matrix.shields)} | "
                 f"Vulnerabilities: {len(league_analysis.threat_matrix.vulnerabilities)} | "
                 f"Daggers: {len(league_analysis.threat_matrix.daggers)}"

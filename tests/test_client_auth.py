@@ -130,9 +130,15 @@ def test_http_401_interceptor_when_refresh_fails(tmp_path):
                 client._request("GET", "my-team/12345/", authenticated=True)
 
 
-def test_unauthenticated_guard_when_no_refresh_available():
+def test_unauthenticated_guard_when_no_refresh_available(tmp_path, monkeypatch):
     """Test graceful handling when no token or refresh credentials exist."""
-    auth = FPLAuth(token="")
+    monkeypatch.delenv("FPL_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FPL_EMAIL", raising=False)
+    monkeypatch.delenv("FPL_PASSWORD", raising=False)
+    monkeypatch.delenv("FPL_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("FPL_ACCESS_TOKEN", raising=False)
+
+    auth = FPLAuth(token="", state_file=tmp_path / "empty.json")
     client = FPLClient(auth=auth)
 
     assert client.auth.can_refresh is False
