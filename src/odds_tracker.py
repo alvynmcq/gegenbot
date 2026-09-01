@@ -228,4 +228,7 @@ class BookmakerOddsFetcher:
                 "source": source_tag,
             }
 
+        logger.info(
+            f"Computed bookmaker implied market profiles for {len(profiles)} players (Source: {source_tag.upper()})."
+        )
         return profiles

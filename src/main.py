@@ -330,8 +330,8 @@ def run_pipeline(
         except Exception as e:
             logger.warning(f"Could not load Vaastav FPL dataset: {e}. Continuing with standard projections.")
 
-    # 3. Enrich player metrics with xP and underlying stats
-    logger.info("Computing expected points (xP), underlying form, and FDR weighting...")
+    # 3. Enrich player metrics with xP, underlying stats, and market odds
+    logger.info("Computing expected points (xP), underlying form, FDR weighting, and market implied odds...")
     players_df = calculate_player_metrics(
         bootstrap,
         fixtures,

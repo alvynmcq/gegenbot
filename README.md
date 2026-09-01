@@ -10,14 +10,14 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                             Live Data Feeds & Real-Time Intelligence                             │
-│  ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐  ┌─────────┐ │
-│  │    Official FPL API    │  │   FPL Core Insights    │  │  Vaastav FPL Dataset   │  │ Price   │ │
-│  │ • Bootstrap & Selling  │  │ • Multi-GW xP Proj.    │  │ • Match Logs (2026-27) │  │ Predict │ │
-│  │ • Set-Piece Hierarchy  │  │ • xGI/90 & xGC/90      │  │ • xGI Mean Reversion Δ │  │ • Δ Targets│
-│  │ • Mini-League Rivals   │  │ • Def. Contributions   │  │ • Rolling Minutes & BPS│  │ • ±100% │ │
-│  └───────────┬────────────┘  └───────────┬────────────┘  └───────────┬────────────┘  └────┬────┘ │
-└──────────────┼───────────────────────────┼───────────────────────────┼────────────────────┼──────┘
-               ▼                           ▼                           ▼                    ▼
+│  ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────┐ ┌─────────────┐ │
+│  │ Official FPL API │ │FPL Core Insights │ │Vaastav Match Logs│ │ The-Odds-API │ │Price Tracker│ │
+│  │•Bootstrap & Sells│ │•Multi-GW xP Proj.│ │•xGI/90 & xGC/90  │ │•Vig Removal  │ │•Net Velocity│ │
+│  │•Set-Piece Roles  │ │•Def. Contribution│ │•xGI Mean Revers. │ │•Implied CS % │ │•Rise/Fall Δ │ │
+│  │•Mini-League Ranks│ │•Underlying Threat│ │•Rolling Mins/BPS │ │•Implied Goal%│ │•±95% Targets│ │
+│  └────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘ └──────┬───────┘ └──────┬──────┘ │
+└───────────┼────────────────────┼────────────────────┼──────────────────┼────────────────┼────────┘
+            ▼                    ▼                    ▼                  ▼                ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                           fpl-worker                                             │
 │  ┌──────────────────────────────────────────────┐  ┌──────────────────────────────────────────┐  │
