@@ -480,6 +480,9 @@ DASHBOARD_HTML = """
                             <div class="mt-1.5 bg-slate-950/85 backdrop-blur px-2 py-0.5 rounded border border-white/10 text-center shadow">
                                 <div class="text-xs font-semibold text-white leading-tight truncate max-w-[85px]">{{ p.web_name }}</div>
                                 <div class="text-[10px] text-emerald-400 font-mono">{{ p.xp }} xP</div>
+                                {% if p.implied_cs_pct and p.implied_cs_pct >= 30.0 %}
+                                <div class="text-[9px] text-sky-300 font-mono">🛡️ {{ p.implied_cs_pct | round(0) }}% CS</div>
+                                {% endif %}
                             </div>
                         </div>
                         {% endfor %}
@@ -502,6 +505,9 @@ DASHBOARD_HTML = """
                             <div class="mt-1.5 bg-slate-950/85 backdrop-blur px-2 py-0.5 rounded border border-white/10 text-center shadow">
                                 <div class="text-xs font-semibold text-white leading-tight truncate max-w-[80px]">{{ p.web_name }}</div>
                                 <div class="text-[10px] text-emerald-400 font-mono">{{ p.xp }} xP</div>
+                                {% if p.implied_cs_pct and p.implied_cs_pct >= 30.0 %}
+                                <div class="text-[9px] text-sky-300 font-mono">🛡️ {{ p.implied_cs_pct | round(0) }}% CS</div>
+                                {% endif %}
                             </div>
                         </div>
                         {% endfor %}
@@ -524,6 +530,9 @@ DASHBOARD_HTML = """
                             <div class="mt-1.5 bg-slate-950/85 backdrop-blur px-2 py-0.5 rounded border border-white/10 text-center shadow">
                                 <div class="text-xs font-semibold text-white leading-tight truncate max-w-[80px]">{{ p.web_name }}</div>
                                 <div class="text-[10px] text-emerald-400 font-mono">{{ p.xp }} xP</div>
+                                {% if p.implied_goal_pct and p.implied_goal_pct >= 35.0 %}
+                                <div class="text-[9px] text-amber-300 font-mono">🎯 {{ p.implied_goal_pct | round(0) }}% G</div>
+                                {% endif %}
                             </div>
                         </div>
                         {% endfor %}
@@ -546,6 +555,9 @@ DASHBOARD_HTML = """
                             <div class="mt-1.5 bg-slate-950/85 backdrop-blur px-2 py-0.5 rounded border border-white/10 text-center shadow">
                                 <div class="text-xs font-semibold text-white leading-tight truncate max-w-[80px]">{{ p.web_name }}</div>
                                 <div class="text-[10px] text-emerald-400 font-mono">{{ p.xp }} xP</div>
+                                {% if p.implied_goal_pct and p.implied_goal_pct >= 35.0 %}
+                                <div class="text-[9px] text-amber-300 font-mono">🎯 {{ p.implied_goal_pct | round(0) }}% G</div>
+                                {% endif %}
                             </div>
                         </div>
                         {% endfor %}

@@ -186,6 +186,10 @@ class AIDirector:
                     xp_flags.append(f"{t.player_in.web_name} [MONEYBALL ENABLER]: elite budget yield ({vorp_str} VORP/£m)")
                 elif t.player_in.moneyball_tag == "OVERVALUED_HAULER":
                     xp_flags.append(f"{t.player_in.web_name} [MONEYBALL CAUTION]: overperforming underlying xGI")
+                if t.player_in.implied_goal_pct is not None and t.player_in.implied_goal_pct >= 40.0:
+                    xp_flags.append(f"{t.player_in.web_name} [MARKET ODDS]: {t.player_in.implied_goal_pct:.1f}% anytime goal probability")
+                elif t.player_in.implied_cs_pct is not None and t.player_in.implied_cs_pct >= 38.0 and t.player_in.position in ["GKP", "DEF"]:
+                    xp_flags.append(f"{t.player_in.web_name} [MARKET ODDS]: {t.player_in.implied_cs_pct:.1f}% clean sheet probability")
                 if t.player_in.minutes_reliability == "LOW":
                     xp_flags.append(f"{t.player_in.web_name} minutes risk (recent starts/mins below threshold)")
 

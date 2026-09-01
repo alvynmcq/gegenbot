@@ -77,10 +77,15 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 * **`vaastav/Fantasy-Premier-League`:** Ingests match logs and computes rolling $xGI/90$, $xGC/90$, average minutes in recent appearances, and starts reliability.
 * **Proactive Injury & Minutes Reliability Multipliers:** Dynamically scales availability ($75\% \rightarrow 0.8\times$, $50\% \rightarrow 0.4\times$, $25\% \rightarrow 0.1\times$, $0\% \rightarrow 0.0\times$) and flags minutes fragility.
 
-### 4. Expanded AI Decision Director
+### 4. Bookmaker Odds & Market Implied Probabilities
+* **Vig-Free Probability Modeling:** Ingests live betting market odds (via `The-Odds-API` or calibrated team strength models) and removes bookmaker margin (overround) to derive pure statistical likelihoods.
+* **Implied Clean Sheet ($P(\text{CS})$) & Goalscorer ($P(\text{Goal})$):** Translates liquid multi-million pound betting markets into fair percentages per player for tactical decision-making.
+* **Market-Priced Expected Points ($xP_{\text{odds}}$):** Calculates independent mathematical valuations according to positional scoring rules, directly boosting high-ceiling captaincy locks and clean sheet anchors.
+
+### 5. Expanded AI Decision Director
 * **Manager Press Conference Decryption:** Decodes nuanced managerial quotes (e.g. Arteta, Slot, Emery, Maresca) for key targets and captains.
 * **Emergency Veto & Instant Re-Solve Loop:** If late-breaking news reveals an unexpected injury or benching, the Director issues an emergency veto and the HiGHS solver instantly re-solves in 15ms for a clean alternative.
-* **Armband Authority & Moneyball Intelligence:** Intelligently validates or overrides Captain and Vice-Captain picks based on late weather, press quotes, Moneyball regression tags, and mini-league risk mode (`DEFEND`, `CHASE`, `NEUTRAL`).
+* **Armband Authority & Moneyball Intelligence:** Intelligently validates or overrides Captain and Vice-Captain picks based on market odds, press quotes, Moneyball regression tags, and mini-league risk mode (`DEFEND`, `CHASE`, `NEUTRAL`).
 
 ---
 
@@ -91,6 +96,7 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 * FPL account credentials or authentication cookie
 * Telegram Bot Token & Chat ID (for deadline alerts)
 * LLM API Key (Google Gemini, OpenAI, Groq, DeepSeek, or local Ollama)
+* *(Optional)* The-Odds-API Key for live bookmaker lines
 
 ### 1. Clone the Repository
 ```bash
@@ -115,6 +121,7 @@ FPL_LEAGUE_ID=your_primary_mini_league_id
 # --- Data Feeds & Underlying Stats ---
 VAASTAV_DATA_ENABLED=true
 VAASTAV_SEASON=2026-27
+THE_ODDS_API_KEY=your_optional_odds_api_key
 
 # --- Mathematical Solver Configuration ---
 DECAY_FACTOR=0.85                # Horizon Decay Factor (gamma)
@@ -163,7 +170,7 @@ Gegenbot includes a comprehensive unit test suite covering auth, data fetchers, 
 ```bash
 pytest
 ```
-*All 68 tests passing.*
+*All 73 tests passing (100%).*
 
 ---
 
@@ -175,7 +182,7 @@ pytest
 ├── requirements.txt         # Python dependencies (PuLP, highspy, requests, pandas, Flask, etc.)
 ├── .env.example             # Template configuration file
 ├── data/                    # Local cache (projections, decisions, auth tokens)
-├── tests/                   # Full unit and integration test suite
+├── tests/                   # Full unit and integration test suite (73 tests)
 └── src/
     ├── agent/               # AI Decision Director (LLM reasoning, quote decryption, veto logic)
     ├── api/                 # FPL API clients, auth token manager, and endpoint handlers
@@ -184,6 +191,8 @@ pytest
     ├── notifier/            # Telegram alerting module with press conference alerts
     ├── tracker/             # Mini-league scanner, EO% analyzer, and live news tracker
     ├── data_fetcher.py      # Multi-source data pipeline (FPL Core Insights & Vaastav)
+    ├── odds_tracker.py      # Bookmaker odds ingestion, vig removal, and implied probabilities
+    ├── price_tracker.py     # Price change target predictor and transfer velocity tracker
     └── main.py              # CLI entry point, scheduler loop, and pipeline orchestrator
 ```
 

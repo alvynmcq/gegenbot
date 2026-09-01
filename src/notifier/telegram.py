@@ -72,10 +72,17 @@ class TelegramNotifier:
         if cand.transfers_count == 0:
             tx_block = "• *Move:* Rolled / Banked free transfer (0 moves)"
         else:
-            tx_lines = [
-                f"• OUT: *{t.player_out.web_name}* (£{t.player_out.cost_m}m) ➔ IN: *{t.player_in.web_name}* (£{t.player_in.cost_m}m)"
-                for t in cand.transfers
-            ]
+            tx_lines = []
+            for t in cand.transfers:
+                p_in = t.player_in
+                odds_tag = ""
+                if p_in.implied_goal_pct and p_in.implied_goal_pct >= 35.0:
+                    odds_tag = f" _(🎯 {p_in.implied_goal_pct:.0f}% Goal Prob)_"
+                elif p_in.implied_cs_pct and p_in.implied_cs_pct >= 35.0 and p_in.position in ["GKP", "DEF"]:
+                    odds_tag = f" _(🛡️ {p_in.implied_cs_pct:.0f}% CS Prob)_"
+                tx_lines.append(
+                    f"• OUT: *{t.player_out.web_name}* (£{t.player_out.cost_m}m) ➔ IN: *{p_in.web_name}* (£{p_in.cost_m}m){odds_tag}"
+                )
             tx_block = "\n".join(tx_lines)
 
         # Starters list with (C) and (VC)
@@ -83,9 +90,14 @@ class TelegramNotifier:
         for p in cand.starters:
             tag = ""
             if p.is_captain:
-                tag = " 👑 *(C)*"
+                odds_detail = f" _(🎯 {p.implied_goal_pct:.0f}% Goal)_" if p.implied_goal_pct else ""
+                tag = f" 👑 *(C)*{odds_detail}"
             elif p.is_vice_captain:
                 tag = " 🛡️ *(VC)*"
+            elif p.implied_goal_pct and p.implied_goal_pct >= 45.0:
+                tag = f" _(🎯 {p.implied_goal_pct:.0f}%)_"
+            elif p.implied_cs_pct and p.implied_cs_pct >= 40.0 and p.position in ["GKP", "DEF"]:
+                tag = f" _(🛡️ {p.implied_cs_pct:.0f}%)_"
             starters_lines.append(f"• `{p.position}` *{p.web_name}* ({p.team_code}) - {p.xp} xP{tag}")
 
         # Bench list

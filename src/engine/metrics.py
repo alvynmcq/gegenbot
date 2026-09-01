@@ -85,14 +85,15 @@ def calculate_player_metrics(
     fplreview_df: Optional[pd.DataFrame] = None,
     fplreview_xp_map: Optional[Dict[int, Any]] = None,
     vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None,
+    odds_data: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """
     Process raw FPL bootstrap data, fixtures, optional external FPL Review projections,
-    and vaastav/Fantasy-Premier-League match logs into an enriched DataFrame with expected points (xP).
-    Uses FPL Review xP when available, with a sensible fallback to official FPL ep_next or FDR baseline.
+    vaastav/Fantasy-Premier-League match logs, and bookmaker implied odds into an enriched DataFrame.
     """
     from src.data_fetcher import map_fplreview_to_elements
     from src.price_tracker import calculate_price_change_targets
+    from src.odds_tracker import BookmakerOddsFetcher
 
     elements = bootstrap_data.get("elements", [])
     teams_raw = bootstrap_data.get("teams", [])
@@ -125,6 +126,16 @@ def calculate_player_metrics(
         fplreview_map = fplreview_xp_map
     elif fplreview_df is not None and not fplreview_df.empty:
         fplreview_map = map_fplreview_to_elements(fplreview_df, bootstrap_data, current_event=current_event)
+
+    # Resolve Bookmaker Implied Market Odds Profiles
+    if odds_data is None:
+        odds_fetcher = BookmakerOddsFetcher()
+        odds_data = odds_fetcher.compute_player_odds_profiles(
+            bootstrap_data=bootstrap_data,
+            fixtures=fixtures,
+            current_event=current_event,
+            vaastav_stats=vaastav_stats,
+        )
 
     records = []
     for el in elements:
@@ -286,6 +297,12 @@ def calculate_player_metrics(
                 fplreview_3gw_val = round(fplreview_val * decay_sum, 2)
                 source_tag = "fplreview"
 
+        # Market Implied Probabilities
+        o_info = (odds_data or {}).get(player_id, {})
+        implied_cs_pct = float(o_info.get("implied_cs_pct", 0.0) or 0.0)
+        implied_goal_pct = float(o_info.get("implied_goal_pct", 0.0) or 0.0)
+        odds_xp_val = float(o_info.get("odds_xp", 0.0) or 0.0)
+
         if fplreview_val is not None:
             # Respect availability if fully unavailable (injured/suspended)
             xp = round(max(0.0, fplreview_val * availability), 2) if availability == 0.0 else fplreview_val
@@ -336,7 +353,8 @@ def calculate_player_metrics(
             + (rolling_xgi_90 * 2.0)
             + (1.0 if price_momentum > 0.25 or imminent_price_change == "RISE_IMMINENT" else 0.0)
             + (0.5 if moneyball_tag == "UNDERVALUED_REGRESSION" else 0.0)
-            + (0.4 if is_pen_taker else 0.0),
+            + (0.4 if is_pen_taker else 0.0)
+            + (0.5 if implied_goal_pct >= 40.0 or (implied_cs_pct >= 40.0 and position in ["GKP", "DEF"]) else 0.0),
             2,
         )
 
@@ -386,6 +404,9 @@ def calculate_player_metrics(
             "is_set_piece_taker": bool(is_pen_taker or is_corner_taker or is_fk_taker),
             "price_target_pct": price_target_pct,
             "imminent_price_change": imminent_price_change,
+            "implied_cs_pct": implied_cs_pct,
+            "implied_goal_pct": implied_goal_pct,
+            "odds_xp": odds_xp_val,
         })
 
     df = pd.DataFrame(records)

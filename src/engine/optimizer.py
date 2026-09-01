@@ -149,6 +149,8 @@ class PlayerPick(BaseModel):
     moneyball_score: Optional[float] = None  # Composite Moneyball valuation score
     set_piece_role: Optional[str] = None  # "PENALTIES", "CORNERS", "PENALTIES + CORNERS/FK", etc.
     imminent_price_change: Optional[str] = None  # "RISE_IMMINENT", "FALL_IMMINENT", "STABLE"
+    implied_cs_pct: Optional[float] = None  # Bookmaker implied clean sheet probability %
+    implied_goal_pct: Optional[float] = None  # Bookmaker implied anytime goal probability %
     is_starter: bool = False
     is_captain: bool = False
     is_vice_captain: bool = False
@@ -340,6 +342,8 @@ class FPLOptimizer:
         moneyball_score_val = float(info["moneyball_score"]) if "moneyball_score" in info and not pd.isna(info["moneyball_score"]) else None
         set_piece_role_val = str(info["set_piece_role"]) if "set_piece_role" in info and info["set_piece_role"] else None
         imminent_price_val = str(info["imminent_price_change"]) if "imminent_price_change" in info and info["imminent_price_change"] else None
+        implied_cs_val = float(info["implied_cs_pct"]) if "implied_cs_pct" in info and not pd.isna(info["implied_cs_pct"]) else None
+        implied_goal_val = float(info["implied_goal_pct"]) if "implied_goal_pct" in info and not pd.isna(info["implied_goal_pct"]) else None
 
         return PlayerPick(
             id=player_id,
@@ -373,6 +377,8 @@ class FPLOptimizer:
             moneyball_score=moneyball_score_val,
             set_piece_role=set_piece_role_val,
             imminent_price_change=imminent_price_val,
+            implied_cs_pct=implied_cs_val,
+            implied_goal_pct=implied_goal_val,
             is_starter=is_starter,
             is_captain=is_captain,
             is_vice_captain=is_vice_captain,
