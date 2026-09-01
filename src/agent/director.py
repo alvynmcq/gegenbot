@@ -161,17 +161,31 @@ class AIDirector:
             vc_name = cand.vice_captain.web_name if cand.vice_captain else "N/A"
             tx_list = [f"OUT: {t.player_out.web_name} (£{t.player_out.cost_m}m) ➔ IN: {t.player_in.web_name} (£{t.player_in.cost_m}m)" for t in cand.transfers]
 
-            # xP confidence flags and underlying Vaastav stats for transfer targets
+            # xP confidence flags, underlying Vaastav stats, and Moneyball metrics for transfer targets
             xp_flags = []
             for t in cand.transfers:
                 conf = t.player_in.xp_confidence
                 if conf != "HIGH":
                     xp_flags.append(f"{t.player_in.web_name} xP confidence: {conf}")
-                if abs(t.player_in.price_momentum) >= 0.1:
+                if t.player_in.imminent_price_change == "RISE_IMMINENT":
+                    xp_flags.append(f"{t.player_in.web_name} [PRICE RISE IMMINENT]: target threshold met (buying captures +£0.1m rise)")
+                elif abs(t.player_in.price_momentum) >= 0.1:
                     direction = "rising" if t.player_in.price_momentum > 0 else "falling"
                     xp_flags.append(f"{t.player_in.web_name} price {direction} (momentum: {t.player_in.price_momentum:+.2f})")
+                if t.player_out.imminent_price_change == "FALL_IMMINENT":
+                    xp_flags.append(f"{t.player_out.web_name} [PRICE FALL IMMINENT]: selling avoids -£0.1m loss")
+                if t.player_in.set_piece_role:
+                    xp_flags.append(f"{t.player_in.web_name} [SET PIECES]: {t.player_in.set_piece_role}")
                 if t.player_in.rolling_xgi_90 is not None and t.player_in.rolling_xgi_90 >= 0.40:
                     xp_flags.append(f"{t.player_in.web_name} strong underlying attacking threat ({t.player_in.rolling_xgi_90:.2f} xGI/90)")
+                if t.player_in.moneyball_tag == "UNDERVALUED_REGRESSION":
+                    delta_str = f"{t.player_in.xgi_delta:+.2f}" if t.player_in.xgi_delta is not None else "+0.8"
+                    xp_flags.append(f"{t.player_in.web_name} [MONEYBALL BUY]: underperforming xGI by {delta_str} (positive mean reversion candidate)")
+                elif t.player_in.moneyball_tag == "HIGH_EFFICIENCY_ENABLER":
+                    vorp_str = f"{t.player_in.vorp_per_m:.2f}" if t.player_in.vorp_per_m is not None else "1.8"
+                    xp_flags.append(f"{t.player_in.web_name} [MONEYBALL ENABLER]: elite budget yield ({vorp_str} VORP/£m)")
+                elif t.player_in.moneyball_tag == "OVERVALUED_HAULER":
+                    xp_flags.append(f"{t.player_in.web_name} [MONEYBALL CAUTION]: overperforming underlying xGI")
                 if t.player_in.minutes_reliability == "LOW":
                     xp_flags.append(f"{t.player_in.web_name} minutes risk (recent starts/mins below threshold)")
 
@@ -233,11 +247,11 @@ class AIDirector:
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
-                "Evaluate the mathematical MILP candidates, mini-league threat dynamics, and breaking press conference / injury news. "
+                "Evaluate the mathematical MILP candidates, mini-league threat dynamics, Moneyball statistical metrics, and breaking press conference / injury news. "
                 f"Select the single best move option (candidate_index: 0 to {max_idx}). "
                 f"CRITICAL: The current competitive risk mode is '{risk_mode}'. {risk_note} "
                 "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
-                "If risk_mode is CHASE: consider hits and differentials to gain ground. "
+                "If risk_mode is CHASE: actively consider high-EV Moneyball differentials (marked [MONEYBALL BUY] with high xGI and low EO%) to close point deficits against mini-league leaders. "
                 "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "
                 "Decide whether to accept or override the solver's Captain / Vice-Captain based on manager press conference quotes. "
                 "If breaking news reveals that a transfer target is unexpectedly injured or benched, you may issue a 'veto_player_ids' to trigger a clean re-solve. "

@@ -1603,6 +1603,48 @@ def test_bench_weight_sub_factor_in_optimizer(mock_bootstrap_data, mock_fixtures
         assert cand.formation in ["3-5-2", "3-4-3", "4-4-2", "4-3-3", "4-5-1", "5-3-2", "5-4-1", "5-2-3"]
 
 
+def test_build_competitive_context_chase_and_defend():
+    from src.main import _build_competitive_context
+
+    entry_history = {
+        "current": [
+            {"event": 1, "points": 50, "total_points": 50, "overall_rank": 1000000},
+            {"event": 2, "points": 40, "total_points": 90, "overall_rank": 1200000},
+        ]
+    }
+
+    rivals = [
+        {"entry": 101, "rank": 1, "total": 140},
+        {"entry": 102, "rank": 2, "total": 125},
+        {"entry": 8250646, "rank": 15, "total": 90},
+        {"entry": 104, "rank": 16, "total": 85},
+    ]
+
+    # Test 50 point deficit with my_entry_id match -> CHASE mode
+    ctx = _build_competitive_context(entry_history, rivals=rivals, my_entry_id=8250646)
+    assert ctx["rank_in_mini_league"] == 15
+    assert ctx["points_behind_leader"] == 50
+    assert ctx["risk_mode"] == "CHASE"
+
+    # Test DEFEND mode when 2 pts behind leader
+    defend_history = {
+        "current": [{"event": 1, "points": 138, "total_points": 138, "overall_rank": 5000}]
+    }
+    ctx_defend = _build_competitive_context(defend_history, rivals=rivals, my_entry_id=999)
+    assert ctx_defend["rank_in_mini_league"] == 2
+    assert ctx_defend["points_behind_leader"] == 2
+    assert ctx_defend["risk_mode"] == "DEFEND"
+
+    # Test fallback when user is lower than all sampled rivals
+    low_history = {
+        "current": [{"event": 1, "points": 60, "total_points": 60, "overall_rank": 5000000}]
+    }
+    ctx_low = _build_competitive_context(low_history, rivals=rivals, my_entry_id=777)
+    assert ctx_low["rank_in_mini_league"] == 5
+    assert ctx_low["points_behind_leader"] == 80
+    assert ctx_low["risk_mode"] == "CHASE"
+
+
 
 
 

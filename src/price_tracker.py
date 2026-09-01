@@ -1,6 +1,6 @@
 import os
 import requests
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 
@@ -8,6 +8,54 @@ def fetch_price_data() -> Dict[str, Any]:
     res = requests.get(FPL_BOOTSTRAP_URL, timeout=10)
     res.raise_for_status()
     return res.json()
+
+
+def calculate_price_change_targets(data: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """
+    Calculate price change target percentages and imminent rise/fall status for all players.
+    Returns: {player_id: {"target_pct": float, "status": str, "net_transfers": int}}
+    Status: "RISE_IMMINENT" (target >= 95%), "FALL_IMMINENT" (target <= -95%), or "STABLE"
+    """
+    elements = data.get("elements", [])
+    results: Dict[int, Dict[str, Any]] = {}
+
+    for p in elements:
+        p_id = p.get("id")
+        if not p_id:
+            continue
+
+        try:
+            transfers_in = int(p.get("transfers_in_event", 0) or 0)
+            transfers_out = int(p.get("transfers_out_event", 0) or 0)
+            net_transfers = transfers_in - transfers_out
+            selected_by_pct = float(p.get("selected_by_percent", 0.0) or 0.0)
+
+            # Dynamic threshold scaling: players with high ownership need more net transfers to shift price
+            # e.g. for 5% ownership -> ~20k transfers; for 35% ownership -> ~87.5k transfers
+            base_threshold = max(20000.0, selected_by_pct * 2500.0)
+            target_pct = round((net_transfers / base_threshold) * 100.0, 1)
+
+            if target_pct >= 95.0 or (net_transfers >= 50000 and target_pct >= 80.0):
+                status = "RISE_IMMINENT"
+            elif target_pct <= -95.0 or (net_transfers <= -50000 and target_pct <= -80.0):
+                status = "FALL_IMMINENT"
+            else:
+                status = "STABLE"
+
+            results[p_id] = {
+                "target_pct": target_pct,
+                "status": status,
+                "net_transfers": net_transfers,
+            }
+        except (ValueError, TypeError):
+            results[p_id] = {
+                "target_pct": 0.0,
+                "status": "STABLE",
+                "net_transfers": 0,
+            }
+
+    return results
+
 
 def analyze_market_movements(data: Dict[str, Any], threshold_transfers: int = 40000) -> Dict[str, List[Dict[str, Any]]]:
     players = data.get("elements", [])

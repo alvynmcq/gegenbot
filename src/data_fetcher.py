@@ -602,12 +602,16 @@ class VaastavDataFetcher:
         lookback_gws: int = 4,
     ) -> Dict[int, Dict[str, Any]]:
         """
-        Calculate rolling player-level underlying form and minutes reliability:
+        Calculate rolling player-level underlying form, minutes reliability, and Moneyball regression metrics:
         - rolling_xgi_90: Expected Goal Involvements per 90 in recent GWs
         - rolling_xgc_90: Expected Goals Conceded per 90 in recent GWs
         - rolling_minutes_avg: Average minutes in recent GWs
         - starts_ratio: Ratio of starts in recent appearances
         - season_xgi_90: Overall season xGI/90 from players_raw
+        - xgi_delta: Difference between Expected GI and Actual GI (xGI - (Goals + Assists))
+        - xgc_delta: Difference between Expected GC and Actual GC (xGC - Goals Conceded)
+        - rolling_bps_avg: Average BPS in recent matches
+        - def_contrib_90: Defensive contribution / CBI per 90
         """
         if merged_gw_df is None:
             merged_gw_df = self.fetch_merged_gw()
@@ -629,6 +633,16 @@ class VaastavDataFetcher:
                     xa_90 = float(row.get("expected_assists_per_90", 0.0) or 0.0)
                     xgc_90 = float(row.get("expected_goals_conceded_per_90", 0.0) or 0.0)
                     def_contrib_90 = float(row.get("defensive_contribution_per_90", 0.0) or 0.0)
+
+                    tot_goals = float(row.get("goals_scored", 0.0) or 0.0)
+                    tot_assists = float(row.get("assists", 0.0) or 0.0)
+                    tot_xgi_season = float(row.get("expected_goal_involvements", 0.0) or (float(row.get("expected_goals", 0.0) or 0.0) + float(row.get("expected_assists", 0.0) or 0.0)))
+                    season_xgi_delta = round(tot_xgi_season - (tot_goals + tot_assists), 2)
+
+                    tot_gc = float(row.get("goals_conceded", 0.0) or 0.0)
+                    tot_xgc_season = float(row.get("expected_goals_conceded", 0.0) or 0.0)
+                    season_xgc_delta = round(tot_xgc_season - tot_gc, 2)
+
                     results[p_id] = {
                         "season_xgi_90": round(xgi_90 or (xg_90 + xa_90), 2),
                         "season_xg_90": round(xg_90, 2),
@@ -640,6 +654,11 @@ class VaastavDataFetcher:
                         "rolling_minutes_avg": float(row.get("minutes", 0) or 0),
                         "starts_ratio": 1.0,
                         "recent_matches_count": 0,
+                        "xgi_delta": season_xgi_delta,
+                        "xgc_delta": season_xgc_delta,
+                        "actual_gi": round(tot_goals + tot_assists, 2),
+                        "actual_gc": round(tot_gc, 2),
+                        "rolling_bps_avg": float(row.get("bps", 0.0) or 0.0),
                     }
                 except Exception:
                     continue
@@ -663,10 +682,22 @@ class VaastavDataFetcher:
                         total_starts = float(group["starts"].sum() if "starts" in group.columns else (group["minutes"] >= 60).sum())
                         matches_count = len(group)
 
+                        goals = float(group["goals_scored"].sum() if "goals_scored" in group.columns else 0.0)
+                        assists = float(group["assists"].sum() if "assists" in group.columns else 0.0)
+                        actual_gi = goals + assists
+                        actual_gc = float(group["goals_conceded"].sum() if "goals_conceded" in group.columns else 0.0)
+
                         rolling_xgi_90 = round((total_xgi / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgi_90", 0.0))
                         rolling_xgc_90 = round((total_xgc / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgc_90", 0.0))
                         avg_mins = round(total_mins / matches_count, 1) if matches_count > 0 else 0.0
                         starts_ratio = round(total_starts / matches_count, 2) if matches_count > 0 else 1.0
+
+                        # Regression delta over recent window: positive means underperformed expected (buy candidate)
+                        xgi_delta = round(total_xgi - actual_gi, 2)
+                        xgc_delta = round(total_xgc - actual_gc, 2)
+
+                        bps_sum = float(group["bps"].sum() if "bps" in group.columns else 0.0)
+                        avg_bps = round(bps_sum / matches_count, 1) if matches_count > 0 else 0.0
 
                         if p_id not in results:
                             results[p_id] = {}
@@ -676,6 +707,11 @@ class VaastavDataFetcher:
                             "rolling_minutes_avg": avg_mins,
                             "starts_ratio": starts_ratio,
                             "recent_matches_count": matches_count,
+                            "xgi_delta": xgi_delta,
+                            "xgc_delta": xgc_delta,
+                            "actual_gi": round(actual_gi, 2),
+                            "actual_gc": round(actual_gc, 2),
+                            "rolling_bps_avg": avg_bps,
                         })
                     except Exception:
                         continue

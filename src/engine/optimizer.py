@@ -141,6 +141,14 @@ class PlayerPick(BaseModel):
     rolling_xgc_90: Optional[float] = None  # Expected Goals Conceded per 90 from Vaastav dataset
     minutes_reliability: Optional[str] = None  # "HIGH", "MEDIUM", "LOW" based on recent start/sub frequency
     starts_ratio: Optional[float] = None  # Ratio of recent matches started
+    xgi_delta: Optional[float] = None  # xGI - (Goals + Assists); positive = underperforming expected (buy)
+    xgc_delta: Optional[float] = None  # xGC - Goals Conceded
+    vorp: Optional[float] = None  # Value Over Replacement Player (xP above positional floor)
+    vorp_per_m: Optional[float] = None  # VORP per marginal million above positional price floor
+    moneyball_tag: Optional[str] = None  # "UNDERVALUED_REGRESSION", "HIGH_EFFICIENCY_ENABLER", "ELITE_ANCHOR", etc.
+    moneyball_score: Optional[float] = None  # Composite Moneyball valuation score
+    set_piece_role: Optional[str] = None  # "PENALTIES", "CORNERS", "PENALTIES + CORNERS/FK", etc.
+    imminent_price_change: Optional[str] = None  # "RISE_IMMINENT", "FALL_IMMINENT", "STABLE"
     is_starter: bool = False
     is_captain: bool = False
     is_vice_captain: bool = False
@@ -324,6 +332,14 @@ class FPLOptimizer:
         rolling_xgc_val = float(info["rolling_xgc_90"]) if "rolling_xgc_90" in info and not pd.isna(info["rolling_xgc_90"]) else None
         minutes_reliability_val = str(info["minutes_reliability"]) if "minutes_reliability" in info and info["minutes_reliability"] else None
         starts_ratio_val = float(info["starts_ratio"]) if "starts_ratio" in info and not pd.isna(info["starts_ratio"]) else None
+        xgi_delta_val = float(info["xgi_delta"]) if "xgi_delta" in info and not pd.isna(info["xgi_delta"]) else None
+        xgc_delta_val = float(info["xgc_delta"]) if "xgc_delta" in info and not pd.isna(info["xgc_delta"]) else None
+        vorp_val = float(info["vorp"]) if "vorp" in info and not pd.isna(info["vorp"]) else None
+        vorp_per_m_val = float(info["vorp_per_m"]) if "vorp_per_m" in info and not pd.isna(info["vorp_per_m"]) else None
+        moneyball_tag_val = str(info["moneyball_tag"]) if "moneyball_tag" in info and info["moneyball_tag"] else None
+        moneyball_score_val = float(info["moneyball_score"]) if "moneyball_score" in info and not pd.isna(info["moneyball_score"]) else None
+        set_piece_role_val = str(info["set_piece_role"]) if "set_piece_role" in info and info["set_piece_role"] else None
+        imminent_price_val = str(info["imminent_price_change"]) if "imminent_price_change" in info and info["imminent_price_change"] else None
 
         return PlayerPick(
             id=player_id,
@@ -349,6 +365,14 @@ class FPLOptimizer:
             rolling_xgc_90=rolling_xgc_val,
             minutes_reliability=minutes_reliability_val,
             starts_ratio=starts_ratio_val,
+            xgi_delta=xgi_delta_val,
+            xgc_delta=xgc_delta_val,
+            vorp=vorp_val,
+            vorp_per_m=vorp_per_m_val,
+            moneyball_tag=moneyball_tag_val,
+            moneyball_score=moneyball_score_val,
+            set_piece_role=set_piece_role_val,
+            imminent_price_change=imminent_price_val,
             is_starter=is_starter,
             is_captain=is_captain,
             is_vice_captain=is_vice_captain,

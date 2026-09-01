@@ -5,39 +5,44 @@ An autonomous, AI-augmented Fantasy Premier League (FPL) tactical decision daemo
 Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) with an **AI Decision Director** (powered by LLMs like Google Gemini / OpenAI) to optimize lineups, automate transfers, evaluate game-theoretic Effective Ownership (EO%), decode live press conference quotes, manage chip deployment, and dispatch natural-language briefings to Telegram before every gameweek deadline.
 
 ---
-
 ## ⚡ Architecture Overview
 
 ```text
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                        Live Data Feeds & Real-Time Intelligence                        │
-│  ┌───────────────────────┐  ┌─────────────────────────┐  ┌──────────────────────────┐  │
-│  │   Official FPL API    │  │    FPL Core Insights    │  │   Vaastav FPL Dataset    │  │
-│  │ • Bootstrap & Prices  │  │ • Live xP & xGI/90      │  │ • 2026-27 Match Logs     │  │
-│  │ • Mini-League Rivals  │  │ • Defensive Contrib.    │  │ • Rolling xGI/xGC/90     │  │
-│  └───────────┬───────────┘  └────────────┬────────────┘  └────────────┬─────────────┘  │
-└──────────────┼───────────────────────────┼────────────────────────────┼────────────────┘
-               ▼                           ▼                            ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   fpl-worker                                           │
-│  ┌─────────────────────────────────────────┐  ┌─────────────────────────────────────┐  │
-│  │        HiGHS MILP Solver Engine         │  │        AI Decision Director         │  │
-│  │ • Multi-Period Lookahead Decay (γᵗ)     │  │ • Press Conference Quote Decryption │  │
-│  │ • Bench Sub-Factor Utility Weighting    │  │ • Dynamic Armband & Shielding       │  │
-│  │ • Exact Half-Profit Selling Prices      │  │ • Late Injury Veto & Re-Solve Loop  │  │
-│  │ • EO% Mini-League Shielding & Daggers   │  │ • Contextual Tactical Rationale     │  │
-│  │ • Banked Free Transfer Valuation (+1.5) │  └──────────────────┬──────────────────┘  │
-│  └────────────────────┬────────────────────┘                     │                     │
-│                       │                                          │                     │
-│                       ▼                                          ▼                     │
-│              Automated Execution                       Telegram Match Digest           │
-└───────────────────────┬────────────────────────────────────────────────────────────────┘
-                        │
-                        ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 fpl-dashboard                                          │
-│                   (Flask Web UI • Live Pitch • Mini-Leagues)                           │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                             Live Data Feeds & Real-Time Intelligence                             │
+│  ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐  ┌─────────┐ │
+│  │    Official FPL API    │  │   FPL Core Insights    │  │  Vaastav FPL Dataset   │  │ Price   │ │
+│  │ • Bootstrap & Selling  │  │ • Multi-GW xP Proj.    │  │ • Match Logs (2026-27) │  │ Predict │ │
+│  │ • Set-Piece Hierarchy  │  │ • xGI/90 & xGC/90      │  │ • xGI Mean Reversion Δ │  │ • Δ Targets│
+│  │ • Mini-League Rivals   │  │ • Def. Contributions   │  │ • Rolling Minutes & BPS│  │ • ±100% │ │
+│  └───────────┬────────────┘  └───────────┬────────────┘  └───────────┬────────────┘  └────┬────┘ │
+└──────────────┼───────────────────────────┼───────────────────────────┼────────────────────┼──────┘
+               ▼                           ▼                           ▼                    ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                           fpl-worker                                             │
+│  ┌──────────────────────────────────────────────┐  ┌──────────────────────────────────────────┐  │
+│  │           HiGHS MILP Solver Engine           │  │     Moneyball & Sabermetrics Engine      │  │
+│  │ • Multi-Period Lookahead Decay (γᵗ)          │  │ • Mean Reversion (xGI - (G+A) Δ)         │  │
+│  │ • Exact Half-Profit Selling Prices           │  │ • VORP per Marginal Million (£m Yield)  │  │
+│  │ • Bench Sub-Factor Utility Weighting (10%)   │  │ • "Barbell" Portfolio (Anchor + Enabler) │  │
+│  │ • Banked Free Transfer Valuation (+1.5 xP)   │  │ • Set-Piece Baseline Bonus (Pen/FK/Cor)  │  │
+│  └──────────────────────┬───────────────────────┘  └────────────────────┬─────────────────────┘  │
+│                         │                                               │                        │
+│                         ▼                                               ▼                        │
+│  ┌────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                  AI Decision Director                                      │  │
+│  │ • Press Conference Decryption     • Emergency Veto Loop      • Dynamic Captaincy Armband   │  │
+│  │ • Mini-League Shielding & Daggers • Risk Mode (DEFEND/CHASE) • Contextual Tactical Rationale│  │
+│  └──────────────────────────────────────────────┬─────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┼────────────────────────────────────────────────┘
+                                                  │
+                                                  ▼
+                         ┌─────────────────────────────────────────────────┐
+                         │              Automated Dispatch                 │
+                         │  • Live Squad Execution & FPL API Lock-in       │
+                         │  • Natural-Language Telegram Match Briefing     │
+                         │  • Flask Live Dashboard Pitch Visualization     │
+                         └─────────────────────────────────────────────────┘
 ```
 
 ---
@@ -52,15 +57,30 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 * **Game-Theoretic Effective Ownership (EO%) Shielding:** Scans rival squads in configured mini-leagues to identify **Shields** (high-ownership rivals), **Vulnerabilities**, and **Daggers** (differentials) to protect or gain rank.
 * **Banked Free Transfer Valuation:** Awards $+1.5\text{ xP}$ strategic value to banking a free transfer, preventing unnecessary lateral churn.
 
-### 2. Multi-Source Ingestion & Underlying Statistics
+### 2. Moneyball Analytics & Sabermetrics Engine
+* **Luck vs. Skill Mean Reversion ($xGI\text{ Delta}$):** Quantifies variance between underlying threat and actual returns ($xGI\text{ Delta} = xGI - (G+A)$) to spot high-threat assets *before* they haul while flagging overvalued, lucky haulers.
+* **VORP per Marginal Million (£m Efficiency):** Calculates Value Over Replacement Player relative to positional floors (GKP: £4.0m, DEF: £4.0m, MID: £4.5m, FWD: £4.5m) to find hyper-efficient budget enablers.
+* **"Barbell" Portfolio Architecture:** Maximizes marginal points per pound across the £4.5m–£6.5m supporting cast, seamlessly funding elite £15.0m captaincy engines (Haaland / Salah).
+* **Set-Piece & Penalty Hierarchy Registry:** Ingests official penalty orders, direct free-kick orders, and corner duties to award baseline threat boosts and spot cheap set-piece specialists.
+* **Price Change Target Predictor:** Computes net transfer velocity targets to identify imminent $+£0.1\text{m}$ price rises and $-£0.1\text{m}$ price falls, locking in squad value.
+* **Mini-League `CHASE` Mode Daggers:** Injects high-EV, low-EO% Moneyball differentials into tactical candidate screening to overcome mini-league point deficits.
+
+| Tag Archetype | Criteria | Strategic Action |
+| :--- | :--- | :--- |
+| `ELITE_ANCHOR` | Cost $\ge £9.5\text{m}$, $\text{xP} \ge 5.5$ | Permanent captaincy engine; protected from budget stripping |
+| `UNDERVALUED_REGRESSION` | $xGI\text{ Delta} \ge +0.60$, Cost $\le £8.5\text{m}$ | Prime buy target; expected positive mean reversion |
+| `HIGH_EFFICIENCY_ENABLER` | $\text{VORP/£m} \ge 1.50$, Cost $\le £6.5\text{m}$ | Starting XI budget enabler to fund elite premiums |
+| `OVERVALUED_HAULER` | $xGI\text{ Delta} \le -1.20$, $\text{Form} \ge 5.0$ | Sell candidate; lucky conversion rate overdue negative regression |
+
+### 3. Multi-Source Ingestion & Underlying Statistics
 * **`olbauday/FPL-Core-Insights`:** Automatically ingests live expected points ($xP$), expected goal involvement ($xGI/90$), and defensive contribution metrics.
 * **`vaastav/Fantasy-Premier-League`:** Ingests match logs and computes rolling $xGI/90$, $xGC/90$, average minutes in recent appearances, and starts reliability.
 * **Proactive Injury & Minutes Reliability Multipliers:** Dynamically scales availability ($75\% \rightarrow 0.8\times$, $50\% \rightarrow 0.4\times$, $25\% \rightarrow 0.1\times$, $0\% \rightarrow 0.0\times$) and flags minutes fragility.
 
-### 3. Expanded AI Decision Director
+### 4. Expanded AI Decision Director
 * **Manager Press Conference Decryption:** Decodes nuanced managerial quotes (e.g. Pep, Arteta, Emery) for key targets and captains.
 * **Emergency Veto & Instant Re-Solve Loop:** If late-breaking news reveals an unexpected injury or benching, the Director issues an emergency veto and the HiGHS solver instantly re-solves in 15ms for a clean alternative.
-* **Armband Authority:** Intelligently validates or overrides Captain and Vice-Captain picks based on late weather, press quotes, and mini-league risk mode (`DEFEND`, `CHASE`, `NEUTRAL`).
+* **Armband Authority & Moneyball Intelligence:** Intelligently validates or overrides Captain and Vice-Captain picks based on late weather, press quotes, Moneyball regression tags, and mini-league risk mode (`DEFEND`, `CHASE`, `NEUTRAL`).
 
 ---
 
@@ -138,12 +158,12 @@ Access the web dashboard at `http://localhost:5000`.
 
 ## 🛠️ Testing & Verification
 
-Gegenbot includes a comprehensive unit test suite covering auth, data fetchers, news tracking, HiGHS solver formulations, chip evaluations, and AI Director decision logic.
+Gegenbot includes a comprehensive unit test suite covering auth, data fetchers, news tracking, Moneyball metrics, HiGHS solver formulations, chip evaluations, and AI Director decision logic.
 
 ```bash
 pytest
 ```
-*All 61 tests passing.*
+*All 68 tests passing.*
 
 ---
 

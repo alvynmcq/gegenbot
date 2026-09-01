@@ -98,13 +98,12 @@ class TelegramNotifier:
 
         news_block = ""
         if decision.news_alerts:
-            import re
-            cleaned_alerts = [f"• 🚨 {re.sub(r'[_*`]', ' ', a)}" for a in decision.news_alerts[:3]]
+            # Escape Telegram markdown characters without losing content
+            cleaned_alerts = [f"• 🚨 {a.replace('*', '').replace('`', '')}" for a in decision.news_alerts[:3]]
             alerts_str = "\n".join(cleaned_alerts)
             news_block = f"📰 *PRESS CONFERENCE & NEWS ALERTS:*\n{alerts_str}\n\n"
 
-        import re
-        clean_rationale = re.sub(r"[_*`]", " ", decision.rationale)
+        clean_rationale = decision.rationale.replace("*", "").replace("`", "")
 
         message = (
             f"{status_tag}\n"

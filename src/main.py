@@ -99,6 +99,7 @@ def get_latest_live_gameweek(events: List[Dict[str, Any]]) -> Optional[int]:
 def _build_competitive_context(
     entry_history: Dict[str, Any],
     rivals: Optional[List[Dict[str, Any]]] = None,
+    my_entry_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Derive DEFEND / NEUTRAL / CHASE risk mode from entry history and league standings.
@@ -118,20 +119,40 @@ def _build_competitive_context(
 
     if rivals:
         sorted_rivals = sorted(rivals, key=lambda r: -r.get("total", 0))
-        for idx, r in enumerate(sorted_rivals):
-            if r.get("total", 0) <= my_total_points:
-                rank_in_mini_league = idx + 1
-                points_behind_leader = sorted_rivals[0].get("total", 0) - my_total_points
-                if idx + 1 < len(sorted_rivals):
-                    points_ahead_last = my_total_points - sorted_rivals[idx + 1].get("total", 0)
-                break
+        leader_points = sorted_rivals[0].get("total", 0) if sorted_rivals else my_total_points
+
+        # 1. Direct match by entry ID if present in standings
+        my_rival_match = next((r for r in sorted_rivals if my_entry_id and r.get("entry") == my_entry_id), None)
+        if my_rival_match:
+            rank_in_mini_league = my_rival_match.get("rank")
+            my_league_points = my_rival_match.get("total", my_total_points)
+            points_behind_leader = max(0, leader_points - my_league_points)
+            curr_rank = my_rival_match.get("rank", 1)
+            next_below = next((r for r in sorted_rivals if r.get("rank", 0) > curr_rank), None)
+            points_ahead_last = (my_league_points - next_below.get("total", 0)) if next_below else 0
+        else:
+            # 2. Derive relative rank by points comparison
+            matched = False
+            for idx, r in enumerate(sorted_rivals):
+                if r.get("total", 0) <= my_total_points:
+                    rank_in_mini_league = idx + 1
+                    matched = True
+                    if idx + 1 < len(sorted_rivals):
+                        points_ahead_last = my_total_points - sorted_rivals[idx + 1].get("total", 0)
+                    else:
+                        points_ahead_last = 0
+                    break
+            if not matched:
+                rank_in_mini_league = len(sorted_rivals) + 1
+                points_ahead_last = 0
+            points_behind_leader = max(0, leader_points - my_total_points)
 
     # Determine risk mode
     gws_remaining = max(1, 38 - len(current_season))
-    if points_behind_leader is not None and points_ahead_last is not None:
+    if points_behind_leader is not None:
         if points_behind_leader <= 5:
             risk_mode = "DEFEND"
-        elif points_behind_leader >= 30 and gws_remaining <= 10:
+        elif points_behind_leader >= 35 or (points_behind_leader >= 20 and gws_remaining <= 15) or (points_behind_leader >= 10 and gws_remaining <= 6):
             risk_mode = "CHASE"
         else:
             risk_mode = "NEUTRAL"
@@ -148,7 +169,7 @@ def _build_competitive_context(
         "risk_mode": risk_mode,
         "risk_mode_note": {
             "DEFEND": "Within 5 pts of league leader — protect rank, avoid hits and differentials.",
-            "CHASE": "15+ pts behind with limited GWs left — be aggressive, take hits, play differentials.",
+            "CHASE": "Significant deficit to leader — be aggressive, take calculated hits, play high-EV differentials.",
             "NEUTRAL": "Mid-table — balance risk vs reward, take free hits, avoid unnecessary -4s.",
         }.get(risk_mode, ""),
     }
@@ -424,10 +445,15 @@ def run_pipeline(
     if league_analysis and league_analysis.rivals and entry_history_data:
         try:
             rival_standings = [
-                {"total": r.total_points}
+                {"entry": r.entry_id, "rank": r.rank, "total": r.total_points}
                 for r in league_analysis.rivals
             ]
-            competitive_context = _build_competitive_context(entry_history_data, rivals=rival_standings)
+            my_entry_id = int(team_id_str) if team_id_str else None
+            competitive_context = _build_competitive_context(
+                entry_history_data,
+                rivals=rival_standings,
+                my_entry_id=my_entry_id,
+            )
             logger.info(
                 f"Mini-league rank: #{competitive_context.get('rank_in_mini_league', 'N/A')} | "
                 f"Behind leader: {competitive_context.get('points_behind_leader', 'N/A')} pts | "
