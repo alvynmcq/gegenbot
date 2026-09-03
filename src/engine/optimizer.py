@@ -156,6 +156,8 @@ class PlayerPick(BaseModel):
     is_vice_captain: bool = False
     bench_order: Optional[int] = None  # 0 for Sub GK (Pick 12), 1-3 for outfield bench (Picks 13-15)
     fixtures_in_gw: int = 1
+    opponent_team_id: Optional[int] = None
+    opponent_team_ids: Optional[List[int]] = None
 
 
 class TransferMove(BaseModel):
@@ -246,13 +248,17 @@ class FPLOptimizer:
         decay_factor: Optional[float] = None,
         horizon_length: Optional[int] = None,
         bench_weight: Optional[float] = None,
+        enable_correlation_penalties: Optional[bool] = None,
+        captain_clash_penalty: Optional[float] = None,
+        def_att_clash_penalty: Optional[float] = None,
+        max_opposing_starters: Optional[int] = None,
     ):
         """
         Initialize optimizer with player DataFrame and apply injury/rotation status discounting.
         Incorporates configurable horizon decay factor (gamma), horizon lookahead length (N),
-        and bench strength auto-sub weighting factor.
+        bench strength auto-sub weighting factor, and starting XI correlation / fixture clash mitigation.
         Expected columns: id, web_name, element_type, position, team_id, team_name, team_code, cost_m, xp
-        Optional columns: xp_3gw, status, chance_of_playing_next_round, fixtures_in_gw
+        Optional columns: xp_3gw, status, chance_of_playing_next_round, fixtures_in_gw, opponent_team_id, opponent_team_ids
         """
         self.df = players_df.copy().reset_index(drop=True)
         self.decay_factor = float(decay_factor if decay_factor is not None else os.getenv("DECAY_FACTOR", "0.85"))
@@ -262,11 +268,61 @@ class FPLOptimizer:
         )
         self.decay_weights, self.decay_sum = calculate_decay_weights(self.horizon_length, self.decay_factor)
 
+        # Correlation & fixture clash parameters
+        self.enable_correlation_penalties = (
+            enable_correlation_penalties
+            if enable_correlation_penalties is not None
+            else os.getenv("ENABLE_CORRELATION_PENALTIES", "true").lower() in ("true", "1", "yes")
+        )
+        self.captain_clash_penalty = float(
+            captain_clash_penalty
+            if captain_clash_penalty is not None
+            else os.getenv("CAPTAIN_CLASH_PENALTY", "0.40")
+        )
+        self.def_att_clash_penalty = float(
+            def_att_clash_penalty
+            if def_att_clash_penalty is not None
+            else os.getenv("DEF_ATT_CLASH_PENALTY", "0.20")
+        )
+        raw_max_opp = (
+            max_opposing_starters
+            if max_opposing_starters is not None
+            else os.getenv("MAX_OPPOSING_DEF_ATT_STARTERS", "3")
+        )
+        try:
+            self.max_opposing_starters = int(raw_max_opp) if raw_max_opp is not None and int(raw_max_opp) > 0 else None
+        except (ValueError, TypeError):
+            self.max_opposing_starters = None
+
+        # Extract per-player opponent team IDs for fixture correlation tracking
+        player_opponents: List[Set[int]] = []
+        for _, row in self.df.iterrows():
+            opps: Set[int] = set()
+            opp_list = row.get("opponent_team_ids")
+            if isinstance(opp_list, (list, set, tuple)):
+                for o in opp_list:
+                    if o is not None and not pd.isna(o):
+                        try:
+                            opps.add(int(o))
+                        except (ValueError, TypeError):
+                            pass
+            elif row.get("opponent_team_id") is not None and not pd.isna(row.get("opponent_team_id")):
+                try:
+                    opps.add(int(row["opponent_team_id"]))
+                except (ValueError, TypeError):
+                    pass
+            player_opponents.append(opps)
+        self.player_opponents = player_opponents
+
         if "raw_xp" not in self.df.columns:
             self.df["raw_xp"] = self.df["xp"]
+        else:
+            self.df["raw_xp"] = self.df["raw_xp"].fillna(self.df["xp"])
 
         if "xp_3gw" not in self.df.columns:
             self.df["xp_3gw"] = self.df["xp"] * self.decay_sum
+        else:
+            self.df["xp_3gw"] = self.df["xp_3gw"].fillna(self.df["xp"] * self.decay_sum)
 
         if "fixtures_in_gw" not in self.df.columns:
             self.df["fixtures_in_gw"] = 1
@@ -279,10 +335,21 @@ class FPLOptimizer:
             chance = row.get("chance_of_playing_next_round")
             mult = get_player_injury_multiplier(stat, chance)
             multipliers.append(mult)
-            raw = float(row.get("raw_xp", row.get("xp", 0.0)))
+            raw_val = row.get("raw_xp")
+            if raw_val is not None and not pd.isna(raw_val):
+                raw = float(raw_val)
+            else:
+                raw = float(row.get("xp", 0.0) or 0.0)
             disc = round(raw * mult, 2)
             discounted_xps.append(disc)
-            raw_3gw = float(row.get("xp_3gw", raw * self.decay_sum))
+            raw_3gw_val = row.get("xp_3gw")
+            if raw_3gw_val is not None and not pd.isna(raw_3gw_val):
+                try:
+                    raw_3gw = float(raw_3gw_val)
+                except (ValueError, TypeError):
+                    raw_3gw = raw * self.decay_sum
+            else:
+                raw_3gw = raw * self.decay_sum
             discounted_3gw.append(round(raw_3gw * mult, 2))
 
         self.df["injury_multiplier"] = multipliers
@@ -344,6 +411,16 @@ class FPLOptimizer:
         imminent_price_val = str(info["imminent_price_change"]) if "imminent_price_change" in info and info["imminent_price_change"] else None
         implied_cs_val = float(info["implied_cs_pct"]) if "implied_cs_pct" in info and not pd.isna(info["implied_cs_pct"]) else None
         implied_goal_val = float(info["implied_goal_pct"]) if "implied_goal_pct" in info and not pd.isna(info["implied_goal_pct"]) else None
+        opp_id_raw = info.get("opponent_team_id")
+        opp_id_val = int(opp_id_raw) if opp_id_raw is not None and not pd.isna(opp_id_raw) else None
+
+        opp_ids_raw = info.get("opponent_team_ids")
+        opp_ids_val = None
+        if isinstance(opp_ids_raw, (list, set, tuple)):
+            clean_opps = [int(x) for x in opp_ids_raw if x is not None and not pd.isna(x)]
+            opp_ids_val = clean_opps if clean_opps else None
+        elif opp_id_val is not None:
+            opp_ids_val = [opp_id_val]
 
         return PlayerPick(
             id=player_id,
@@ -384,6 +461,8 @@ class FPLOptimizer:
             is_vice_captain=is_vice_captain,
             bench_order=bench_order,
             fixtures_in_gw=n_fix,
+            opponent_team_id=opp_id_val,
+            opponent_team_ids=opp_ids_val,
         )
 
     def select_initial_squad(self, budget_m: float = 100.0) -> List[int]:
@@ -536,7 +615,121 @@ class FPLOptimizer:
                 selling_price_m=sp_map.get(p_id),
             ))
 
+        # Check and log Starting XI fixture clashes / correlation
+        cap_opps = self.player_opponents[captain_idx] if captain_idx < len(self.player_opponents) else set()
+        cap_opp_defs = [
+            p.web_name for p in starters
+            if p.element_type in (1, 2) and self.player_map.get(p.id, {}).get("team_id") in cap_opps
+        ]
+        if cap_opp_defs:
+            logger.info(f"Fixture Correlation Notice: Starting defender(s) {cap_opp_defs} playing against captain {captain_pick.web_name}.")
+        else:
+            logger.debug(f"Fixture Correlation: Captain {captain_pick.web_name} decoupled from opposing starting defense.")
+
         return starters, bench, captain_pick, vc_pick, formation
+
+    def _add_correlation_penalties(
+        self,
+        prob: pulp.LpProblem,
+        starter_vars: Dict[int, pulp.LpVariable],
+        captain_vars: Dict[int, pulp.LpVariable],
+        indices: List[int],
+    ) -> pulp.LpAffineExpression:
+        """
+        Add linear correlation penalties and anti-cannibalization guards for Starting XI:
+        1. Decouple Captain vs Opponent Defender/GK:
+           If captain_vars[c] == 1 and starter_vars[d] == 1 for an opposing defender d,
+           penalize the objective by captain_clash_penalty (default 0.40 xP).
+        2. Opposing DEF/GK vs MID/FWD starting clash:
+           If starter_vars[d] == 1 (DEF/GK) and starter_vars[a] == 1 (opposing MID/FWD),
+           penalize the objective by def_att_clash_penalty (default 0.20 xP).
+        3. Hard cap guard (optional):
+           Max opposing starters across DEF_A and ATT_B in a single match.
+        """
+        if not self.enable_correlation_penalties or not any(self.player_opponents):
+            return pulp.LpAffineExpression()
+
+        penalty_terms = []
+        elem_types = [int(self.df.loc[i, "element_type"]) for i in indices]
+        team_ids = [int(self.df.loc[i, "team_id"]) for i in indices]
+        multipliers = [float(self.df.loc[i, "injury_multiplier"]) for i in indices]
+        xps = [float(self.df.loc[i, "xp"]) for i in indices]
+
+        # Map teams to active player indices by role
+        def_gk_by_team: Dict[int, List[int]] = {}
+        att_by_team: Dict[int, List[int]] = {}
+        for i in indices:
+            if multipliers[i] == 0.0 or xps[i] <= 0:
+                continue
+            t = team_ids[i]
+            pos = elem_types[i]
+            if pos in (1, 2):
+                def_gk_by_team.setdefault(t, []).append(i)
+            elif pos in (3, 4):
+                att_by_team.setdefault(t, []).append(i)
+
+        def _make_var(name: str) -> pulp.LpVariable:
+            if hasattr(prob, "add_variable"):
+                return prob.add_variable(name, lowBound=0, upBound=1)
+            return pulp.LpVariable(name, 0, 1)
+
+        # 1. Captain vs Opposing DEF/GK Clash Penalty
+        if self.captain_clash_penalty > 0:
+            for c_idx in indices:
+                if multipliers[c_idx] == 0.0 or xps[c_idx] < 2.0:
+                    continue
+                c_opps = self.player_opponents[c_idx]
+                if not c_opps:
+                    continue
+                for opp_team in c_opps:
+                    for d_idx in def_gk_by_team.get(opp_team, []):
+                        z_cap = _make_var(f"CapDefClash_{c_idx}_{d_idx}")
+                        prob += z_cap >= captain_vars[c_idx] + starter_vars[d_idx] - 1, f"CapDefClash_{c_idx}_{d_idx}"
+                        penalty_terms.append(self.captain_clash_penalty * z_cap)
+
+        # 2. Opposing DEF/GK vs MID/FWD Starting Clash Penalty & Optional Hard Cap
+        processed_fixtures: Set[Tuple[int, int]] = set()
+        for i in indices:
+            team_a = team_ids[i]
+            for team_b in self.player_opponents[i]:
+                if team_a == team_b:
+                    continue
+                fixture_key = (min(team_a, team_b), max(team_a, team_b))
+                if fixture_key in processed_fixtures:
+                    continue
+                processed_fixtures.add(fixture_key)
+
+                defs_a = def_gk_by_team.get(team_a, [])
+                atts_b = att_by_team.get(team_b, [])
+                defs_b = def_gk_by_team.get(team_b, [])
+                atts_a = att_by_team.get(team_a, [])
+
+                if self.def_att_clash_penalty > 0:
+                    for d in defs_a:
+                        for a in atts_b:
+                            z_clash = _make_var(f"DefAttClash_{d}_{a}")
+                            prob += z_clash >= starter_vars[d] + starter_vars[a] - 1, f"DefAttClash_{d}_{a}"
+                            penalty_terms.append(self.def_att_clash_penalty * z_clash)
+
+                    for d in defs_b:
+                        for a in atts_a:
+                            z_clash = _make_var(f"DefAttClash_{d}_{a}")
+                            prob += z_clash >= starter_vars[d] + starter_vars[a] - 1, f"DefAttClash_{d}_{a}"
+                            penalty_terms.append(self.def_att_clash_penalty * z_clash)
+
+                if self.max_opposing_starters is not None and self.max_opposing_starters > 0:
+                    if defs_a and atts_b:
+                        prob += (
+                            pulp.lpSum([starter_vars[k] for k in defs_a + atts_b]) <= self.max_opposing_starters,
+                            f"MaxCrossClash_{team_a}_{team_b}",
+                        )
+                    if defs_b and atts_a:
+                        prob += (
+                            pulp.lpSum([starter_vars[k] for k in defs_b + atts_a]) <= self.max_opposing_starters,
+                            f"MaxCrossClash_{team_b}_{team_a}",
+                        )
+
+        return pulp.lpSum(penalty_terms) if penalty_terms else pulp.LpAffineExpression()
 
     def _solve_optimal_squad_from_scratch(
         self,
@@ -602,16 +795,20 @@ class FPLOptimizer:
 
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
-        # 7. Objective with optional EO shield weighting and sub factor bench weighting
+        # 7. Objective with optional EO shield weighting, sub factor bench weighting, and correlation penalties
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
+
+        correlation_penalty = self._add_correlation_penalties(
+            prob, starter_vars, captain_vars, indices
+        )
 
         prob += pulp.lpSum([
             starter_vars[i] * (xps[i] + eo_boosts[i])
             + captain_vars[i] * xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * xps[i]
             for i in indices
-        ]), "TotalXP"
+        ]) - correlation_penalty, "TotalXP"
 
         status = _solve_problem(prob)
 
@@ -775,7 +972,7 @@ class FPLOptimizer:
                         f"ExclTransfersInCut_{cut_idx}",
                     )
 
-        # 9. Objective function:
+        # 9. Objective function with correlation penalties:
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
@@ -784,12 +981,16 @@ class FPLOptimizer:
             for i in indices
         ]
 
+        correlation_penalty = self._add_correlation_penalties(
+            prob, starter_vars, captain_vars, indices
+        )
+
         prob += pulp.lpSum([
             starter_vars[i] * (blended_xps[i] + eo_boosts[i])
             + captain_vars[i] * blended_xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * blended_xps[i]
             for i in indices
-        ]), "TotalXP"
+        ]) - correlation_penalty, "TotalXP"
 
         status = _solve_problem(prob)
 
@@ -801,6 +1002,13 @@ class FPLOptimizer:
                 for i in zero_mult_indices:
                     cname = f"NoZeroMultStarter_{i}"
                     if cname in prob.constraints:
+                        del prob.constraints[cname]
+                status = _solve_problem(prob)
+
+            if status != pulp.LpStatusOptimal:
+                # Relax any hard MaxCrossClash constraints if present
+                for cname in list(prob.constraints.keys()):
+                    if cname.startswith("MaxCrossClash_"):
                         del prob.constraints[cname]
                 status = _solve_problem(prob)
 

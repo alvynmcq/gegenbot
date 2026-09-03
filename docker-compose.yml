@@ -13,6 +13,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      - ./src:/app/src
       - ./.env:/app/.env:ro
     environment:
       - PYTHONPATH=/app
@@ -36,6 +37,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      - ./src:/app/src
       - ./.env:/app/.env:ro
     environment:
       - PYTHONPATH=/app

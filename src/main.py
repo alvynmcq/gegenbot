@@ -293,6 +293,7 @@ def run_pipeline(
     """
     Execute full optimization, decision, and dispatch pipeline.
     """
+    load_dotenv(override=True)
     logger.info("=" * 60)
     logger.info(f"Starting FPL Tactical Pipeline (Mode: {'DRY-RUN' if not execute else 'LIVE EXECUTION'})")
     logger.info("=" * 60)
@@ -352,29 +353,50 @@ def run_pipeline(
 
     if custom_squad_ids:
         current_squad_ids = custom_squad_ids
-    elif client.auth.is_authenticated and team_id_str:
-        try:
-            team_id = int(team_id_str)
-            auth_ok, auth_msg = client.validate_auth(team_id)
-            if not auth_ok:
-                logger.warning(f"FPL Authentication warning: {auth_msg}")
+    elif team_id_str:
+        team_id = int(team_id_str)
+        if client.auth.is_authenticated:
+            try:
+                auth_res = client.validate_auth(team_id)
+                if isinstance(auth_res, tuple) and len(auth_res) == 2:
+                    auth_ok, auth_msg = auth_res
+                else:
+                    auth_ok, auth_msg = bool(auth_res), "Auth validation checked"
+                if not auth_ok:
+                    logger.warning(f"FPL Authentication warning: {auth_msg}")
 
-            logger.info(f"Fetching live squad for Team ID {team_id}...")
-            my_team_data = client.get_my_team(team_id)
-            picks = my_team_data.get("picks", [])
-            current_squad_ids = [p["element"] for p in picks]
-            selling_prices = {
-                p["element"]: float(p.get("selling_price", p.get("now_cost", 50))) / 10.0
-                for p in picks
-            }
-            transfers_info = my_team_data.get("transfers", {})
-            bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
-            free_transfers = transfers_info.get("limit", 1)
-            logger.info(
-                f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to fetch live team: {e}. Initializing default squad from top performers.")
+                logger.info(f"Fetching live squad for Team ID {team_id}...")
+                my_team_data = client.get_my_team(team_id)
+                picks = my_team_data.get("picks", [])
+                current_squad_ids = [p["element"] for p in picks]
+                selling_prices = {
+                    p["element"]: float(p.get("selling_price", p.get("now_cost", 50))) / 10.0
+                    for p in picks
+                }
+                transfers_info = my_team_data.get("transfers", {})
+                bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
+                free_transfers = transfers_info.get("limit", 1)
+                logger.info(
+                    f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch live team via authenticated API: {e}. Falling back to public picks.")
+
+        # Fallback to public entry picks if authenticated retrieval failed or unauthenticated
+        if not current_squad_ids:
+            try:
+                latest_gw = get_latest_live_gameweek(events) or max(1, gw_id - 1)
+                logger.info(f"Fetching public squad picks for Team ID {team_id} (GW{latest_gw})...")
+                entry_picks = client.get_entry_picks(team_id, latest_gw)
+                picks = entry_picks.get("picks", [])
+                current_squad_ids = [p["element"] for p in picks]
+                history = entry_picks.get("entry_history", {})
+                bank_m = round(history.get("bank", 0) / 10.0, 1)
+                logger.info(
+                    f"Public squad retrieved: {len(current_squad_ids)} players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch public picks for Team ID {team_id}: {e}. Initializing default squad from top performers.")
 
     optimizer = FPLOptimizer(players_df)
 

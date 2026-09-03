@@ -115,10 +115,20 @@ def calculate_player_metrics(
     team_names = {t["id"]: t["name"] for t in teams_raw}
     team_short = {t["id"]: t["short_name"] for t in teams_raw}
 
-    # FDR calculation
+    # FDR calculation & Next Opponent Mapping
     fdr_lookup = {}
+    team_opponents: Dict[int, List[int]] = {t["id"]: [] for t in teams_raw}
     if fixtures:
         fdr_lookup = calculate_team_fdr_next_n_fixtures(fixtures, current_event, n_gameweeks=3)
+        for fix in fixtures:
+            if fix.get("event") == current_event and not fix.get("finished", False):
+                th = fix.get("team_h")
+                ta = fix.get("team_a")
+                if th and ta:
+                    if ta not in team_opponents.setdefault(th, []):
+                        team_opponents[th].append(ta)
+                    if th not in team_opponents.setdefault(ta, []):
+                        team_opponents[ta].append(th)
 
     # Resolve FPL Review mapped projections
     fplreview_map: Dict[int, Any] = {}
@@ -358,6 +368,9 @@ def calculate_player_metrics(
             2,
         )
 
+        opp_list = team_opponents.get(team_id, [])
+        primary_opp = opp_list[0] if opp_list else None
+
         records.append({
             "id": player_id,
             "web_name": web_name,
@@ -366,6 +379,8 @@ def calculate_player_metrics(
             "team_id": team_id,
             "team_name": team_name,
             "team_code": team_code,
+            "opponent_team_id": primary_opp,
+            "opponent_team_ids": opp_list,
             "now_cost": now_cost,
             "cost_m": cost_m,
             "form": form,

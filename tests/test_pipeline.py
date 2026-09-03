@@ -1645,6 +1645,141 @@ def test_build_competitive_context_chase_and_defend():
     assert ctx_low["risk_mode"] == "CHASE"
 
 
+# ==========================================
+# 7. Portfolio Correlation & Clash Mitigation Tests
+# ==========================================
+
+def test_metrics_calculation_opponent_mapping(mock_bootstrap_data, mock_fixtures_data):
+    """Verify calculate_player_metrics extracts opponent_team_id and opponent_team_ids correctly."""
+    df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+
+    assert "opponent_team_id" in df.columns
+    assert "opponent_team_ids" in df.columns
+
+    # Event 1 has Team 1 vs Team 2, and Team 3 vs Team 4
+    team1_players = df[df["team_id"] == 1]
+    assert len(team1_players) > 0
+    for _, p in team1_players.iterrows():
+        assert p["opponent_team_id"] == 2
+        assert 2 in p["opponent_team_ids"]
+
+    team2_players = df[df["team_id"] == 2]
+    assert len(team2_players) > 0
+    for _, p in team2_players.iterrows():
+        assert p["opponent_team_id"] == 1
+        assert 1 in p["opponent_team_ids"]
+
+
+def test_captain_defense_correlation_penalty(mock_bootstrap_data, mock_fixtures_data):
+    """
+    Verify captain-defense soft penalty decouples starting defender from captain
+    when an alternative is within the penalty margin, but does NOT sacrifice high xP.
+    """
+    df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+
+    # Initial squad: 2 GK, 5 DEF, 5 MID, 3 FWD (respecting max 3 per club)
+    # In mock data:
+    # Team 1 vs Team 2.
+    # Player 25 is FWD on Team 1 (form=8.5, highest xP talisman, clear captain).
+    # DEF 5 is on Team 1
+    # DEF 6 is on Team 2 (Opponent of Team 1)
+    # DEF 7 is on Team 3 (Neutral match vs Team 4)
+    initial_squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 25, 27, 28]
+
+    # Case A: Defender 6 (Opponent) has xP = 4.2. Defender 7 (Neutral) has xP = 4.0.
+    # With captain_clash_penalty = 0.40, Defender 6 net value is 4.2 - 0.40 = 3.8 < 4.0.
+    # The optimizer should bench Defender 6 in favor of Defender 7.
+    df_case_a = df.copy()
+    df_case_a.loc[df_case_a["id"] == 6, "xp"] = 4.2
+    df_case_a.loc[df_case_a["id"] == 7, "xp"] = 4.0
+
+    opt_a = FPLOptimizer(
+        df_case_a,
+        enable_correlation_penalties=True,
+        captain_clash_penalty=0.40,
+        def_att_clash_penalty=0.0,
+    )
+    res_a = opt_a.optimize(initial_squad, bank_m=0.0, free_transfers=0)
+    cand_a = res_a.candidates[0]
+
+    assert cand_a.captain.id == 25
+    starter_ids_a = [p.id for p in cand_a.starters]
+    # Defender 7 (neutral) should start over Defender 6 (clashing with captain)
+    assert 7 in starter_ids_a
+    assert 6 not in starter_ids_a
+
+    # Case B: Defender 6 (Opponent) has xP = 6.0. Defender 7 (Neutral) has xP = 4.0.
+    # Delta (2.0) > penalty (0.40). The model should NOT sacrifice 2.0 xP just to avoid a clash!
+    df_case_b = df.copy()
+    df_case_b.loc[df_case_b["id"] == 6, "xp"] = 6.0
+    df_case_b.loc[df_case_b["id"] == 7, "xp"] = 4.0
+
+    opt_b = FPLOptimizer(
+        df_case_b,
+        enable_correlation_penalties=True,
+        captain_clash_penalty=0.40,
+        def_att_clash_penalty=0.0,
+    )
+    res_b = opt_b.optimize(initial_squad, bank_m=0.0, free_transfers=0)
+    cand_b = res_b.candidates[0]
+
+    starter_ids_b = [p.id for p in cand_b.starters]
+    assert 6 in starter_ids_b  # Elite defender starts despite captain clash
+
+
+def test_starter_clash_penalty_vs_stacking(mock_bootstrap_data, mock_fixtures_data):
+    """Verify that same-team stacking is preserved while cross-team DEF vs ATT clash is penalized."""
+    df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+
+    # In mock data, Team 1 plays Team 2.
+    # DEF 5 is Team 1, FWD 25 is Team 1. They are teammates (stacking).
+    # DEF 6 is Team 2. It clashes with FWD 25 (Team 1).
+    initial_squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 25, 27, 28]
+
+    opt = FPLOptimizer(
+        df,
+        enable_correlation_penalties=True,
+        captain_clash_penalty=0.0,
+        def_att_clash_penalty=0.50,
+    )
+    res = opt.optimize(initial_squad, bank_m=0.0, free_transfers=0)
+    cand = res.candidates[0]
+
+    starter_ids = [p.id for p in cand.starters]
+    # DEF 5 (teammate of FWD 25) can freely start together (intra-team stack)
+    assert 5 in starter_ids
+    # DEF 6 (opposing defender to FWD 25) is penalized and benched
+    assert 6 not in starter_ids
+
+
+def test_optimizer_backward_compatibility_missing_opponents():
+    """Verify optimizer runs cleanly when DataFrame lacks opponent_team_id / opponent_team_ids."""
+    raw_data = {
+        "id": list(range(1, 16)),
+        "web_name": [f"Player_{i}" for i in range(1, 16)],
+        "element_type": [1, 1] + [2] * 5 + [3] * 5 + [4] * 3,
+        "position": ["GKP", "GKP"] + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3,
+        "team_id": list(range(1, 16)),
+        "team_name": [f"Team {i}" for i in range(1, 16)],
+        "team_code": [f"T{i}" for i in range(1, 16)],
+        "cost_m": [4.5] * 15,
+        "xp": [3.0] * 15,
+    }
+    df = pd.DataFrame(raw_data)
+    # Ensure no opponent columns exist
+    assert "opponent_team_id" not in df.columns
+    assert "opponent_team_ids" not in df.columns
+
+    optimizer = FPLOptimizer(df, enable_correlation_penalties=True)
+    res = optimizer.optimize(list(range(1, 16)), bank_m=1.0, free_transfers=1)
+
+    assert res is not None
+    assert len(res.candidates) >= 1
+    assert len(res.candidates[0].starters) == 11
+    assert len(res.candidates[0].bench) == 4
+
+
+
 
 
 

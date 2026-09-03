@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Union
 import requests
 from pydantic import BaseModel, Field
@@ -40,12 +41,15 @@ class AIDirector:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: int = 15,
+        timeout: Optional[int] = None,
+        max_retries: int = 3,
     ):
         self.api_key = api_key if api_key is not None else os.getenv("LLM_API_KEY", "").strip()
         self.base_url = (base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
-        self.timeout = timeout
+        env_timeout = os.getenv("LLM_TIMEOUT", "").strip()
+        self.timeout = timeout if timeout is not None else (int(env_timeout) if env_timeout.isdigit() else 45)
+        self.max_retries = max_retries
 
     def _extract_candidate_news_alerts(
         self,
@@ -295,83 +299,111 @@ class AIDirector:
             "temperature": 0.2,
         }
 
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=self.timeout)
-            resp.raise_for_status()
-            resp_data = resp.json()
-            content_str = resp_data["choices"][0]["message"]["content"]
-            parsed = json.loads(content_str)
+        parsed = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.post(url, headers=headers, json=body, timeout=self.timeout)
+                resp.raise_for_status()
+                resp_data = resp.json()
+                content_str = resp_data["choices"][0]["message"]["content"]
+                parsed = json.loads(content_str)
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                if attempt < self.max_retries:
+                    sleep_time = attempt * 2
+                    logger.warning(
+                        f"LLM Director attempt {attempt}/{self.max_retries} failed ({net_err}). "
+                        f"Retrying in {sleep_time}s..."
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    logger.warning(f"LLM Director call timed out / connection failed after {self.max_retries} attempts ({net_err}). Engaging automated mathematical fallback.")
+                    return self._build_fallback_decision(optimization_result, f"LLM timeout/network error: {net_err}", news_intel)
+            except requests.exceptions.HTTPError as http_err:
+                status_code = resp.status_code if 'resp' in locals() and resp is not None else 0
+                if status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    sleep_time = attempt * 2
+                    logger.warning(
+                        f"LLM Director attempt {attempt}/{self.max_retries} returned HTTP {status_code}. "
+                        f"Retrying in {sleep_time}s..."
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    logger.warning(f"LLM Director HTTP error {status_code} ({http_err}). Engaging automated mathematical fallback.")
+                    return self._build_fallback_decision(optimization_result, f"LLM HTTP error: {http_err}", news_intel)
+            except Exception as exc:
+                logger.warning(f"LLM Director call failed ({exc}). Engaging automated mathematical fallback.")
+                return self._build_fallback_decision(optimization_result, f"LLM error: {exc}", news_intel)
 
-            chosen_idx = int(parsed.get("selected_candidate_index", 0))
-            if chosen_idx < 0 or chosen_idx >= len(candidates):
-                chosen_idx = 0
-            rationale_text = str(parsed.get("rationale") or "").strip()
+        if not parsed:
+            return self._build_fallback_decision(optimization_result, "Empty or invalid LLM response", news_intel)
 
-            captain_override = parsed.get("captain_override")
-            vice_captain_override = parsed.get("vice_captain_override")
-            raw_veto_ids = parsed.get("veto_player_ids") or []
-            veto_player_ids = [int(pid) for pid in raw_veto_ids if str(pid).isdigit()]
-            veto_reason = parsed.get("veto_reason")
+        chosen_idx = int(parsed.get("selected_candidate_index", 0))
+        if chosen_idx < 0 or chosen_idx >= len(candidates):
+            chosen_idx = 0
+        rationale_text = str(parsed.get("rationale") or "").strip()
 
-            chosen = candidates[chosen_idx]
+        captain_override = parsed.get("captain_override")
+        vice_captain_override = parsed.get("vice_captain_override")
+        raw_veto_ids = parsed.get("veto_player_ids") or []
+        veto_player_ids = [int(pid) for pid in raw_veto_ids if str(pid).isdigit()]
+        veto_reason = parsed.get("veto_reason")
 
-            # Process Captain Override if valid starter in chosen squad
-            if captain_override and isinstance(captain_override, str):
-                target_norm = captain_override.strip().lower()
-                for p in chosen.starters:
-                    if p.web_name.lower() == target_norm:
-                        for s in chosen.starters:
-                            s.is_captain = (s.id == p.id)
-                        chosen.captain = p
-                        logger.info(f"AI Director overrode captain to: {p.web_name}")
-                        break
+        chosen = candidates[chosen_idx]
 
-            # Process Vice-Captain Override if valid starter in chosen squad
-            if vice_captain_override and isinstance(vice_captain_override, str):
-                target_norm = vice_captain_override.strip().lower()
-                for p in chosen.starters:
-                    if p.web_name.lower() == target_norm and not p.is_captain:
-                        for s in chosen.starters:
-                            s.is_vice_captain = (s.id == p.id)
-                        chosen.vice_captain = p
-                        logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
-                        break
+        # Process Captain Override if valid starter in chosen squad
+        if captain_override and isinstance(captain_override, str):
+            target_norm = captain_override.strip().lower()
+            for p in chosen.starters:
+                if p.web_name.lower() == target_norm:
+                    for s in chosen.starters:
+                        s.is_captain = (s.id == p.id)
+                    chosen.captain = p
+                    logger.info(f"AI Director overrode captain to: {p.web_name}")
+                    break
 
-            c_name = chosen.captain.web_name if chosen.captain else "Unknown"
-            vc_name = chosen.vice_captain.web_name if chosen.vice_captain else "Unknown"
+        # Process Vice-Captain Override if valid starter in chosen squad
+        if vice_captain_override and isinstance(vice_captain_override, str):
+            target_norm = vice_captain_override.strip().lower()
+            for p in chosen.starters:
+                if p.web_name.lower() == target_norm and not p.is_captain:
+                    for s in chosen.starters:
+                        s.is_vice_captain = (s.id == p.id)
+                    chosen.vice_captain = p
+                    logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
+                    break
 
-            if chosen.transfers_count == 0:
-                tx_desc = "No transfers (Roll/Bank transfer)."
-            else:
-                tx_desc = ", ".join([f"{t.player_out.web_name} ➔ {t.player_in.web_name}" for t in chosen.transfers])
+        c_name = chosen.captain.web_name if chosen.captain else "Unknown"
+        vc_name = chosen.vice_captain.web_name if chosen.vice_captain else "Unknown"
 
-            if not rationale_text:
-                rationale_text = (
-                    f"Selected {chosen.name} to maximize expected points ({chosen.net_xp} net xP). "
-                    f"Captaincy assigned to {c_name} to capitalize on favorable fixture metrics."
-                )
+        if chosen.transfers_count == 0:
+            tx_desc = "No transfers (Roll/Bank transfer)."
+        else:
+            tx_desc = ", ".join([f"{t.player_out.web_name} ➔ {t.player_in.web_name}" for t in chosen.transfers])
 
-            logger.info(f"AI Director decision received: {chosen.name}")
-            news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
-
-            return DecisionOutput(
-                selected_candidate_index=chosen_idx,
-                selected_candidate=chosen,
-                chosen_move_name=chosen.name,
-                transfers_description=tx_desc,
-                captain_name=c_name,
-                vice_captain_name=vc_name,
-                projected_net_xp=chosen.net_xp,
-                rationale=rationale_text,
-                source="LLM_DIRECTOR",
-                news_alerts=news_alerts,
-                captain_override=captain_override,
-                vice_captain_override=vice_captain_override,
-                veto_player_ids=veto_player_ids,
-                veto_reason=veto_reason,
+        if not rationale_text:
+            rationale_text = (
+                f"Selected {chosen.name} to maximize expected points ({chosen.net_xp} net xP). "
+                f"Captaincy assigned to {c_name} to capitalize on favorable fixture metrics."
             )
 
-        except Exception as exc:
-            logger.warning(f"LLM Director call failed ({exc}). Engaging automated mathematical fallback.")
-            return self._build_fallback_decision(optimization_result, f"LLM error: {exc}", news_intel)
+        logger.info(f"AI Director decision received: {chosen.name}")
+        news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
+
+        return DecisionOutput(
+            selected_candidate_index=chosen_idx,
+            selected_candidate=chosen,
+            chosen_move_name=chosen.name,
+            transfers_description=tx_desc,
+            captain_name=c_name,
+            vice_captain_name=vc_name,
+            projected_net_xp=chosen.net_xp,
+            rationale=rationale_text,
+            source="LLM_DIRECTOR",
+            news_alerts=news_alerts,
+            captain_override=captain_override,
+            vice_captain_override=vice_captain_override,
+            veto_player_ids=veto_player_ids,
+            veto_reason=veto_reason,
+        )
 

@@ -66,50 +66,63 @@ class FPLClient:
         refresh_token = self.auth.refresh_token
         if refresh_token:
             logger.info("Attempting automated PingOne OAuth2 token refresh...")
-            payload = {
-                "grant_type": "refresh_token",
-                "client_id": self.client_id,
-                "refresh_token": refresh_token,
-            }
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-            }
-            try:
-                resp = requests.post(
-                    self.PINGONE_TOKEN_URL,
-                    data=payload,
-                    headers=headers,
-                    timeout=15,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_access = data.get("access_token")
-                    new_refresh = data.get("refresh_token", refresh_token)
-                    expires_in = data.get("expires_in", 7200)
+            token_endpoints = [
+                (self.PINGONE_TOKEN_URL, self.client_id),
+                ("https://account.premierleague.com/as/token", "bfcbaf69-aade-4c1b-8f00-c1cb8a193030"),
+                ("https://auth.pingone.eu/68340de1-dfb9-412e-937c-20172986d129/as/token", "1f243d70-a140-4035-8c41-341f5af5aa12"),
+            ]
+            seen_targets = set()
+            endpoints_to_try = []
+            for u, cid in token_endpoints:
+                if (u, cid) not in seen_targets:
+                    seen_targets.add((u, cid))
+                    endpoints_to_try.append((u, cid))
 
-                    if new_access:
-                        self.auth.update_tokens(
-                            access_token=new_access,
-                            refresh_token=new_refresh,
-                            expires_in=expires_in,
-                        )
-                        self._sync_session_cookies()
-                        logger.info("Successfully refreshed PingOne OAuth2 access token and updated state.")
-                        return True
-                    else:
-                        logger.warning("PingOne response did not contain access_token.")
-                else:
-                    logger.warning(
-                        f"PingOne token refresh failed with HTTP {resp.status_code}: {resp.text}"
+            for endpoint_url, cid in endpoints_to_try:
+                payload = {
+                    "grant_type": "refresh_token",
+                    "client_id": cid,
+                    "refresh_token": refresh_token,
+                }
+                headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                }
+                try:
+                    resp = requests.post(
+                        endpoint_url,
+                        data=payload,
+                        headers=headers,
+                        timeout=15,
                     )
-            except Exception as e:
-                logger.warning(f"Error during PingOne token refresh: {e}")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        new_access = data.get("access_token")
+                        new_refresh = data.get("refresh_token", refresh_token)
+                        expires_in = data.get("expires_in", 7200)
+
+                        if new_access:
+                            self.auth.update_tokens(
+                                access_token=new_access,
+                                refresh_token=new_refresh,
+                                expires_in=expires_in,
+                            )
+                            self._sync_session_cookies()
+                            logger.info(f"Successfully refreshed OAuth2 access token via {endpoint_url} and updated state.")
+                            return True
+                        else:
+                            logger.warning(f"OAuth endpoint {endpoint_url} response did not contain access_token.")
+                    else:
+                        logger.warning(
+                            f"OAuth token refresh via {endpoint_url} failed with HTTP {resp.status_code}: {resp.text}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Error during token refresh via {endpoint_url}: {e}")
 
         # Fallback to direct credentials login if available
         if self.auth.email and self.auth.password:
