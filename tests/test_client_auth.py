@@ -183,3 +183,21 @@ def test_http_404_fast_fail_no_retry():
         # Ensure it fast-failed on attempt 1 without wasting retries
         assert mock_req.call_count == 1
 
+
+def test_expired_auth_state_falls_back_to_env(tmp_path, monkeypatch):
+    """Test that an expired token in auth_state.json is discarded in favor of unexpired env token."""
+    state_file = tmp_path / "auth_state.json"
+    state_file.write_text(json.dumps({
+        "access_token": "old_expired_token",
+        "refresh_token": "old_refresh_token",
+        "token_expiry": 1000.0,  # Far in the past
+    }))
+
+    monkeypatch.setenv("FPL_AUTH_TOKEN", "fresh_env_token")
+    monkeypatch.setenv("FPL_REFRESH_TOKEN", "fresh_env_refresh")
+
+    auth = FPLAuth(state_file=state_file)
+    assert auth.access_token == "fresh_env_token"
+    assert auth.refresh_token == "old_refresh_token"  # refresh token retained if not expired
+
+

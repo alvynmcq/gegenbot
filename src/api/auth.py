@@ -1,5 +1,6 @@
 """Authentication and token state management for official FPL API and PingOne OAuth."""
 
+import base64
 import json
 import logging
 import os
@@ -11,6 +12,23 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_jwt_exp(token: Optional[str]) -> Optional[float]:
+    """Extract expiry timestamp from JWT if present."""
+    if not token or not isinstance(token, str):
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded))
+            exp = payload.get("exp")
+            if exp and isinstance(exp, (int, float)):
+                return float(exp)
+    except Exception:
+        pass
+    return None
 
 
 class FPLAuth:
@@ -53,14 +71,22 @@ class FPLAuth:
                 self.refresh_token = refresh_token.strip()
         else:
             # 1. Check data/auth_state.json
-            loaded_from_state = self.load_state()
+            self.load_state()
 
-            # 2. If not loaded from state or empty, check environment variables
-            if not loaded_from_state or not self.access_token:
+            # 2. If state token is missing or expired, fall back to environment variables
+            if not self.access_token:
                 env_access = (os.getenv("FPL_ACCESS_TOKEN", "") or os.getenv("FPL_AUTH_TOKEN", "")).strip()
-                env_refresh = os.getenv("FPL_REFRESH_TOKEN", "").strip()
                 if env_access:
-                    self.access_token = env_access
+                    env_exp = _parse_jwt_exp(env_access)
+                    now = time.time()
+                    if env_exp is None or env_exp > now:
+                        self.access_token = env_access
+                        if env_exp:
+                            self.token_expiry = env_exp
+                        logger.info("Using active FPL_AUTH_TOKEN / FPL_ACCESS_TOKEN from environment.")
+
+            if not self.refresh_token:
+                env_refresh = os.getenv("FPL_REFRESH_TOKEN", "").strip()
                 if env_refresh:
                     self.refresh_token = env_refresh
 
@@ -74,16 +100,27 @@ class FPLAuth:
         self.access_token = value.strip() if value else ""
 
     def load_state(self) -> bool:
-        """Load credentials and token state from auth_state.json if available."""
+        """Load credentials and token state from auth_state.json if available and not expired."""
         if not self.state_file.exists():
             return False
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.access_token = data.get("access_token") or data.get("token") or None
+            token = data.get("access_token") or data.get("token") or None
+            token_expiry = data.get("token_expiry")
+
+            now = time.time()
+            jwt_exp = _parse_jwt_exp(token)
+            effective_expiry = token_expiry or jwt_exp
+
+            if effective_expiry and effective_expiry <= now:
+                logger.info(f"Cached access token in {self.state_file} has expired. Discarding cached token.")
+                self.access_token = None
+            else:
+                self.access_token = token
+                self.token_expiry = effective_expiry
+
             self.refresh_token = data.get("refresh_token") or self.refresh_token
-            self.token_expiry = data.get("token_expiry") or self.token_expiry
-            logger.info(f"Loaded active token state from {self.state_file}")
             return bool(self.access_token or self.refresh_token)
         except Exception as e:
             logger.warning(f"Failed to load auth state from {self.state_file}: {e}")
@@ -103,7 +140,14 @@ class FPLAuth:
             tmp_path = self.state_file.with_suffix(".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
-            tmp_path.replace(self.state_file)
+            try:
+                tmp_path.replace(self.state_file)
+            except PermissionError:
+                if self.state_file.exists():
+                    self.state_file.unlink()
+                    tmp_path.replace(self.state_file)
+                else:
+                    raise
             logger.info(f"Saved active authentication tokens to {self.state_file}")
             return True
         except Exception as e:
