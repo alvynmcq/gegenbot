@@ -252,12 +252,21 @@ class AIDirector:
             "emergency_veto_rule": "If breaking news reveals a target in the solver's top candidates is definitively OUT or benched, specify veto_player_ids to trigger an instant mathematical re-solve."
         }
 
+        forced_chip = (chip_season_plan or {}).get("forced_chip")
+        chip_directive = ""
+        if forced_chip:
+            chip_directive = (
+                f"MANDATORY CHIP DIRECTIVE: The '{forced_chip.upper()}' chip has been user-forced for this gameweek. "
+                f"You MUST select the candidate move corresponding to the {forced_chip.upper()} strategy. "
+            )
+
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
                 "Evaluate the mathematical MILP candidates, mini-league threat dynamics, Moneyball statistical metrics, and breaking press conference / injury news. "
                 f"Select the single best move option (candidate_index: 0 to {max_idx}). "
                 f"CRITICAL: The current competitive risk mode is '{risk_mode}'. {risk_note} "
+                f"{chip_directive}"
                 "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
                 "If risk_mode is CHASE: actively consider high-EV Moneyball differentials (marked [MONEYBALL BUY] with high xGI and low EO%) to close point deficits against mini-league leaders. "
                 "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "

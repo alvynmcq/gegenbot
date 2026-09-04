@@ -37,8 +37,8 @@ logger = logging.getLogger("fpl-orchestrator")
 
 
 def load_environment():
-    """Load environment variables from .env file with override enabled."""
-    load_dotenv(override=True)
+    """Load environment variables from .env file."""
+    load_dotenv(override=False)
 
 
 load_environment()
@@ -289,11 +289,13 @@ def run_pipeline(
     custom_squad_ids: Optional[List[int]] = None,
     custom_bank_m: float = 0.0,
     custom_ft: int = 1,
+    force_mode: Optional[str] = None,
+    force_chip: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute full optimization, decision, and dispatch pipeline.
     """
-    load_dotenv(override=True)
+    load_dotenv(override=False)
     logger.info("=" * 60)
     logger.info(f"Starting FPL Tactical Pipeline (Mode: {'DRY-RUN' if not execute else 'LIVE EXECUTION'})")
     logger.info("=" * 60)
@@ -513,6 +515,23 @@ def run_pipeline(
         except Exception as e:
             logger.warning(f"Could not enrich competitive context with league standings: {e}")
 
+    # Tactical Mode Override (CLI --mode or FORCE_RISK_MODE env var)
+    forced_mode = (force_mode or os.getenv("FORCE_RISK_MODE", "")).strip().upper() or None
+    if forced_mode:
+        valid_modes = {
+            "DEFEND": "Within 5 pts of league leader — protect rank, avoid hits and differentials.",
+            "CHASE": "Significant deficit to leader — be aggressive, take calculated hits, play high-EV differentials.",
+            "NEUTRAL": "Mid-table — balance risk vs reward, take free hits, avoid unnecessary -4s.",
+        }
+        if forced_mode in valid_modes:
+            competitive_context["risk_mode"] = forced_mode
+            competitive_context["risk_mode_note"] = valid_modes[forced_mode]
+            logger.info(f"⚡ Tactical risk mode overridden by user: {forced_mode}")
+        else:
+            logger.warning(
+                f"Invalid forced risk mode '{forced_mode}'. Valid choices: DEFEND, NEUTRAL, CHASE. Using auto-derived mode."
+            )
+
     # 5. PuLP MILP Optimization & Automated Chip Evaluation
     logger.info("Running PuLP MILP solver (Multi-Period Horizon, Real Selling Prices & EO Shielding)...")
     opt_result = optimizer.optimize(
@@ -531,14 +550,35 @@ def run_pipeline(
             f"  [{idx}] {cand.name} ➔ Net xP: {cand.net_xp:.2f} | 3-GW xP: {cand.multi_gw_xp:.2f} | Formation: {cand.formation} | Captain: {cand.captain.web_name if cand.captain else 'N/A'}"
         )
 
-    # Automated Chip Strategy Evaluation
+    # Automated Chip Strategy Evaluation & Forced Chip Handling
     enable_auto_chips = os.getenv("ENABLE_AUTO_CHIPS", "false").lower() in ("true", "1", "yes")
+    forced_chip = (force_chip or os.getenv("FORCE_CHIP", "")).strip().lower() or None
+    if forced_chip and forced_chip not in ("wildcard", "freehit", "bboost", "3xc"):
+        logger.warning(
+            f"Invalid forced chip '{forced_chip}'. Valid choices: wildcard, freehit, bboost, 3xc. Ignoring."
+        )
+        forced_chip = None
+
+    # Guard: verify forced chip has not already been used this season
+    if forced_chip:
+        used_chips = set(chip_season_plan.get("chips_used", []))
+        if not used_chips and entry_history_data:
+            used_chips = {c.get("name") for c in entry_history_data.get("chips", []) if isinstance(c, dict)}
+        if forced_chip in used_chips:
+            logger.warning(
+                f"⚠️ Cannot force chip '{forced_chip}': It has already been played this season "
+                f"(used chips: {list(used_chips)}). Aborting forced chip activation."
+            )
+            forced_chip = None
+        else:
+            chip_season_plan["forced_chip"] = forced_chip
+
     recommended_chip: Optional[str] = None
     triggered_chip_eval: Optional[Dict[str, Any]] = None
 
     if opt_result.chip_evaluation:
         logger.info("=" * 60)
-        logger.info("AUTOMATED CHIP STRATEGY EVALUATION:")
+        logger.info("CHIP STRATEGY EVALUATION:")
         for c_name, c_eval in opt_result.chip_evaluation.evaluations.items():
             status_text = "THRESHOLD MET" if c_eval.threshold_met else "BELOW THRESHOLD"
             logger.info(
@@ -546,7 +586,24 @@ def run_pipeline(
                 f"(Gain: +{c_eval.xp_gain:.2f} pts vs +{c_eval.threshold:.1f} pts threshold) -> {status_text}"
             )
 
-        if enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
+        if forced_chip:
+            f_eval = opt_result.chip_evaluation.evaluations.get(forced_chip)
+            if f_eval:
+                recommended_chip = forced_chip
+                triggered_chip_eval = f_eval.model_dump()
+                triggered_chip_eval["threshold_met"] = True
+                triggered_chip_eval["forced"] = True
+                logger.info(
+                    f"⚡ USER FORCED CHIP ACTIVATED: {f_eval.display_name} "
+                    f"(Projected: {f_eval.projected_xp:.2f} pts | Gain: +{f_eval.xp_gain:.2f} xP)"
+                )
+                if forced_chip in ("wildcard", "freehit") and f_eval.squad_candidate:
+                    chip_cand = f_eval.squad_candidate.model_copy(deep=True)
+                    chip_cand.active_chip = forced_chip
+                    chip_cand.name = f"Option 1: Forced {f_eval.display_name} Squad Rebuild"
+                    chip_cand.strategic_value_score = 999.0
+                    opt_result.candidates.insert(0, chip_cand)
+        elif enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
             recommended_chip = opt_result.chip_evaluation.recommended_chip
             c_eval = opt_result.chip_evaluation.evaluations[recommended_chip]
             triggered_chip_eval = c_eval.model_dump()
@@ -623,9 +680,9 @@ def run_pipeline(
 
     # Determine the actual active chip:
     # 1) If the chosen candidate already carries a chip (e.g. Wildcard / Free Hit rebuild candidate), use it.
-    # 2) If a lineup chip (bboost, 3xc) was recommended & enabled, apply it to the chosen candidate.
+    # 2) If a lineup chip (bboost, 3xc) was recommended & enabled (or forced), apply it to the chosen candidate.
     active_chip: Optional[str] = decision.selected_candidate.active_chip
-    if enable_auto_chips and recommended_chip in ("bboost", "3xc") and not active_chip:
+    if (enable_auto_chips or forced_chip) and recommended_chip in ("bboost", "3xc") and not active_chip:
         active_chip = recommended_chip
         decision.selected_candidate.active_chip = active_chip
         if active_chip == "bboost":
@@ -638,6 +695,9 @@ def run_pipeline(
             decision.projected_net_xp = round(decision.selected_candidate.net_xp + c_xp, 2)
             if "Triple Captain" not in decision.chosen_move_name:
                 decision.chosen_move_name += " + Triple Captain"
+    elif forced_chip and forced_chip in ("wildcard", "freehit") and not active_chip:
+        active_chip = forced_chip
+        decision.selected_candidate.active_chip = active_chip
 
     logger.info("=" * 60)
     logger.info(f"FINAL DECISION: {decision.chosen_move_name} (Source: {decision.source})")
@@ -893,20 +953,35 @@ def main():
     parser.add_argument("--execute", action="store_true", help="Execute live transfers & lineup on FPL API and alert Telegram")
     parser.add_argument("--post-deadline", action="store_true", help="Scan mini-league rivals and send post-deadline intelligence briefing")
     parser.add_argument("--daemon", action="store_true", help="Run autonomous background scheduler loop (T-90m execution, T+5m scanner)")
+    parser.add_argument(
+        "--mode",
+        choices=["DEFEND", "NEUTRAL", "CHASE", "defend", "neutral", "chase"],
+        default=None,
+        help="Force tactical risk mode (DEFEND, NEUTRAL, CHASE)",
+    )
+    parser.add_argument(
+        "--chip",
+        choices=["wildcard", "freehit", "bboost", "3xc", "WILDCARD", "FREEHIT", "BBOOST", "3XC"],
+        default=None,
+        help="Force chip activation for this gameweek (wildcard, freehit, bboost, 3xc)",
+    )
 
     args = parser.parse_args()
 
     client = FPLClient()
+
+    force_mode = args.mode.upper() if args.mode else None
+    force_chip = args.chip.lower() if args.chip else None
 
     if args.daemon:
         run_daemon(client)
     elif args.post_deadline:
         run_post_deadline_intel(client)
     elif args.execute:
-        run_pipeline(client, dry_run=False, execute=True)
+        run_pipeline(client, dry_run=False, execute=True, force_mode=force_mode, force_chip=force_chip)
     else:
         # Default to dry-run
-        run_pipeline(client, dry_run=True, execute=False)
+        run_pipeline(client, dry_run=True, execute=False, force_mode=force_mode, force_chip=force_chip)
 
 
 if __name__ == "__main__":

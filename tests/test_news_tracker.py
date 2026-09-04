@@ -294,3 +294,83 @@ def test_ai_director_captain_override_and_veto_output():
         assert decision.selected_candidate.vice_captain.web_name == "Saka"
         assert decision.veto_player_ids == [99]
         assert decision.veto_reason == "Late presser confirmed out"
+
+
+def test_news_tracker_firecrawl_search_success():
+    tracker = NewsTracker(enable_web_search=True, firecrawl_api_key="fc-mock-test-key")
+
+    mock_firecrawl_resp = {
+        "success": True,
+        "data": [
+            {
+                "url": "https://example.com/saka-news",
+                "title": "Saka Training Update",
+                "description": "Bukayo Saka completed full first-team training on Friday and Mikel Arteta confirmed he is ready to start.",
+            }
+        ],
+    }
+
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_firecrawl_resp
+        mock_post.return_value = mock_resp
+
+        snippets = tracker._search_web_snippets("Saka", "Arsenal")
+
+        assert len(snippets) == 1
+        assert "Bukayo Saka completed full first-team training" in snippets[0]
+
+        # Verify Firecrawl endpoint and headers
+        mock_post.assert_called_once()
+        call_args, call_kwargs = mock_post.call_args
+        assert call_args[0] == "https://api.firecrawl.dev/v1/search"
+        assert call_kwargs["headers"]["Authorization"] == "Bearer fc-mock-test-key"
+        assert call_kwargs["headers"]["Content-Type"] == "application/json"
+        assert call_kwargs["json"]["query"] == "Saka Arsenal press conference team news injury update"
+        assert call_kwargs["json"]["limit"] == 2
+        assert call_kwargs["json"]["tbs"] == "qdr:w"
+
+
+def test_news_tracker_firecrawl_fallback_on_error():
+    tracker = NewsTracker(enable_web_search=True, firecrawl_api_key="fc-mock-test-key")
+
+    mock_ddg_html = '<html><body><a class="result__snippet">Arteta stated Saka is fully fit after light knock.</a></body></html>'
+
+    with patch("requests.post") as mock_post, patch("requests.get") as mock_get:
+        # Firecrawl post fails with an exception
+        mock_post.side_effect = Exception("Firecrawl rate limited")
+
+        # DuckDuckGo fallback succeeds
+        mock_ddg_resp = MagicMock()
+        mock_ddg_resp.status_code = 200
+        mock_ddg_resp.text = mock_ddg_html
+        mock_get.return_value = mock_ddg_resp
+
+        snippets = tracker._search_web_snippets("Saka", "Arsenal")
+
+        assert len(snippets) == 1
+        assert "Arteta stated Saka is fully fit" in snippets[0]
+        mock_post.assert_called_once()
+        mock_get.assert_called_once()
+
+
+def test_news_tracker_backwards_compatibility_for_tavily_key(monkeypatch):
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    # 1. Backwards compatible keyword arg
+    tracker1 = NewsTracker(tavily_api_key="legacy-key-1")
+    assert tracker1.firecrawl_api_key == "legacy-key-1"
+    assert tracker1.tavily_api_key == "legacy-key-1"
+
+    # 2. Backwards compatible env var
+    monkeypatch.setenv("TAVILY_API_KEY", "legacy-env-key")
+    tracker2 = NewsTracker()
+    assert tracker2.firecrawl_api_key == "legacy-env-key"
+
+    # 3. Firecrawl key takes priority over legacy Tavily key
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-priority-key")
+    tracker3 = NewsTracker()
+    assert tracker3.firecrawl_api_key == "fc-priority-key"
+

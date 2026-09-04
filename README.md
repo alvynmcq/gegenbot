@@ -135,6 +135,7 @@ LLM_API_KEY=your_llm_api_key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
 ENABLE_LIVE_NEWS=true
+FIRECRAWL_API_KEY=your_optional_firecrawl_api_key
 
 # --- Telegram Alert Dispatcher ---
 TELEGRAM_BOT_TOKEN=your_bot_token

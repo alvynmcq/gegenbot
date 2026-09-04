@@ -47,6 +47,7 @@ class NewsTracker:
     def __init__(
         self,
         enable_web_search: Optional[bool] = None,
+        firecrawl_api_key: Optional[str] = None,
         tavily_api_key: Optional[str] = None,
         search_timeout: int = 5,
     ):
@@ -55,7 +56,13 @@ class NewsTracker:
         else:
             self.enable_web_search = enable_web_search
 
-        self.tavily_api_key = (tavily_api_key or os.getenv("TAVILY_API_KEY", "")).strip()
+        self.firecrawl_api_key = (
+            firecrawl_api_key
+            or os.getenv("FIRECRAWL_API_KEY", "")
+            or tavily_api_key
+            or os.getenv("TAVILY_API_KEY", "")
+        ).strip()
+        self.tavily_api_key = self.firecrawl_api_key
         self.search_timeout = search_timeout
         self._cache: Dict[str, List[str]] = {}
 
@@ -87,30 +94,33 @@ class NewsTracker:
 
         snippets: List[str] = []
 
-        # 1. Tavily Search API if configured (strictly filtered to recent 7 days news)
-        if self.tavily_api_key:
+        # 1. Firecrawl Search API if configured (strictly filtered to recent 7 days news)
+        if self.firecrawl_api_key:
             try:
                 resp = requests.post(
-                    "https://api.tavily.com/search",
+                    "https://api.firecrawl.dev/v1/search",
+                    headers={
+                        "Authorization": f"Bearer {self.firecrawl_api_key}",
+                        "Content-Type": "application/json",
+                    },
                     json={
-                        "api_key": self.tavily_api_key,
                         "query": f"{player_name} {team_name} press conference team news injury update",
-                        "topic": "news",
-                        "days": 7,
-                        "search_depth": "basic",
-                        "max_results": 2,
+                        "limit": 2,
+                        "tbs": "qdr:w",
                     },
                     timeout=self.search_timeout,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    for r in data.get("results", []):
-                        raw_content = r.get("content", "")
-                        if raw_content:
-                            clean = re.sub(r"\s+", " ", raw_content).strip()
-                            snippets.append(clean[:200])
+                    results = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    for r in results:
+                        if isinstance(r, dict):
+                            raw_content = r.get("description") or r.get("markdown") or r.get("snippet") or r.get("title") or ""
+                            if raw_content:
+                                clean = re.sub(r"\s+", " ", raw_content).strip()
+                                snippets.append(clean[:200])
             except Exception as e:
-                logger.debug(f"Tavily search failed for {player_name}: {e}")
+                logger.debug(f"Firecrawl search failed for {player_name}: {e}")
 
         # 2. Free DuckDuckGo Lite / HTML search fallback (strictly past week &df=w)
         if not snippets:

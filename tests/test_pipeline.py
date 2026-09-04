@@ -1212,6 +1212,132 @@ def test_pipeline_wildcard_recommended_and_rebuild_selected(tmp_path, mock_boots
         assert tx_call_args[0]["chips"] == "wildcard"
 
 
+def test_pipeline_force_risk_mode(mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that force_mode overrides auto-derived risk mode in competitive context."""
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = False
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    mock_client.get_entry_history.return_value = {}
+
+    from src.main import run_pipeline
+    with patch("src.main.AIDirector") as mock_director_cls:
+        mock_director = MagicMock()
+        mock_director_cls.return_value = mock_director
+
+        def mock_eval(opt_res, *args, **kwargs):
+            comp_ctx = kwargs.get("competitive_context") or {}
+            assert comp_ctx.get("risk_mode") == "CHASE"
+            assert "deficit" in comp_ctx.get("risk_mode_note", "").lower()
+            cand = opt_res.candidates[0]
+            return DecisionOutput(
+                selected_candidate_index=0,
+                selected_candidate=cand,
+                chosen_move_name=cand.name,
+                transfers_description="Test",
+                captain_name="GK_1",
+                vice_captain_name="GK_2",
+                projected_net_xp=cand.net_xp,
+                rationale="Forced CHASE mode.",
+                source="LLM_DIRECTOR",
+            )
+        mock_director.evaluate_and_decide.side_effect = mock_eval
+
+        result = run_pipeline(mock_client, dry_run=True, execute=False, force_mode="CHASE")
+        assert result["status"] == "success"
+
+
+def test_pipeline_force_chip_triple_captain(mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that force_chip='3xc' activates Triple Captain even if threshold is not met and ENABLE_AUTO_CHIPS is false."""
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "false")
+    monkeypatch.setenv("TRIPLE_CAPTAIN_MIN_XP", "999.0")  # very high threshold
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = True
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    mock_client.get_entry_history.return_value = {"chips": []}
+    mock_client.get_my_team.return_value = {
+        "picks": [{"element": i} for i in [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]],
+        "transfers": {"bank": 10, "limit": 1},
+    }
+    mock_client.post_transfers.return_value = {"status": "ok"}
+    mock_client.post_lineup.return_value = {"status": "ok"}
+
+    from src.main import run_pipeline
+    with patch("src.main.TelegramNotifier") as mock_notifier_cls:
+        mock_notifier = MagicMock()
+        mock_notifier_cls.return_value = mock_notifier
+
+        result = run_pipeline(mock_client, dry_run=False, execute=True, force_chip="3xc")
+
+        assert result["status"] == "success"
+        assert result["active_chip"] == "3xc"
+        assert mock_notifier.notify_chip_triggered.called
+        assert mock_client.post_lineup.called
+        call_args = mock_client.post_lineup.call_args[0]
+        assert call_args[1]["chip"] == "3xc"
+
+
+def test_pipeline_force_chip_wildcard(mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that force_chip='wildcard' injects and selects Wildcard squad with chips payload."""
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "false")
+    monkeypatch.setenv("WILDCARD_MIN_XP_GAIN", "999.0")  # very high threshold
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = True
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    mock_client.get_entry_history.return_value = {"chips": []}
+    mock_client.get_my_team.return_value = {
+        "picks": [{"element": i, "selling_price": 50} for i in [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]],
+        "transfers": {"bank": 50, "limit": 1},
+    }
+    mock_client.post_transfers.return_value = {"status": "ok"}
+    mock_client.post_lineup.return_value = {"status": "ok"}
+
+    from src.main import run_pipeline
+    with patch("src.main.TelegramNotifier") as mock_notifier_cls:
+        mock_notifier = MagicMock()
+        mock_notifier_cls.return_value = mock_notifier
+
+        result = run_pipeline(mock_client, dry_run=False, execute=True, force_chip="wildcard")
+
+        assert result["status"] == "success"
+        assert result["active_chip"] == "wildcard"
+        assert mock_client.post_transfers.called
+        tx_call_args = mock_client.post_transfers.call_args[0]
+        assert tx_call_args[0]["chips"] == "wildcard"
+
+
+def test_pipeline_force_chip_already_used_guard(mock_bootstrap_data, mock_fixtures_data, monkeypatch):
+    """Verify that forcing a chip that has already been used in FPL entry history is safely aborted."""
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+
+    mock_client = MagicMock(spec=FPLClient)
+    mock_client.auth = MagicMock()
+    mock_client.auth.is_authenticated = False
+    mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
+    mock_client.get_fixtures.return_value = mock_fixtures_data
+    # Wildcard was already played in GW3
+    mock_client.get_entry_history.return_value = {
+        "chips": [{"name": "wildcard", "time": "2026-09-01T12:00:00Z", "event": 3}],
+        "current": [{"event": 3, "total_points": 150}],
+    }
+
+    from src.main import run_pipeline
+    result = run_pipeline(mock_client, dry_run=True, execute=False, force_chip="wildcard")
+
+    assert result["status"] == "success"
+    # Should safely abort forcing the chip
+    assert result["active_chip"] is None
+
+
 # ==========================================
 # 9. Injury Discounting & Bench Ordering Tests
 # ==========================================
