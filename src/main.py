@@ -754,8 +754,9 @@ def run_pipeline(
         )
         # 11 starters + 4 bench
         picks_payload = []
-        # Starters 1-11
-        for idx, p in enumerate(cand.starters, start=1):
+        # Starters 1-11 must be ordered by ascending element_type (GKP=1, DEF=2, MID=3, FWD=4)
+        sorted_starters = sorted(cand.starters, key=lambda p: p.element_type)
+        for idx, p in enumerate(sorted_starters, start=1):
             picks_payload.append({
                 "element": p.id,
                 "position": idx,
