@@ -144,10 +144,12 @@ class AIDirector:
         news_intel: Optional[Union[Dict[int, PlayerNewsIntel], List[PlayerNewsIntel]]] = None,
         competitive_context: Optional[Dict[str, Any]] = None,
         chip_season_plan: Optional[Dict[str, Any]] = None,
+        recent_performance: Optional[List[Dict[str, Any]]] = None,
     ) -> DecisionOutput:
         """
-        Send prompt to LLM containing solver candidates, mini-league threat matrix,
-        live press conference / injury intelligence, competitive rank context, and chip season plan.
+        Send prompt to LLM containing solver candidates, mini-league threat dynamics,
+        live press conference / injury intelligence, competitive rank context, chip season plan,
+        and recent performance history for feedback-aware tactical decision-making.
         Fallback to PuLP top net xP candidate on error or missing API key.
         """
         candidates = optimization_result.candidates
@@ -263,20 +265,26 @@ class AIDirector:
         prompt = {
             "instruction": (
                 "You are an elite Director of Football and veteran Fantasy Premier League strategist. "
-                "Evaluate the mathematical MILP candidates, mini-league threat dynamics, Moneyball statistical metrics, and breaking press conference / injury news. "
+                "Evaluate the mathematical MILP candidates, mini-league threat dynamics, Moneyball statistical metrics, "
+                "breaking press conference / injury news, and recent performance history. "
                 f"Select the single best move option (candidate_index: 0 to {max_idx}). "
                 f"CRITICAL: The current competitive risk mode is '{risk_mode}'. {risk_note} "
                 f"{chip_directive}"
                 "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
                 "If risk_mode is CHASE: actively consider high-EV Moneyball differentials (marked [MONEYBALL BUY] with high xGI and low EO%) to close point deficits against mini-league leaders. "
                 "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "
-                "Decide whether to accept or override the solver's Captain / Vice-Captain based on manager press conference quotes. "
+                "CRITICAL GAME THEORY (EO SHIELDING & CAPTAINCY): "
+                "- A vice-captain does NOT shield you from rival Effective Ownership (EO) if your captain plays. "
+                "- When a premium asset (e.g. Haaland, Salah) has high EO (>=80%) in your mini-league, captaining against them is devastating if they haul. Do NOT override the armband to a low-EO differential in early/mid season (GW1-28) unless the premium has confirmed injury/rotation news. "
+                "- NEVER assign the captaincy to a Goalkeeper or Defender under standard conditions due to binary clean sheet risk. "
+                "RECENCY & VARIANCE DISCIPLINE: Review 'recent_performance' history. If recent gameweeks experienced heavy negative variance or missed captaincy returns, ground your decisions with extra tactical discipline: avoid panic hits or wild low-probability punts. "
                 "If breaking news reveals that a transfer target is unexpectedly injured or benched, you may issue a 'veto_player_ids' to trigger a clean re-solve. "
                 "Provide your tactical rationale in EXACTLY two concise, impactful sentences balancing "
                 "expected points (xP), injury safety from latest news, defensive shielding vs differential upside, "
                 "and your competitive position. "
                 "Respond in strictly valid JSON format matching the schema."
             ),
+            "recent_performance": recent_performance or [],
             "manager_decryption_rubric": manager_decryption_rubric,
             "competitive_context": competitive_context or {},
             "chip_season_plan": chip_season_plan or {},
@@ -360,15 +368,51 @@ class AIDirector:
 
         chosen = candidates[chosen_idx]
 
-        # Process Captain Override if valid starter in chosen squad
+        # Process Captain Override with Safety Guardrails
         if captain_override and isinstance(captain_override, str):
             target_norm = captain_override.strip().lower()
             for p in chosen.starters:
                 if p.web_name.lower() == target_norm:
+                    # Guardrail 1: Defensive assets prohibited from captaincy
+                    has_outfield_attackers = any(s.element_type in (3, 4) for s in chosen.starters)
+                    if p.element_type in (1, 2) and has_outfield_attackers:
+                        logger.warning(
+                            f"AI Director captain override '{p.web_name}' rejected: "
+                            f"defensive assets (GKP/DEF) prohibited from holding the captaincy."
+                        )
+                        break
+
+                    # Guardrail 2: High-EO Shield Protection
+                    current_cap = chosen.captain
+                    shield_protected = False
+                    if current_cap and league_analysis and league_analysis.threat_matrix:
+                        gw_num = league_analysis.gameweek or 1
+                        if gw_num <= 28 and current_cap.injury_multiplier == 1.0:
+                            current_eo = league_analysis.raw_eo.get(current_cap.id, 0.0)
+                            if current_eo >= 80.0 and p.id != current_cap.id:
+                                logger.warning(
+                                    f"AI Director captain override '{p.web_name}' rejected: "
+                                    f"protecting high-EO shield {current_cap.web_name} ({current_eo:.1f}% EO)."
+                                )
+                                shield_protected = True
+                                break
+
+                    if not shield_protected:
+                        for s in chosen.starters:
+                            s.is_captain = (s.id == p.id)
+                        chosen.captain = p
+                        logger.info(f"AI Director overrode captain to: {p.web_name}")
+                    break
+
+        # Process Vice-Captain Override if valid starter in chosen squad
+        if vice_captain_override and isinstance(vice_captain_override, str):
+            target_norm = vice_captain_override.strip().lower()
+            for p in chosen.starters:
+                if p.web_name.lower() == target_norm and not p.is_captain:
                     for s in chosen.starters:
-                        s.is_captain = (s.id == p.id)
-                    chosen.captain = p
-                    logger.info(f"AI Director overrode captain to: {p.web_name}")
+                        s.is_vice_captain = (s.id == p.id)
+                    chosen.vice_captain = p
+                    logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
                     break
 
         # Process Vice-Captain Override if valid starter in chosen squad

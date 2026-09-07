@@ -1905,8 +1905,159 @@ def test_optimizer_backward_compatibility_missing_opponents():
     assert len(res.candidates[0].bench) == 4
 
 
+def test_sync_decision_history_actuals(tmp_path):
+    """Test sync_decision_history_actuals updates actual score and rank change."""
+    from src.main import sync_decision_history_actuals
+    import json
+
+    history_file = tmp_path / "decisions_history.json"
+    initial_history = [
+        {"gameweek": 1, "predicted_net_xp": 40.0, "actual_gw_score": None, "actual_overall_rank_change": None},
+        {"gameweek": 2, "predicted_net_xp": 50.0, "actual_gw_score": None, "actual_overall_rank_change": None},
+    ]
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(initial_history, f)
+
+    entry_history = {
+        "current": [
+            {"event": 1, "points": 43, "overall_rank": 6000000},
+            {"event": 2, "points": 116, "overall_rank": 1000000},
+        ]
+    }
+
+    sync_decision_history_actuals(entry_history, history_path=history_file)
+
+    with open(history_file, "r", encoding="utf-8") as f:
+        updated = json.load(f)
+
+    assert updated[0]["actual_gw_score"] == 43
+    assert updated[0]["actual_overall_rank_change"] == 0
+    assert updated[1]["actual_gw_score"] == 116
+    assert updated[1]["actual_overall_rank_change"] == 5000000
 
 
+def test_bench_order_prefers_lower_fdr_on_tie():
+    """Verify that when bench players have identical xP, the player with the easier fixture (lower FDR) is ordered first."""
+    raw_data = {
+        "id": list(range(1, 16)),
+        "web_name": [f"P_{i}" for i in range(1, 16)],
+        "element_type": [1, 1] + [2] * 5 + [3] * 5 + [4] * 3,
+        "position": ["GKP", "GKP"] + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3,
+        "team_id": list(range(1, 16)),
+        "team_name": [f"Team {i}" for i in range(1, 16)],
+        "team_code": [f"T{i}" for i in range(1, 16)],
+        "cost_m": [5.0] * 15,
+        # Starters have 6.0 xP, bench defenders (P_6, P_7) have 1.5 xP
+        "xp": [6.0] * 5 + [1.5, 1.5] + [6.0] * 8,
+        "form": [2.0] * 15,
+        "fdr_next": [3.0] * 5 + [4.0, 2.0] + [3.0] * 8,  # P_6 has hard fixture (FDR 4), P_7 has easy fixture (FDR 2)
+        "status": ["a"] * 15,
+        "chance_of_playing_next_round": [100] * 15,
+    }
+    df = pd.DataFrame(raw_data)
+    optimizer = FPLOptimizer(df)
+    res = optimizer.optimize(list(range(1, 16)), bank_m=1.0, free_transfers=1)
+
+    cand = res.candidates[0]
+    outfield_bench = [p for p in cand.bench if p.element_type != 1]
+    # Verify P_7 (FDR 2) is ordered before P_6 (FDR 4)
+    bench_names = [p.web_name for p in outfield_bench]
+    assert "P_7" in bench_names and "P_6" in bench_names
+    idx_p7 = bench_names.index("P_7")
+    idx_p6 = bench_names.index("P_6")
+    assert idx_p7 < idx_p6, f"Expected P_7 (FDR 2.0) to be ordered before P_6 (FDR 4.0), got {bench_names}"
 
 
+def test_solver_disallows_defensive_captain():
+    """Verify that the solver refuses to assign captaincy to a DEF even if their xP is higher than all attackers."""
+    raw_data = {
+        "id": list(range(1, 16)),
+        "web_name": [f"P_{i}" for i in range(1, 16)],
+        "element_type": [1, 1] + [2] * 5 + [3] * 5 + [4] * 3,
+        "position": ["GKP", "GKP"] + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3,
+        "team_id": list(range(1, 16)),
+        "team_name": [f"Team {i}" for i in range(1, 16)],
+        "team_code": [f"T{i}" for i in range(1, 16)],
+        "cost_m": [5.0] * 15,
+        # Defenders have inflated 12.0 xP, but MID/FWD have 8.0 xP
+        "xp": [4.0, 4.0] + [12.0] * 5 + [8.0] * 5 + [8.0] * 3,
+        "status": ["a"] * 15,
+        "chance_of_playing_next_round": [100] * 15,
+    }
+    df = pd.DataFrame(raw_data)
+    # Default: allow_defensive_captain=False
+    optimizer = FPLOptimizer(df)
+    res = optimizer.optimize(list(range(1, 16)), bank_m=1.0, free_transfers=1)
+
+    cand = res.candidates[0]
+    assert cand.captain is not None
+    assert cand.captain.position in ("MID", "FWD"), f"Expected attacking captain, got {cand.captain.position} ({cand.captain.web_name})"
+
+
+def test_director_recency_history_and_captain_guardrail(tmp_path):
+    """Verify _load_recent_performance_history and that AI Director rejects defensive captain overrides."""
+    from src.main import _load_recent_performance_history
+    from src.agent.director import AIDirector
+    from unittest.mock import patch, MagicMock
+
+    # 1. Test history loader
+    history_file = tmp_path / "decisions_history.json"
+    dummy_history = [
+        {
+            "gameweek": 3,
+            "chosen_move": "Move A",
+            "captain": "Haaland",
+            "vice_captain": "Bruno",
+            "predicted_net_xp": 96.5,
+            "actual_gw_score": 45,
+            "actual_overall_rank_change": -722000,
+        }
+    ]
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(dummy_history, f)
+
+    loaded = _load_recent_performance_history(limit=3, history_path=history_file)
+    assert len(loaded) == 1
+    assert loaded[0]["gameweek"] == 3
+    assert loaded[0]["variance_delta"] == -51.5
+    assert "SEVERE_DOWNSIDE" in loaded[0]["variance_label"]
+
+    # 2. Test AI Director rejects defensive captain override
+    raw_data = {
+        "id": list(range(1, 16)),
+        "web_name": ["GK_1", "GK_2"] + [f"DEF_{i}" for i in range(3, 8)] + [f"MID_{i}" for i in range(8, 13)] + [f"FWD_{i}" for i in range(13, 16)],
+        "element_type": [1, 1] + [2] * 5 + [3] * 5 + [4] * 3,
+        "position": ["GKP", "GKP"] + ["DEF"] * 5 + ["MID"] * 5 + ["FWD"] * 3,
+        "team_id": list(range(1, 16)),
+        "team_name": [f"Team {i}" for i in range(1, 16)],
+        "team_code": [f"T{i}" for i in range(1, 16)],
+        "cost_m": [5.0] * 15,
+        "xp": [4.0, 4.0] + [5.0] * 5 + [8.0] * 5 + [9.0] * 3,
+        "status": ["a"] * 15,
+        "chance_of_playing_next_round": [100] * 15,
+    }
+    df = pd.DataFrame(raw_data)
+    optimizer = FPLOptimizer(df)
+    opt_res = optimizer.optimize(list(range(1, 16)), bank_m=1.0, free_transfers=1)
+
+    director = AIDirector(api_key="mock_key")
+    # Mock LLM trying to override captain to DEF_3 (a defender)
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "choices": [{
+            "message": {
+                "content": json.dumps({
+                    "selected_candidate_index": 0,
+                    "captain_override": "DEF_3",
+                    "rationale": "Attempting risky defensive captaincy."
+                })
+            }
+        }]
+    }
+
+    with patch("requests.post", return_value=mock_resp):
+        decision = director.evaluate_and_decide(opt_res, recent_performance=loaded)
+        # Verify DEF_3 was rejected and captaincy remains an attacker
+        assert decision.captain_name != "DEF_3"
+        assert decision.selected_candidate.captain.position in ("MID", "FWD")
 

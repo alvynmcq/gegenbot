@@ -3,6 +3,15 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_test_data_dir(tmp_path, monkeypatch):
+    """Ensure test runs never overwrite live production data directory."""
+    test_data = tmp_path / "data"
+    test_data.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("STATE_DIR", str(test_data))
+    monkeypatch.setenv("DECISION_HISTORY_PATH", str(test_data / "decisions_history.json"))
+
+
 @pytest.fixture
 def mock_bootstrap_data():
     """Generates synthetic FPL bootstrap-static data with 20 teams and a realistic player pool."""

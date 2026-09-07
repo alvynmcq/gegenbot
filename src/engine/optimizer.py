@@ -252,6 +252,8 @@ class FPLOptimizer:
         captain_clash_penalty: Optional[float] = None,
         def_att_clash_penalty: Optional[float] = None,
         max_opposing_starters: Optional[int] = None,
+        allow_defensive_captain: Optional[bool] = None,
+        five_def_penalty: Optional[float] = None,
     ):
         """
         Initialize optimizer with player DataFrame and apply injury/rotation status discounting.
@@ -293,6 +295,18 @@ class FPLOptimizer:
             self.max_opposing_starters = int(raw_max_opp) if raw_max_opp is not None and int(raw_max_opp) > 0 else None
         except (ValueError, TypeError):
             self.max_opposing_starters = None
+
+        # Game theory & defensive fragility parameters
+        self.allow_defensive_captain = (
+            allow_defensive_captain
+            if allow_defensive_captain is not None
+            else os.getenv("ALLOW_DEFENSIVE_CAPTAIN", "false").lower() in ("true", "1", "yes")
+        )
+        self.five_def_penalty = float(
+            five_def_penalty
+            if five_def_penalty is not None
+            else os.getenv("FIVE_DEF_PENALTY", "0.50")
+        )
 
         # Extract per-player opponent team IDs for fixture correlation tracking
         player_opponents: List[Set[int]] = []
@@ -595,7 +609,8 @@ class FPLOptimizer:
             fdr = float(row.get("fdr_next", 3.0))
             form = float(row.get("form", 0.0) or 0.0)
             cost = float(row.get("cost_m", 5.0))
-            return (-disc_xp, -fdr, -form, -cost)
+            # Lower FDR means easier fixture -> sorts earlier in ascending order
+            return (-disc_xp, fdr, -form, -cost)
 
         bench_outfield_indices.sort(key=outfield_bench_sort_key)
 
@@ -789,13 +804,16 @@ class FPLOptimizer:
         prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 4]) >= 1, "StarterFWDMin1"
         prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 4]) <= 3, "StarterFWDMax3"
 
-        # 6. Captain
+        # 6. Captain (single captain from starters, prefer attacking assets)
+        has_outfield_attackers = any(elem_types[i] in (3, 4) and multipliers[i] > 0 for i in indices)
         for i in indices:
             prob += captain_vars[i] <= starter_vars[i], f"CaptainInStarter_{i}"
+            if not self.allow_defensive_captain and has_outfield_attackers and elem_types[i] in (1, 2):
+                prob += captain_vars[i] == 0, f"NoDefensiveCaptain_{i}"
 
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
-        # 7. Objective with optional EO shield weighting, sub factor bench weighting, and correlation penalties
+        # 7. Objective with optional EO shield weighting, sub factor bench weighting, correlation penalties, and 5-DEF fragility penalty
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
@@ -803,12 +821,18 @@ class FPLOptimizer:
             prob, starter_vars, captain_vars, indices
         )
 
+        five_def_penalty_term = 0
+        if self.five_def_penalty > 0:
+            is_five_def = pulp.LpVariable("is_five_def_scratch", cat=pulp.LpBinary)
+            prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 2]) - 4 <= is_five_def * 10, "FiveDefConstraint_scratch"
+            five_def_penalty_term = self.five_def_penalty * is_five_def
+
         prob += pulp.lpSum([
             starter_vars[i] * (xps[i] + eo_boosts[i])
             + captain_vars[i] * xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * xps[i]
             for i in indices
-        ]) - correlation_penalty, "TotalXP"
+        ]) - correlation_penalty - five_def_penalty_term, "TotalXP"
 
         status = _solve_problem(prob)
 
@@ -949,9 +973,12 @@ class FPLOptimizer:
         prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 4]) >= 1, "StarterFWDMin1"
         prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 4]) <= 3, "StarterFWDMax3"
 
-        # 6. Captain
+        # 6. Captain (single captain from starters, prefer attacking assets)
+        has_outfield_attackers = any(elem_types[i] in (3, 4) and multipliers[i] > 0 for i in indices)
         for i in indices:
             prob += captain_vars[i] <= starter_vars[i], f"CaptainInStarter_{i}"
+            if not self.allow_defensive_captain and has_outfield_attackers and elem_types[i] in (1, 2):
+                prob += captain_vars[i] == 0, f"NoDefensiveCaptain_{i}"
 
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
@@ -972,7 +999,7 @@ class FPLOptimizer:
                         f"ExclTransfersInCut_{cut_idx}",
                     )
 
-        # 9. Objective function with correlation penalties:
+        # 9. Objective function with correlation penalties and 5-DEF fragility penalty:
         eo_map = eo_weights or {}
         eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
 
@@ -985,12 +1012,18 @@ class FPLOptimizer:
             prob, starter_vars, captain_vars, indices
         )
 
+        five_def_penalty_term = 0
+        if self.five_def_penalty > 0:
+            is_five_def = pulp.LpVariable(f"is_five_def_{k_transfers}", cat=pulp.LpBinary)
+            prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 2]) - 4 <= is_five_def * 10, f"FiveDefConstraint_{k_transfers}"
+            five_def_penalty_term = self.five_def_penalty * is_five_def
+
         prob += pulp.lpSum([
             starter_vars[i] * (blended_xps[i] + eo_boosts[i])
             + captain_vars[i] * blended_xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * blended_xps[i]
             for i in indices
-        ]) - correlation_penalty, "TotalXP"
+        ]) - correlation_penalty - five_def_penalty_term, "TotalXP"
 
         status = _solve_problem(prob)
 

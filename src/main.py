@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -240,12 +240,13 @@ def _append_decision_history(
     decision: "DecisionOutput",
     gameweek: int,
     opt_result: "OptimizationResult",
+    history_file_path: Optional[Union[str, Path]] = None,
 ) -> None:
     """
     Append this GW's decision to data/decisions_history.json for autonomous performance tracking.
     Only writes predicted xP — actual score should be patched post-deadline by a scheduled job.
     """
-    history_file = Path("data/decisions_history.json")
+    history_file = Path(history_file_path or os.getenv("DECISION_HISTORY_PATH", "data/decisions_history.json"))
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
     history: List[Dict[str, Any]] = []
@@ -279,6 +280,119 @@ def _append_decision_history(
     with open(history_file, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     logger.info(f"Decision appended to {history_file} (GW{gameweek})")
+
+
+def sync_decision_history_actuals(
+    entry_history: Dict[str, Any],
+    history_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """
+    Synchronize actual gameweek scores and overall rank changes from entry history
+    into data/decisions_history.json.
+    """
+    history_file = Path(history_path or os.getenv("DECISION_HISTORY_PATH", "data/decisions_history.json"))
+    if not history_file.exists():
+        return
+
+    current_events = entry_history.get("current", [])
+    if not current_events:
+        return
+
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            history = json.load(f)
+    except Exception:
+        return
+
+    events_by_gw = {ev.get("event"): ev for ev in current_events if isinstance(ev, dict)}
+    prev_overall_rank = None
+    rank_deltas: Dict[int, int] = {}
+    for ev in current_events:
+        gw = ev.get("event")
+        overall = ev.get("overall_rank")
+        if gw is not None and overall is not None:
+            if prev_overall_rank is not None:
+                rank_deltas[gw] = prev_overall_rank - overall  # positive means rank climbed
+            else:
+                rank_deltas[gw] = 0
+            prev_overall_rank = overall
+
+    modified = False
+    for entry in history:
+        gw = entry.get("gameweek")
+        if gw in events_by_gw:
+            ev_data = events_by_gw[gw]
+            actual_pts = ev_data.get("points")
+            if actual_pts is not None and entry.get("actual_gw_score") != actual_pts:
+                entry["actual_gw_score"] = actual_pts
+                modified = True
+            if gw in rank_deltas and entry.get("actual_overall_rank_change") != rank_deltas[gw]:
+                entry["actual_overall_rank_change"] = rank_deltas[gw]
+                modified = True
+
+    if modified:
+        try:
+            with open(history_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            logger.info(f"Synchronized actual scores in {history_file} from FPL entry history.")
+        except Exception as e:
+            logger.warning(f"Could not persist synchronized decision history: {e}")
+
+
+def _load_recent_performance_history(
+    limit: int = 3,
+    history_path: Optional[Union[str, Path]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Load recent gameweek decision and performance actuals from decisions_history.json.
+    Computes variance delta (actual - predicted) to feed recency feedback into the AI Director.
+    """
+    history_file = Path(history_path or os.getenv("DECISION_HISTORY_PATH", "data/decisions_history.json"))
+    if not history_file.exists():
+        return []
+
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            history = json.load(f)
+    except Exception:
+        return []
+
+    if not isinstance(history, list) or not history:
+        return []
+
+    # Sort by gameweek
+    sorted_history = sorted(history, key=lambda h: h.get("gameweek", 0))
+    recent_entries = sorted_history[-limit:]
+
+    formatted: List[Dict[str, Any]] = []
+    for h in recent_entries:
+        gw = h.get("gameweek")
+        pred_xp = h.get("predicted_net_xp")
+        actual_score = h.get("actual_gw_score")
+        variance_delta = None
+        variance_label = "PENDING_ACTUAL"
+        if pred_xp is not None and actual_score is not None:
+            variance_delta = round(actual_score - pred_xp, 2)
+            if variance_delta >= 10.0:
+                variance_label = "HIGH_POSITIVE_VARIANCE (OUTPERFORMANCE)"
+            elif variance_delta <= -15.0:
+                variance_label = "HIGH_NEGATIVE_VARIANCE (SEVERE_DOWNSIDE)"
+            else:
+                variance_label = "NORMAL_VARIANCE_BAND"
+
+        formatted.append({
+            "gameweek": gw,
+            "chosen_move": h.get("chosen_move"),
+            "captain": h.get("captain"),
+            "vice_captain": h.get("vice_captain"),
+            "predicted_net_xp": pred_xp,
+            "actual_gw_score": actual_score,
+            "variance_delta": variance_delta,
+            "variance_label": variance_label,
+            "overall_rank_change": h.get("actual_overall_rank_change"),
+        })
+
+    return formatted
 
 
 
@@ -418,6 +532,7 @@ def run_pipeline(
             # Guard: only use if the API returned a proper dict
             if isinstance(raw_history, dict):
                 entry_history_data = raw_history
+                sync_decision_history_actuals(entry_history_data)
                 competitive_context = _build_competitive_context(
                     entry_history_data,
                     rivals=None,  # Populated after league scan below
@@ -634,6 +749,8 @@ def run_pipeline(
         focal_player_ids=focal_player_ids,
     )
 
+    recent_performance = _load_recent_performance_history(limit=3)
+
     logger.info("Consulting AI Decision Director...")
     director = AIDirector()
     decision = director.evaluate_and_decide(
@@ -642,6 +759,7 @@ def run_pipeline(
         news_intel,
         competitive_context=competitive_context or None,
         chip_season_plan=chip_season_plan or None,
+        recent_performance=recent_performance,
     )
 
     # Check for AI Director Late Breaking News Veto & Instant Re-Solve
@@ -676,6 +794,7 @@ def run_pipeline(
             news_intel,
             competitive_context=competitive_context or None,
             chip_season_plan=chip_season_plan or None,
+            recent_performance=recent_performance,
         )
 
     # Determine the actual active chip:
