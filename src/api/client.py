@@ -113,6 +113,7 @@ class FPLClient:
                                 expires_in=expires_in,
                             )
                             self._sync_session_cookies()
+                            self._sync_tokens_to_env(new_access, new_refresh)
                             logger.info(f"Successfully refreshed OAuth2 access token via {endpoint_url} and updated state.")
                             return True
                         else:
@@ -131,6 +132,40 @@ class FPLClient:
 
         logger.warning("No valid refresh token or login credentials available for token refresh.")
         return False
+
+    def _sync_tokens_to_env(self, access_token: str, refresh_token: Optional[str] = None) -> None:
+        """Persist refreshed access and refresh tokens to .env file if present."""
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        env_path = Path(".env")
+        if not env_path.exists():
+            return
+        try:
+            import re
+            content = env_path.read_text(encoding="utf-8")
+            content = re.sub(r"^FPL_AUTH_TOKEN=.*$", f"FPL_AUTH_TOKEN={access_token}", content, flags=re.MULTILINE)
+            if refresh_token:
+                content = re.sub(r"^FPL_REFRESH_TOKEN=.*$", f"FPL_REFRESH_TOKEN={refresh_token}", content, flags=re.MULTILINE)
+            env_path.write_text(content, encoding="utf-8")
+            logger.info("Synchronized updated tokens to .env file.")
+        except Exception as e:
+            logger.warning(f"Could not persist refreshed tokens to .env: {e}")
+
+    def ensure_authenticated(self) -> bool:
+        """
+        Verify that client has an active, valid access token.
+        If token is missing, expired, or within 5 minutes of expiring, automatically refresh it.
+        """
+        now = time.time()
+        # Refresh if no access token or token expires in less than 5 minutes (300 seconds)
+        if not self.auth.access_token or (self.auth.token_expiry and (self.auth.token_expiry - now) < 300):
+            if self.auth.can_refresh:
+                logger.info("FPL access token missing or near expiry. Attempting automated refresh...")
+                if self.refresh_access_token():
+                    return True
+                logger.warning("Automated token refresh failed during ensure_authenticated.")
+            return False
+        return self.auth.is_authenticated
 
     def login_with_credentials(self, email: Optional[str] = None, password: Optional[str] = None) -> bool:
         """Authenticate directly against FPL users login endpoint as fallback."""
@@ -346,11 +381,8 @@ class FPLClient:
 
     def validate_auth(self, team_id: int) -> Tuple[bool, str]:
         """Verify if authentication token is active and valid for team_id, attempting refresh if needed."""
-        if not self.auth.is_authenticated:
-            if self.auth.can_refresh and self.refresh_access_token():
-                logger.info("Authentication self-healed via token refresh.")
-            else:
-                return False, "FPL_AUTH_TOKEN is not configured."
+        if not self.ensure_authenticated():
+            return False, "FPL_AUTH_TOKEN is not configured or expired, and refresh failed."
         try:
             self.get_my_team(team_id)
             return True, "Authentication token valid."

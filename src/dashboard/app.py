@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-from flask import Flask, jsonify, render_template, render_template_string
+from flask import Flask, jsonify, render_template, render_template_string, request
 
 logger = logging.getLogger(__name__)
 
@@ -1049,6 +1049,54 @@ def create_app(data_file_path: Optional[Path] = None) -> Flask:
         """REST endpoint returning current decision state."""
         data = load_decision_data(state_file)
         return jsonify(data)
+
+    @app.route("/api/auth/sync", methods=["POST", "OPTIONS"])
+    def api_auth_sync():
+        """Receive OAuth tokens from browser bookmarklet, persist to auth_state.json and .env."""
+        if request.method == "OPTIONS":
+            resp = jsonify({"status": "ok"})
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            return resp
+
+        try:
+            payload = request.get_json(silent=True) or {}
+            access_token = payload.get("access_token", "").strip()
+            refresh_token = payload.get("refresh_token", "").strip()
+
+            if not access_token:
+                resp = jsonify({"status": "error", "message": "Missing access_token"})
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                return resp, 400
+
+            from src.api.auth import FPLAuth, _parse_jwt_exp
+            auth = FPLAuth()
+            exp = _parse_jwt_exp(access_token)
+            expires_in = (exp - time.time()) if exp else 7200
+            auth.update_tokens(access_token=access_token, refresh_token=refresh_token or None, expires_in=expires_in)
+
+            # Sync to .env as well (skipped during automated pytest runs)
+            env_path = Path(".env")
+            if "PYTEST_CURRENT_TEST" not in os.environ and env_path.exists():
+                import re
+                content = env_path.read_text(encoding="utf-8")
+                content = re.sub(r"^FPL_AUTH_TOKEN=.*$", f"FPL_AUTH_TOKEN={access_token}", content, flags=re.MULTILINE)
+                if refresh_token:
+                    content = re.sub(r"^FPL_REFRESH_TOKEN=.*$", f"FPL_REFRESH_TOKEN={refresh_token}", content, flags=re.MULTILINE)
+                env_path.write_text(content, encoding="utf-8")
+
+            resp = jsonify({
+                "status": "success",
+                "message": "Gegenbot authentication successfully synchronized!",
+                "expires_at": exp,
+            })
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+        except Exception as e:
+            resp = jsonify({"status": "error", "message": str(e)})
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp, 500
 
     @app.route("/healthz")
     def health():

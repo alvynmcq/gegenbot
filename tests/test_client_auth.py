@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -199,5 +200,42 @@ def test_expired_auth_state_falls_back_to_env(tmp_path, monkeypatch):
     auth = FPLAuth(state_file=state_file)
     assert auth.access_token == "fresh_env_token"
     assert auth.refresh_token == "old_refresh_token"  # refresh token retained if not expired
+
+
+def test_ensure_authenticated_auto_refresh(monkeypatch):
+    """Test ensure_authenticated automatically triggers refresh when token is expired or missing."""
+    auth = FPLAuth(token="", refresh_token="valid_refresh")
+    client = FPLClient(auth=auth)
+
+    refresh_called = []
+    def mock_refresh():
+        refresh_called.append(True)
+        auth.access_token = "newly_refreshed_token"
+        auth.token_expiry = time.time() + 3600
+        return True
+
+    monkeypatch.setattr(client, "refresh_access_token", mock_refresh)
+    assert client.ensure_authenticated() is True
+    assert len(refresh_called) == 1
+    assert client.auth.access_token == "newly_refreshed_token"
+
+
+def test_api_auth_sync_endpoint(tmp_path, monkeypatch):
+    """Test dashboard /api/auth/sync route updates tokens and returns success."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("FPL_AUTH_TOKEN=\nFPL_REFRESH_TOKEN=\n")
+    from src.dashboard.app import create_app
+    app = create_app()
+    test_client = app.test_client()
+
+    res = test_client.post("/api/auth/sync", json={
+        "access_token": "mock_browser_access",
+        "refresh_token": "mock_browser_refresh",
+    })
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["status"] == "success"
+    assert "synchronized" in data["message"]
+
 
 

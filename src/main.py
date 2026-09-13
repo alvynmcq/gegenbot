@@ -471,7 +471,7 @@ def run_pipeline(
         current_squad_ids = custom_squad_ids
     elif team_id_str:
         team_id = int(team_id_str)
-        if client.auth.is_authenticated:
+        if client.ensure_authenticated():
             try:
                 auth_res = client.validate_auth(team_id)
                 if isinstance(auth_res, tuple) and len(auth_res) == 2:
@@ -833,73 +833,94 @@ def run_pipeline(
     logger.info("=" * 60)
 
     # 7. Live Execution (if requested)
-    if execute and client.auth.is_authenticated and team_id_str:
-        team_id = int(team_id_str)
-        cand = decision.selected_candidate
-
-        # 7a. Transfers submission
-        if cand.transfers_count > 0 or cand.active_chip in ("wildcard", "freehit"):
-            chip_tx = cand.active_chip if cand.active_chip in ("wildcard", "freehit") else None
-            logger.info(
-                f"Submitting {cand.transfers_count} live transfer(s) to FPL API "
-                f"(Chip: {chip_tx or 'None'})..."
+    live_execution_success = False
+    if execute:
+        if not team_id_str:
+            logger.error("Live execution aborted: FPL_TEAM_ID is not configured.")
+        elif not client.ensure_authenticated():
+            logger.error("❌ Live execution aborted: Client authentication failed (token expired and refresh failed).")
+            TelegramNotifier().send_message(
+                f"🚨 *[LIVE EXECUTION ABORTED: AUTH FAILED]*\n\n"
+                f"Gameweek {gw_id} live transfers could *not* be submitted to FPL servers automatically.\n\n"
+                f"⏰ *Action Needed:* You have ~88 minutes before the deadline to apply manually:\n"
+                f"• *Transfers:* {decision.transfers_description}\n"
+                f"• *Captain:* {decision.captain_name} (C) | *Vice:* {decision.vice_captain_name} (VC)\n"
+                f"• *Hit Cost:* -{decision.selected_candidate.hit_cost} pts\n\n"
+                f"👉 Please make these changes in the FPL app or click your 'Sync Gegenbot' bookmark to retry."
             )
-            transfers_payload = {
-                "chips": chip_tx,
-                "chip": chip_tx,
-                "entry": team_id,
-                "event": gw_id,
-                "transfers": [
-                    {
-                        "element_in": t.player_in.id,
-                        "element_out": t.player_out.id,
-                        "purchase_price": int(t.player_in.cost_m * 10),
-                        "selling_price": int(t.player_out.cost_m * 10),
-                    }
-                    for t in cand.transfers
-                ],
+        else:
+            team_id = int(team_id_str)
+            cand = decision.selected_candidate
+            tx_success = True
+            lineup_success = True
+
+            # 7a. Transfers submission
+            if cand.transfers_count > 0 or cand.active_chip in ("wildcard", "freehit"):
+                chip_tx = cand.active_chip if cand.active_chip in ("wildcard", "freehit") else None
+                logger.info(
+                    f"Submitting {cand.transfers_count} live transfer(s) to FPL API "
+                    f"(Chip: {chip_tx or 'None'})..."
+                )
+                transfers_payload = {
+                    "chips": chip_tx,
+                    "chip": chip_tx,
+                    "entry": team_id,
+                    "event": gw_id,
+                    "transfers": [
+                        {
+                            "element_in": t.player_in.id,
+                            "element_out": t.player_out.id,
+                            "purchase_price": int(t.player_in.cost_m * 10),
+                            "selling_price": int(t.player_out.cost_m * 10),
+                        }
+                        for t in cand.transfers
+                    ],
+                }
+                try:
+                    tx_resp = client.post_transfers(transfers_payload)
+                    logger.info(f"Transfers successfully submitted: {tx_resp}")
+                except Exception as e:
+                    logger.error(f"Live transfer submission failed: {e}")
+                    tx_success = False
+
+            # 7b. Lineup & Captaincy submission
+            chip_lineup = cand.active_chip if cand.active_chip in ("bboost", "3xc") else None
+            logger.info(
+                f"Submitting live lineup & captaincy to FPL API "
+                f"(Chip: {chip_lineup or 'None'})..."
+            )
+            # 11 starters + 4 bench
+            picks_payload = []
+            # Starters 1-11 must be ordered by ascending element_type (GKP=1, DEF=2, MID=3, FWD=4)
+            sorted_starters = sorted(cand.starters, key=lambda p: p.element_type)
+            for idx, p in enumerate(sorted_starters, start=1):
+                picks_payload.append({
+                    "element": p.id,
+                    "position": idx,
+                    "is_captain": p.is_captain,
+                    "is_vice_captain": p.is_vice_captain,
+                })
+            # Bench 12-15
+            for idx, p in enumerate(cand.bench, start=12):
+                picks_payload.append({
+                    "element": p.id,
+                    "position": idx,
+                    "is_captain": False,
+                    "is_vice_captain": False,
+                })
+
+            lineup_payload = {
+                "chip": chip_lineup,
+                "picks": picks_payload,
             }
             try:
-                tx_resp = client.post_transfers(transfers_payload)
-                logger.info(f"Transfers successfully submitted: {tx_resp}")
+                lineup_resp = client.post_lineup(team_id, lineup_payload)
+                logger.info(f"Lineup successfully submitted: {lineup_resp}")
             except Exception as e:
-                logger.error(f"Live transfer submission failed: {e}")
+                logger.error(f"Live lineup submission failed: {e}")
+                lineup_success = False
 
-        # 7b. Lineup & Captaincy submission
-        chip_lineup = cand.active_chip if cand.active_chip in ("bboost", "3xc") else None
-        logger.info(
-            f"Submitting live lineup & captaincy to FPL API "
-            f"(Chip: {chip_lineup or 'None'})..."
-        )
-        # 11 starters + 4 bench
-        picks_payload = []
-        # Starters 1-11 must be ordered by ascending element_type (GKP=1, DEF=2, MID=3, FWD=4)
-        sorted_starters = sorted(cand.starters, key=lambda p: p.element_type)
-        for idx, p in enumerate(sorted_starters, start=1):
-            picks_payload.append({
-                "element": p.id,
-                "position": idx,
-                "is_captain": p.is_captain,
-                "is_vice_captain": p.is_vice_captain,
-            })
-        # Bench 12-15
-        for idx, p in enumerate(cand.bench, start=12):
-            picks_payload.append({
-                "element": p.id,
-                "position": idx,
-                "is_captain": False,
-                "is_vice_captain": False,
-            })
-
-        lineup_payload = {
-            "chip": chip_lineup,
-            "picks": picks_payload,
-        }
-        try:
-            lineup_resp = client.post_lineup(team_id, lineup_payload)
-            logger.info(f"Lineup successfully submitted: {lineup_resp}")
-        except Exception as e:
-            logger.error(f"Live lineup submission failed: {e}")
+            live_execution_success = tx_success and lineup_success
 
     # 8. Persist State to data/latest_decision.json
     state_dir = Path("data")
@@ -907,8 +928,8 @@ def run_pipeline(
     state_file = state_dir / "latest_decision.json"
 
     output_payload = {
-        "status": "success",
-        "mode": "live_execution" if execute else "dry_run",
+        "status": "success" if (not execute or live_execution_success) else "execution_failed",
+        "mode": "live_execution" if live_execution_success else ("dry_run" if not execute else "execution_failed"),
         "gameweek": gw_id,
         "deadline_time": deadline_time,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -937,13 +958,13 @@ def run_pipeline(
             xp_gain=triggered_chip_eval["xp_gain"],
             reason=triggered_chip_eval["reason"],
             gameweek=gw_id,
-            is_live_execution=execute,
+            is_live_execution=live_execution_success,
         )
 
     notifier.notify_pre_deadline(
         decision=decision,
         gameweek=gw_id,
-        is_live_execution=execute,
+        is_live_execution=live_execution_success,
     )
 
     return output_payload
@@ -1011,9 +1032,18 @@ def run_daemon(client: FPLClient):
     logger.info("Starting Autonomous FPL Daemon Scheduler...")
     executed_gameweeks: Set[int] = set()
     post_scanned_gameweeks: Set[int] = set()
+    last_auth_keepalive: float = 0.0
 
     while True:
         try:
+            # Periodic background OAuth session keep-alive (every 6 hours)
+            now_ts = time.time()
+            if now_ts - last_auth_keepalive >= 21600:
+                if client.auth.can_refresh:
+                    logger.info("[DAEMON] Performing scheduled background OAuth session keep-alive...")
+                    client.refresh_access_token()
+                last_auth_keepalive = now_ts
+
             bootstrap = client.get_bootstrap_static(force_refresh=True)
             events = bootstrap.get("events", [])
             gw_id, deadline_str, is_next = get_active_gameweek(events)

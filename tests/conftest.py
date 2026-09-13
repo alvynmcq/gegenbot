@@ -10,6 +10,8 @@ def isolate_test_data_dir(tmp_path, monkeypatch):
     test_data.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("STATE_DIR", str(test_data))
     monkeypatch.setenv("DECISION_HISTORY_PATH", str(test_data / "decisions_history.json"))
+    from src.api.auth import FPLAuth
+    monkeypatch.setattr(FPLAuth, "DEFAULT_STATE_PATH", test_data / "auth_state.json")
 
 
 @pytest.fixture
