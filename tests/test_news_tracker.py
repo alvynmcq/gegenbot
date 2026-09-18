@@ -237,6 +237,18 @@ def test_telegram_notifier_renders_news_alerts():
     assert "AI DIRECTOR RATIONALE:" in alert_msg
 
 
+def test_telegram_sanitize_markdown():
+    """Verify sanitize_markdown escapes intra-word underscores and unclosed formatting characters."""
+    sanitized = TelegramNotifier.sanitize_markdown("Risk: DOUBT_75 | [75% chance]")
+    assert "DOUBT\\_75" in sanitized
+
+    # Unmatched underscores, asterisks, backticks
+    assert TelegramNotifier.sanitize_markdown("• *Bold* and _Italic_") == "• *Bold* and _Italic_"
+    assert TelegramNotifier.sanitize_markdown("• *Bold* and _Unmatched") == "• *Bold* and \\_Unmatched"
+    assert TelegramNotifier.sanitize_markdown("• `code` and `unmatched") == "• `code` and \\`unmatched"
+    assert TelegramNotifier.sanitize_markdown("• *Bold* and *unmatched") == "• *Bold* and \\*unmatched"
+
+
 def test_ai_director_captain_override_and_veto_output():
     director = AIDirector(api_key="mock_key")
 
@@ -373,4 +385,123 @@ def test_news_tracker_backwards_compatibility_for_tavily_key(monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-priority-key")
     tracker3 = NewsTracker()
     assert tracker3.firecrawl_api_key == "fc-priority-key"
+
+
+def test_news_tracker_escalates_to_ruled_out_on_severe_snippets():
+    tracker = NewsTracker(enable_web_search=False)
+    # Even if official FPL status is 'd' (75% chance), severe snippet escalates to RULED_OUT
+    with patch.object(tracker, "_search_web_snippets", return_value=["Manager confirms striker ruled out with sprained knee ligaments"]):
+        intel = tracker.build_player_intel(
+            player_id=165,
+            web_name="João Pedro",
+            team_name="Chelsea",
+            status="d",
+            chance_of_playing_next_round=75,
+            official_fpl_news="Unspecified injury - 75% chance of playing",
+            fetch_live_web=True,
+            is_focal=True,
+        )
+        assert intel.risk_level == "RULED_OUT"
+        assert intel.sentiment_score < 0
+
+
+def test_ai_director_vetos_doubtful_starter_in_fallback():
+    director = AIDirector(api_key="")  # No key -> fallback
+
+    pedro = _create_mock_player(165, "João Pedro", pos="FWD", is_starter=True)
+    haaland = _create_mock_player(100, "Haaland", pos="FWD", is_starter=True, is_captain=True)
+    bench_p = _create_mock_player(13, "Raya", pos="GKP", is_starter=False)
+
+    cand = CandidateSquad(
+        name="Candidate 1",
+        transfers_count=0,
+        transfers=[],
+        starters=[pedro, haaland],
+        bench=[bench_p],
+        captain=haaland,
+        formation="3-5-2",
+        gross_xp=15.0,
+        hit_cost=0,
+        net_xp=15.0,
+        total_cost_m=80.0,
+        bank_remaining_m=1.0,
+    )
+    opt_result = OptimizationResult(
+        candidates=[cand],
+        current_team_value_m=100.0,
+        bank_m=1.0,
+        free_transfers=1,
+    )
+
+    news_intel = {
+        165: PlayerNewsIntel(
+            player_id=165,
+            web_name="João Pedro",
+            team_name="Chelsea",
+            status="d",
+            chance_of_playing_next_round=75,
+            official_fpl_news="Unspecified injury - 75% chance of playing",
+            risk_level="DOUBT_75",
+            sentiment_score=-0.5,
+        )
+    }
+
+    decision = director.evaluate_and_decide(
+        optimization_result=opt_result,
+        news_intel=news_intel,
+    )
+
+    assert decision.source == "MATHEMATICAL_FALLBACK"
+    assert decision.veto_player_ids == [165]
+    assert "doubtful/injured starter(s) João Pedro" in decision.veto_reason
+
+
+def test_ai_director_squad_news_prioritization():
+    director = AIDirector(api_key="mock-key")
+
+    pedro = _create_mock_player(165, "João Pedro", pos="FWD", is_starter=True)
+    cand = CandidateSquad(
+        name="Candidate 1",
+        transfers_count=0,
+        transfers=[],
+        starters=[pedro],
+        bench=[],
+        captain=pedro,
+        formation="3-5-2",
+        gross_xp=10.0,
+        hit_cost=0,
+        net_xp=10.0,
+        total_cost_m=80.0,
+        bank_remaining_m=1.0,
+    )
+    opt_result = OptimizationResult(candidates=[cand], current_team_value_m=100.0, bank_m=1.0, free_transfers=1)
+
+    # Put 20 other players ahead of Pedro
+    news_intel = {}
+    for i in range(1, 25):
+        news_intel[i] = PlayerNewsIntel(
+            player_id=i, web_name=f"Player_{i}", team_name="Other", status="d", risk_level="DOUBT_50"
+        )
+    news_intel[165] = PlayerNewsIntel(
+        player_id=165, web_name="João Pedro", team_name="Chelsea", status="d", risk_level="DOUBT_75", official_fpl_news="Knee injury"
+    )
+
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"selected_candidate_index": 0, "rationale": "ok"}'}}]
+        }
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        director.evaluate_and_decide(opt_result, news_intel=news_intel)
+
+        call_payload = mock_post.call_args[1]["json"]
+        prompt_content = json_str = call_payload["messages"][1]["content"]
+        import json
+        parsed = json.loads(prompt_content)
+        breaking = parsed["breaking_news_and_injuries"]
+        # João Pedro must be the FIRST entry because he is in the candidate squad
+        assert "João Pedro" in breaking[0]
+
 

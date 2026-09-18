@@ -29,7 +29,7 @@ class DecisionOutput(BaseModel):
     news_alerts: List[str] = Field(default_factory=list)
     captain_override: Optional[str] = None
     vice_captain_override: Optional[str] = None
-    veto_player_ids: List[int] = Field(default_factory=list)
+    veto_player_ids: Optional[List[int]] = Field(default_factory=list)
     veto_reason: Optional[str] = None
 
 
@@ -49,7 +49,8 @@ class AIDirector:
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
         env_timeout = os.getenv("LLM_TIMEOUT", "").strip()
         self.timeout = timeout if timeout is not None else (int(env_timeout) if env_timeout.isdigit() else 45)
-        self.max_retries = max_retries
+        env_retries = os.getenv("LLM_MAX_RETRIES", "").strip()
+        self.max_retries = int(env_retries) if env_retries.isdigit() else max_retries
 
     def _extract_candidate_news_alerts(
         self,
@@ -124,6 +125,19 @@ class AIDirector:
         logger.info(f"Fallback decision made: {chosen.name}")
         news_alerts = self._extract_candidate_news_alerts(chosen, news_intel)
 
+        # Automated safety check: if any starter is ruled out or doubtful with negative news, trigger veto
+        veto_ids: List[int] = []
+        veto_reason: Optional[str] = None
+        if news_intel:
+            intel_map = news_intel if isinstance(news_intel, dict) else {item.player_id: item for item in news_intel if hasattr(item, "player_id")}
+            for s in chosen.starters:
+                info = intel_map.get(s.id)
+                if info and (info.risk_level in ("RULED_OUT", "DOUBT_50") or (info.risk_level == "DOUBT_75" and info.sentiment_score < 0)):
+                    veto_ids.append(s.id)
+            if veto_ids:
+                vetoed_names = [s.web_name for s in chosen.starters if s.id in veto_ids]
+                veto_reason = f"Automated safety check: doubtful/injured starter(s) {', '.join(vetoed_names)} flagged by news intel."
+
         return DecisionOutput(
             selected_candidate_index=best_candidate_idx,
             selected_candidate=chosen,
@@ -135,6 +149,8 @@ class AIDirector:
             rationale=rationale,
             source="MATHEMATICAL_FALLBACK",
             news_alerts=news_alerts,
+            veto_player_ids=veto_ids,
+            veto_reason=veto_reason,
         )
 
     def evaluate_and_decide(
@@ -234,15 +250,40 @@ class AIDirector:
             }
 
         # Format Live News & Press Conference Intel
-        news_list: List[str] = []
+        # Prioritize players directly involved in the solver's candidate squads
+        candidate_pids = set()
+        for cand in candidates:
+            if cand.captain:
+                candidate_pids.add(cand.captain.id)
+            if cand.vice_captain:
+                candidate_pids.add(cand.vice_captain.id)
+            for s in cand.starters:
+                candidate_pids.add(s.id)
+            for b in cand.bench:
+                candidate_pids.add(b.id)
+            for t in cand.transfers:
+                candidate_pids.add(t.player_in.id)
+                candidate_pids.add(t.player_out.id)
+
+        squad_news_list: List[str] = []
+        league_news_list: List[str] = []
+
         if news_intel:
-            items = news_intel.values() if isinstance(news_intel, dict) else news_intel
+            items = list(news_intel.values()) if isinstance(news_intel, dict) else list(news_intel)
             for item in items:
                 if hasattr(item, "summary"):
                     if item.risk_level != "CLEARED" or item.official_fpl_news or item.live_search_snippets:
-                        news_list.append(item.summary())
+                        txt = item.summary()
+                        p_id = getattr(item, "player_id", None)
+                        if p_id in candidate_pids:
+                            squad_news_list.append(txt)
+                        else:
+                            league_news_list.append(txt)
                 elif isinstance(item, dict):
-                    news_list.append(str(item))
+                    league_news_list.append(str(item))
+
+        # Squad/candidate alerts come first so they are never truncated
+        news_list = squad_news_list + league_news_list
 
         max_idx = len(candidates) - 1
         risk_mode = (competitive_context or {}).get("risk_mode", "NEUTRAL")
@@ -251,7 +292,7 @@ class AIDirector:
         manager_decryption_rubric = {
             "high_rotation_or_cameo_risk": "Phrases like 'felt something in training', 'assess in the morning', 'touch and go', 'illness', 'managing his load', 'European game coming'. Action: Avoid captaincy; ensure reliable vice-captain; favor alternative candidates.",
             "cleared_solid_starter": "Phrases like 'trained fully all week', 'ready to go', 'cleared by medical team', 'no concerns'. Action: Full confidence.",
-            "emergency_veto_rule": "If breaking news reveals a target in the solver's top candidates is definitively OUT or benched, specify veto_player_ids to trigger an instant mathematical re-solve."
+            "emergency_veto_rule": "If breaking news or injury flags reveal that any starter, squad member, or transfer target in the solver's top candidates is injured, doubtful, or benched (e.g. DOUBT_75/50/RULED_OUT or negative manager update), specify their player ID(s) in veto_player_ids to trigger an instant mathematical re-solve where they are sidelined/benched."
         }
 
         forced_chip = (chip_season_plan or {}).get("forced_chip")
@@ -278,7 +319,7 @@ class AIDirector:
                 "- When a premium asset (e.g. Haaland, Salah) has high EO (>=80%) in your mini-league, captaining against them is devastating if they haul. Do NOT override the armband to a low-EO differential in early/mid season (GW1-28) unless the premium has confirmed injury/rotation news. "
                 "- NEVER assign the captaincy to a Goalkeeper or Defender under standard conditions due to binary clean sheet risk. "
                 "RECENCY & VARIANCE DISCIPLINE: Review 'recent_performance' history. If recent gameweeks experienced heavy negative variance or missed captaincy returns, ground your decisions with extra tactical discipline: avoid panic hits or wild low-probability punts. "
-                "If breaking news reveals that a transfer target is unexpectedly injured or benched, you may issue a 'veto_player_ids' to trigger a clean re-solve. "
+                "If breaking news or injury intelligence reveals that any starter, squad member, or transfer target is injured, doubtful, or benched (e.g. risk level DOUBT_75/50/RULED_OUT or negative press conference report), you may issue a 'veto_player_ids' (list of their player IDs) to trigger a clean re-solve without them starting. "
                 "Provide your tactical rationale in EXACTLY two concise, impactful sentences balancing "
                 "expected points (xP), injury safety from latest news, defensive shielding vs differential upside, "
                 "and your competitive position. "
@@ -290,7 +331,7 @@ class AIDirector:
             "chip_season_plan": chip_season_plan or {},
             "candidates": candidate_summaries,
             "league_threats": threats_summary,
-            "breaking_news_and_injuries": news_list[:15],
+            "breaking_news_and_injuries": news_list[:25],
             "schema": {
                 "selected_candidate_index": f"int (0 to {max_idx})",
                 "captain_override": "optional str (web_name of starter to captain, or null)",
@@ -323,7 +364,15 @@ class AIDirector:
                 resp.raise_for_status()
                 resp_data = resp.json()
                 content_str = resp_data["choices"][0]["message"]["content"]
-                parsed = json.loads(content_str)
+                cleaned_str = content_str.strip()
+                if cleaned_str.startswith("```"):
+                    lines = cleaned_str.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    cleaned_str = "\n".join(lines).strip()
+                parsed = json.loads(cleaned_str)
                 break
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
                 if attempt < self.max_retries:

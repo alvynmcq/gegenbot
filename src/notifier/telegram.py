@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from typing import Optional
 import requests
 
@@ -26,12 +27,44 @@ class TelegramNotifier:
     def is_configured(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
+    @staticmethod
+    def sanitize_markdown(text: str) -> str:
+        """Sanitize text for Telegram Markdown v1 to prevent 400 Bad Request entity parse errors."""
+        if not text:
+            return text
+
+        # 1. Escape intra-word underscores (e.g., DOUBT_75, xG_90) so they do not trigger unclosed italics
+        text = re.sub(r"(?<=\w)_(?=\w)", r"\\_", text)
+
+        # 2. Check for unmatched single underscores
+        unescaped_underscores = [m.start() for m in re.finditer(r"(?<!\\)_", text)]
+        if len(unescaped_underscores) % 2 != 0:
+            idx = unescaped_underscores[-1]
+            text = text[:idx] + "\\_" + text[idx + 1:]
+
+        # 3. Check for unmatched single asterisks
+        unescaped_asterisks = [m.start() for m in re.finditer(r"(?<!\\)\*", text)]
+        if len(unescaped_asterisks) % 2 != 0:
+            idx = unescaped_asterisks[-1]
+            text = text[:idx] + "\\*" + text[idx + 1:]
+
+        # 4. Check for unmatched backticks
+        unescaped_backticks = [m.start() for m in re.finditer(r"(?<!\\)`", text)]
+        if len(unescaped_backticks) % 2 != 0:
+            idx = unescaped_backticks[-1]
+            text = text[:idx] + "\\`" + text[idx + 1:]
+
+        return text
+
     def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
         """Send message to Telegram chat with error handling and automatic plain-text fallback."""
         if not self.is_configured:
             logger.info("Telegram notifier not configured (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing).")
             logger.info(f"Notification Preview:\n{text}")
             return False
+
+        if parse_mode == "Markdown":
+            text = self.sanitize_markdown(text)
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
@@ -47,7 +80,9 @@ class TelegramNotifier:
             logger.info("Telegram notification successfully dispatched.")
             return True
         except Exception as e:
-            logger.warning(f"Telegram dispatch with parse_mode={parse_mode} failed ({e}). Retrying with plain text fallback...")
+            err_detail = getattr(e, "response", None)
+            detail_msg = err_detail.text if err_detail is not None else str(e)
+            logger.warning(f"Telegram dispatch with parse_mode={parse_mode} failed ({detail_msg}). Retrying with plain text fallback...")
             try:
                 payload.pop("parse_mode", None)
                 resp = requests.post(url, json=payload, timeout=10)

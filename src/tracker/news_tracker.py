@@ -198,12 +198,14 @@ class NewsTracker:
         combined_text = " ".join([official_fpl_news] + snippets)
         sentiment = self._compute_sentiment(combined_text) if combined_text.strip() else 0.0
 
-        # If live snippets indicate definitive breaking news even without official FPL flag, adjust risk level
-        if risk == "CLEARED" and snippets:
+        # If live snippets indicate definitive breaking news, adjust risk level
+        if snippets:
             # Check for strong negative sentiment or explicit absence phrases
-            severe_phrases = ["ruled out", "will miss", "out of action", "surgery", "broken", "fracture", "torn", "not available"]
+            severe_phrases = ["ruled out", "will miss", "out of action", "surgery", "broken", "fracture", "torn", "not available", "sidelined"]
             has_severe = any(p in combined_text.lower() for p in severe_phrases)
-            if sentiment <= -0.75 or (has_severe and sentiment < 0):
+            if has_severe or sentiment <= -0.75:
+                risk = "RULED_OUT"
+            elif risk == "CLEARED" and sentiment < 0:
                 risk = "MONITOR"
 
         return PlayerNewsIntel(

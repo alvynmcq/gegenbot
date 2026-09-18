@@ -735,7 +735,7 @@ def run_pipeline(
     logger.info("Gathering live press conference & news intelligence...")
     news_tracker = NewsTracker(search_timeout=3)
     focal_player_ids: Set[int] = set()
-    # Prioritize captains and transfer-in targets from top options
+    # Prioritize captains, vice-captains, transfer targets, and starters from top options
     for cand in opt_result.candidates[:5]:
         if cand.captain:
             focal_player_ids.add(cand.captain.id)
@@ -743,6 +743,19 @@ def run_pipeline(
             focal_player_ids.add(cand.vice_captain.id)
         for t in cand.transfers:
             focal_player_ids.add(t.player_in.id)
+        for s in cand.starters:
+            if (s.status and s.status != "a") or (s.chance_of_playing_next_round is not None and s.chance_of_playing_next_round < 100):
+                focal_player_ids.add(s.id)
+
+    # Also track any flagged/doubtful players currently in the squad
+    elements_map = {el["id"]: el for el in bootstrap.get("elements", [])}
+    for pid in current_squad_ids:
+        el = elements_map.get(pid, {})
+        stat = el.get("status", "a")
+        chance = el.get("chance_of_playing_next_round")
+        news_txt = el.get("news", "")
+        if stat != "a" or (chance is not None and chance < 100) or news_txt:
+            focal_player_ids.add(pid)
 
     news_intel = news_tracker.extract_focal_players_from_bootstrap(
         bootstrap_data=bootstrap,
@@ -763,9 +776,26 @@ def run_pipeline(
     )
 
     # Check for AI Director Late Breaking News Veto & Instant Re-Solve
-    if decision.veto_player_ids:
+    # Enforce safety veto if a starter in the chosen lineup has an active injury doubt/flag
+    auto_veto_ids = set(decision.veto_player_ids or [])
+    chosen_cand = decision.selected_candidate or (opt_result.candidates[0] if opt_result.candidates else None)
+    if chosen_cand:
+        for s in chosen_cand.starters:
+            s_intel = news_intel.get(s.id)
+            if s_intel and (s_intel.risk_level in ("RULED_OUT", "DOUBT_50") or (s_intel.risk_level == "DOUBT_75" and s_intel.sentiment_score < 0)):
+                if s.id not in auto_veto_ids:
+                    logger.warning(
+                        f"🛡️ Automated Safety Veto triggered for starter {s.web_name} (ID: {s.id}) - "
+                        f"Risk Level: {s_intel.risk_level} | Sentiment: {s_intel.sentiment_score} | News: {s_intel.official_fpl_news}"
+                    )
+                    auto_veto_ids.add(s.id)
+                    if not decision.veto_reason:
+                        decision.veto_reason = f"Automated safety veto: {s.web_name} flagged with injury risk ({s_intel.risk_level})."
+
+    if auto_veto_ids:
+        decision.veto_player_ids = list(auto_veto_ids)
         logger.warning(
-            f"⚠️ AI Director issued late news emergency veto on player IDs: {decision.veto_player_ids}. "
+            f"⚠️ Late news emergency veto on player IDs: {decision.veto_player_ids}. "
             f"Reason: {decision.veto_reason or 'Late injury/rotation doubt'}. Re-running MILP solver..."
         )
         for pid in decision.veto_player_ids:
