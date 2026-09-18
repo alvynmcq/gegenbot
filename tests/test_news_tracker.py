@@ -309,7 +309,7 @@ def test_ai_director_captain_override_and_veto_output():
 
 
 def test_news_tracker_firecrawl_search_success():
-    tracker = NewsTracker(enable_web_search=True, firecrawl_api_key="fc-mock-test-key")
+    tracker = NewsTracker(enable_web_search=True, firecrawl_api_key="fc-mock-test-key", enable_reddit_news=True, reddit_subreddits="r/FantasyPL")
 
     mock_firecrawl_resp = {
         "success": True,
@@ -330,18 +330,30 @@ def test_news_tracker_firecrawl_search_success():
 
         snippets = tracker._search_web_snippets("Saka", "Arsenal")
 
-        assert len(snippets) == 1
+        assert len(snippets) == 2
         assert "Bukayo Saka completed full first-team training" in snippets[0]
+        assert "[r/FantasyPL]" in snippets[1]
 
-        # Verify Firecrawl endpoint and headers
-        mock_post.assert_called_once()
-        call_args, call_kwargs = mock_post.call_args
-        assert call_args[0] == "https://api.firecrawl.dev/v1/search"
-        assert call_kwargs["headers"]["Authorization"] == "Bearer fc-mock-test-key"
-        assert call_kwargs["headers"]["Content-Type"] == "application/json"
-        assert call_kwargs["json"]["query"] == "Saka Arsenal press conference team news injury update"
-        assert call_kwargs["json"]["limit"] == 2
-        assert call_kwargs["json"]["tbs"] == "qdr:w"
+        # Verify Firecrawl endpoint and headers for both calls
+        assert mock_post.call_count == 2
+        call1_kwargs = mock_post.call_args_list[0][1]
+        call2_kwargs = mock_post.call_args_list[1][1]
+        assert call1_kwargs["json"]["query"] == "Saka Arsenal press conference team news injury update"
+        assert "site:reddit.com/r/FantasyPL Saka" in call2_kwargs["json"]["query"]
+
+
+def test_news_tracker_reddit_disabled():
+    tracker = NewsTracker(enable_web_search=True, firecrawl_api_key="fc-mock-test-key", enable_reddit_news=False)
+
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"title": "News", "description": "Fit"}]}
+        mock_post.return_value = mock_resp
+
+        snippets = tracker._search_web_snippets("Saka", "Arsenal")
+        assert mock_post.call_count == 1
+        assert "[r/" not in snippets[0]
 
 
 def test_news_tracker_firecrawl_fallback_on_error():

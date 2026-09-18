@@ -50,11 +50,23 @@ class NewsTracker:
         firecrawl_api_key: Optional[str] = None,
         tavily_api_key: Optional[str] = None,
         search_timeout: int = 5,
+        enable_reddit_news: Optional[bool] = None,
+        reddit_subreddits: Optional[str] = None,
     ):
         if enable_web_search is None:
             self.enable_web_search = os.getenv("ENABLE_LIVE_NEWS", "true").lower() in ("true", "1", "yes")
         else:
             self.enable_web_search = enable_web_search
+
+        if enable_reddit_news is None:
+            self.enable_reddit_news = os.getenv("ENABLE_REDDIT_NEWS", "true").lower() in ("true", "1", "yes")
+        else:
+            self.enable_reddit_news = enable_reddit_news
+
+        self.reddit_subreddits = (
+            reddit_subreddits
+            or os.getenv("REDDIT_SUBREDDITS", "r/FantasyPL")
+        ).strip()
 
         self.firecrawl_api_key = (
             firecrawl_api_key
@@ -96,6 +108,8 @@ class NewsTracker:
 
         # 1. Firecrawl Search API if configured (strictly filtered to recent 7 days news)
         if self.firecrawl_api_key:
+            firecrawl_healthy = False
+            # 1a. Club press conference & team news
             try:
                 resp = requests.post(
                     "https://api.firecrawl.dev/v1/search",
@@ -111,6 +125,7 @@ class NewsTracker:
                     timeout=self.search_timeout,
                 )
                 if resp.status_code == 200:
+                    firecrawl_healthy = True
                     data = resp.json()
                     results = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                     for r in results:
@@ -121,6 +136,39 @@ class NewsTracker:
                                 snippets.append(clean[:200])
             except Exception as e:
                 logger.debug(f"Firecrawl search failed for {player_name}: {e}")
+
+            # 1b. Reddit Community Search (r/FantasyPL and club subreddits for early leaks / news)
+            if firecrawl_healthy and self.enable_reddit_news and self.reddit_subreddits:
+                sub_list = [s.strip().lstrip("r/") for s in self.reddit_subreddits.split(",") if s.strip()]
+                for sub in sub_list[:2]:
+                    try:
+                        reddit_query = f"site:reddit.com/r/{sub} {player_name} injury OR press conference OR ruled out OR leak"
+                        r_resp = requests.post(
+                            "https://api.firecrawl.dev/v1/search",
+                            headers={
+                                "Authorization": f"Bearer {self.firecrawl_api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "query": reddit_query,
+                                "limit": 2,
+                                "tbs": "qdr:w",
+                            },
+                            timeout=self.search_timeout,
+                        )
+                        if r_resp.status_code == 200:
+                            r_data = r_resp.json()
+                            r_results = r_data.get("data", []) if isinstance(r_data, dict) else (r_data if isinstance(r_data, list) else [])
+                            for r in r_results:
+                                if isinstance(r, dict):
+                                    title = (r.get("title") or "").strip()
+                                    desc = (r.get("description") or r.get("snippet") or "").strip()
+                                    combined = f"{title}: {desc}" if title and desc else (title or desc)
+                                    if combined:
+                                        clean = re.sub(r"\s+", " ", combined).strip()
+                                        snippets.append(f"[r/{sub}] {clean[:200]}")
+                    except Exception as e:
+                        logger.debug(f"Firecrawl Reddit search failed for {player_name} on r/{sub}: {e}")
 
         # 2. Free DuckDuckGo Lite / HTML search fallback (strictly past week &df=w)
         if not snippets:
@@ -149,6 +197,7 @@ class NewsTracker:
         bad_words = [
             "ruled out", "out for", "hamstring", "injury", "injured", "doubt",
             "scan", "knock", "miss", "concern", "unavailable", "suspended",
+            "edema", "sprain", "sprained", "sidelined", "broken", "fracture", "torn", "acl", "mcl",
         ]
         good_words = [
             "fit", "trained", "fully fit", "back", "available", "cleared",
