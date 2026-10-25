@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,26 @@ def _parse_jwt_exp(token: Optional[str]) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _newest_refresh_token(*candidates: Optional[str]) -> Optional[str]:
+    """Pick the newest refresh token from candidates listed in order of preference.
+
+    PingOne rotates refresh tokens and revokes the old one, so using a stale copy fails.
+    When every candidate is a JWT, the one with the latest expiry is the newest.
+    Otherwise (e.g. opaque tokens) the first candidate wins.
+    """
+    tokens = []
+    for t in candidates:
+        t = (t or "").strip()
+        if t and t not in tokens:
+            tokens.append(t)
+    if not tokens:
+        return None
+    expiries = [_parse_jwt_exp(t) for t in tokens]
+    if all(expiries):
+        return tokens[expiries.index(max(expiries))]
+    return tokens[0]
 
 
 class FPLAuth:
@@ -54,15 +74,11 @@ class FPLAuth:
         refresh_token: Optional[str] = None,
         token_expiry: Optional[float] = None,
         state_file: Optional[Union[str, Path]] = None,
-        email: Optional[str] = None,
-        password: Optional[str] = None,
     ):
         self.state_file = Path(state_file) if state_file else self.DEFAULT_STATE_PATH
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = refresh_token
         self.token_expiry: Optional[float] = token_expiry
-        self.email: Optional[str] = email or os.getenv("FPL_EMAIL", "").strip() or None
-        self.password: Optional[str] = password or os.getenv("FPL_PASSWORD", "").strip() or None
 
         # If token is explicitly provided in constructor (e.g. FPLAuth(token="...")), prioritize it
         if token is not None:
@@ -85,10 +101,9 @@ class FPLAuth:
                             self.token_expiry = env_exp
                         logger.info("Using active FPL_AUTH_TOKEN / FPL_ACCESS_TOKEN from environment.")
 
-            if not self.refresh_token:
-                env_refresh = os.getenv("FPL_REFRESH_TOKEN", "").strip()
-                if env_refresh:
-                    self.refresh_token = env_refresh
+            self.refresh_token = _newest_refresh_token(
+                self.refresh_token, os.getenv("FPL_REFRESH_TOKEN", "")
+            )
 
     @property
     def token(self) -> str:
@@ -125,6 +140,29 @@ class FPLAuth:
         except Exception as e:
             logger.warning(f"Failed to load auth state from {self.state_file}: {e}")
             return False
+
+    def reload_refresh_token(self, env_path: Union[str, Path] = ".env") -> None:
+        """Adopt a newer refresh token written by another process.
+
+        The dashboard's /api/auth/sync writes auth_state.json, and a user may paste a
+        fresh token into .env, while the daemon keeps its own copy in memory.
+        """
+        state_refresh = None
+        if self.state_file.exists():
+            try:
+                state_refresh = json.loads(self.state_file.read_text(encoding="utf-8")).get("refresh_token")
+            except Exception as e:
+                logger.warning(f"Failed to read refresh token from {self.state_file}: {e}")
+
+        env_refresh = None
+        env_file = Path(env_path)
+        if "PYTEST_CURRENT_TEST" not in os.environ and env_file.exists():
+            env_refresh = dotenv_values(env_file).get("FPL_REFRESH_TOKEN")
+
+        newest = _newest_refresh_token(state_refresh, self.refresh_token, env_refresh)
+        if newest and newest != self.refresh_token:
+            logger.info("Picked up a newer FPL refresh token from disk.")
+            self.refresh_token = newest
 
     def save_state(self) -> bool:
         """Persist active token state to auth_state.json atomically."""
@@ -184,5 +222,5 @@ class FPLAuth:
 
     @property
     def can_refresh(self) -> bool:
-        """Check if refresh token or direct login credentials are available."""
-        return bool(self.refresh_token or (self.email and self.password))
+        """Check if a refresh token is available."""
+        return bool(self.refresh_token)

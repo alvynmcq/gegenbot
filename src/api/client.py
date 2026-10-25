@@ -28,9 +28,14 @@ class FPLClient:
     """Client for Fantasy Premier League REST API with caching, PingOne OAuth token refresh, and retry backoff."""
 
     BASE_URL = "https://fantasy.premierleague.com/api"
-    PINGONE_TOKEN_URL = "https://auth.pingone.eu/68340de1-dfb9-412e-937c-20172986d129/as/token"
-    PINGONE_CLIENT_ID = "1f243d70-a140-4035-8c41-341f5af5aa12"
-    LOGIN_URL = "https://users.premierleague.com/accounts/login/"
+    # FPL signs in through PingOne at account.premierleague.com. The old
+    # users.premierleague.com password login no longer exists.
+    PINGONE_TOKEN_URL = "https://account.premierleague.com/as/token"
+    PINGONE_CLIENT_ID = "bfcbaf69-aade-4c1b-8f00-c1cb8a193030"
+    RESYNC_HINT = (
+        "Log in at https://fantasy.premierleague.com in a browser and re-sync via the "
+        "dashboard bookmarklet (/api/auth/sync), or put a fresh FPL_REFRESH_TOKEN in .env."
+    )
     CACHE_DIR = Path("data")
     BOOTSTRAP_CACHE_FILE = CACHE_DIR / "bootstrap_cache.json"
     CACHE_TTL_SECONDS = 600  # 10 minutes
@@ -60,78 +65,60 @@ class FPLClient:
 
     def refresh_access_token(self) -> bool:
         """
-        Refresh FPL OAuth access token using PingOne token endpoint or login fallback.
-        Updates session headers, cookie jar, auth state, and persists to data/auth_state.json.
+        Exchange the refresh token for a new access token.
+        PingOne rotates the refresh token on every exchange, so the new pair is saved
+        to data/auth_state.json straight away.
         """
+        self.auth.reload_refresh_token()
         refresh_token = self.auth.refresh_token
-        if refresh_token:
-            logger.info("Attempting automated PingOne OAuth2 token refresh...")
-            token_endpoints = [
-                (self.PINGONE_TOKEN_URL, self.client_id),
-                ("https://account.premierleague.com/as/token", "bfcbaf69-aade-4c1b-8f00-c1cb8a193030"),
-                ("https://auth.pingone.eu/68340de1-dfb9-412e-937c-20172986d129/as/token", "1f243d70-a140-4035-8c41-341f5af5aa12"),
-            ]
-            seen_targets = set()
-            endpoints_to_try = []
-            for u, cid in token_endpoints:
-                if (u, cid) not in seen_targets:
-                    seen_targets.add((u, cid))
-                    endpoints_to_try.append((u, cid))
+        if not refresh_token:
+            logger.warning(f"No FPL refresh token available. {self.RESYNC_HINT}")
+            return False
 
-            for endpoint_url, cid in endpoints_to_try:
-                payload = {
-                    "grant_type": "refresh_token",
-                    "client_id": cid,
-                    "refresh_token": refresh_token,
-                }
-                headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                }
-                try:
-                    resp = requests.post(
-                        endpoint_url,
-                        data=payload,
-                        headers=headers,
-                        timeout=15,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        new_access = data.get("access_token")
-                        new_refresh = data.get("refresh_token", refresh_token)
-                        expires_in = data.get("expires_in", 7200)
+        logger.info("Refreshing FPL access token...")
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "refresh_token": refresh_token,
+        }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": self.auth.BASE_HEADERS["User-Agent"],
+        }
+        try:
+            resp = requests.post(self.PINGONE_TOKEN_URL, data=payload, headers=headers, timeout=15)
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"FPL token refresh request failed: {e}")
+            return False
 
-                        if new_access:
-                            self.auth.update_tokens(
-                                access_token=new_access,
-                                refresh_token=new_refresh,
-                                expires_in=expires_in,
-                            )
-                            self._sync_session_cookies()
-                            self._sync_tokens_to_env(new_access, new_refresh)
-                            logger.info(f"Successfully refreshed OAuth2 access token via {endpoint_url} and updated state.")
-                            return True
-                        else:
-                            logger.warning(f"OAuth endpoint {endpoint_url} response did not contain access_token.")
-                    else:
-                        logger.warning(
-                            f"OAuth token refresh via {endpoint_url} failed with HTTP {resp.status_code}: {resp.text}"
-                        )
-                except Exception as e:
-                    logger.warning(f"Error during token refresh via {endpoint_url}: {e}")
+        if resp.status_code != 200:
+            try:
+                error = resp.json().get("error")
+            except Exception:
+                error = None
+            if error == "invalid_grant":
+                logger.error(f"FPL refresh token was rejected (invalid_grant). {self.RESYNC_HINT}")
+            else:
+                logger.warning(f"FPL token refresh failed with HTTP {resp.status_code}: {resp.text[:300]}")
+            return False
 
-        # Fallback to direct credentials login if available
-        if self.auth.email and self.auth.password:
-            logger.info(f"Attempting direct credential login fallback for {self.auth.email}...")
-            return self.login_with_credentials(self.auth.email, self.auth.password)
+        data = resp.json()
+        new_access = data.get("access_token")
+        if not new_access:
+            logger.warning("FPL token refresh response did not contain an access_token.")
+            return False
 
-        logger.warning("No valid refresh token or login credentials available for token refresh.")
-        return False
+        new_refresh = data.get("refresh_token", refresh_token)
+        self.auth.update_tokens(
+            access_token=new_access,
+            refresh_token=new_refresh,
+            expires_in=data.get("expires_in", 3600),
+        )
+        self._sync_session_cookies()
+        self._sync_tokens_to_env(new_access, new_refresh)
+        logger.info("Refreshed FPL access token and saved it to auth_state.json.")
+        return True
 
     def _sync_tokens_to_env(self, access_token: str, refresh_token: Optional[str] = None) -> None:
         """Persist refreshed access and refresh tokens to .env file if present."""
@@ -139,6 +126,9 @@ class FPLClient:
             return
         env_path = Path(".env")
         if not env_path.exists():
+            return
+        if not os.access(env_path, os.W_OK):
+            logger.debug(".env is read-only; tokens are kept in auth_state.json only.")
             return
         try:
             import re
@@ -166,41 +156,6 @@ class FPLClient:
                 logger.warning("Automated token refresh failed during ensure_authenticated.")
             return False
         return self.auth.is_authenticated
-
-    def login_with_credentials(self, email: Optional[str] = None, password: Optional[str] = None) -> bool:
-        """Authenticate directly against FPL users login endpoint as fallback."""
-        user_email = email or self.auth.email
-        user_pwd = password or self.auth.password
-        if not user_email or not user_pwd:
-            logger.warning("Email or password not provided for credential login.")
-            return False
-
-        payload = {
-            "login": user_email,
-            "password": user_pwd,
-            "app": "plfpl-web",
-            "redirect_uri": "https://fantasy.premierleague.com/",
-        }
-        headers = dict(self.auth.BASE_HEADERS)
-        try:
-            resp = self.session.post(self.LOGIN_URL, data=payload, headers=headers, timeout=15)
-            cookies = resp.cookies.get_dict()
-            token = cookies.get("access_token") or cookies.get("pl_profile")
-            if token:
-                self.auth.update_tokens(access_token=token, expires_in=7200)
-                self._sync_session_cookies()
-                logger.info("Direct credential login succeeded.")
-                return True
-            if resp.status_code in (200, 302):
-                for cookie in self.session.cookies:
-                    if cookie.name in ("access_token", "pl_profile"):
-                        self.auth.update_tokens(access_token=cookie.value, expires_in=7200)
-                        self._sync_session_cookies()
-                        return True
-            logger.warning(f"Direct credential login failed with HTTP {resp.status_code}.")
-        except Exception as e:
-            logger.warning(f"Exception during direct credential login: {e}")
-        return False
 
     def _request(
         self,

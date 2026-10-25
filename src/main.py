@@ -1063,15 +1063,28 @@ def run_daemon(client: FPLClient):
     executed_gameweeks: Set[int] = set()
     post_scanned_gameweeks: Set[int] = set()
     last_auth_keepalive: float = 0.0
+    auth_alert_sent = False
 
     while True:
         try:
             # Periodic background OAuth session keep-alive (every 6 hours)
             now_ts = time.time()
             if now_ts - last_auth_keepalive >= 21600:
-                if client.auth.can_refresh:
-                    logger.info("[DAEMON] Performing scheduled background OAuth session keep-alive...")
-                    client.refresh_access_token()
+                logger.info("[DAEMON] Performing scheduled background OAuth session keep-alive...")
+                if client.refresh_access_token():
+                    auth_alert_sent = False
+                elif not auth_alert_sent:
+                    # Alert once per failure streak so an expired login doesn't go unnoticed
+                    try:
+                        TelegramNotifier().send_message(
+                            "🚨 *FPL login expired*\n\n"
+                            "Gegenbot could not refresh its FPL token, so it cannot read or "
+                            "update your team. Log in at fantasy.premierleague.com and re-sync "
+                            "via the dashboard bookmarklet."
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to send auth expiry alert: {e}")
+                    auth_alert_sent = True
                 last_auth_keepalive = now_ts
 
             bootstrap = client.get_bootstrap_static(force_refresh=True)

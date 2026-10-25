@@ -239,3 +239,57 @@ def test_api_auth_sync_endpoint(tmp_path, monkeypatch):
 
 
 
+
+
+def _fake_jwt(exp: float) -> str:
+    """Build an unsigned JWT-shaped string with the given expiry."""
+    import base64
+    body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJub25lIn0.{body}.sig"
+
+
+def test_newer_env_refresh_token_beats_stale_state(tmp_path, monkeypatch):
+    """A newer JWT refresh token in .env must win over an older one cached in auth_state.json."""
+    old_rt, new_rt = _fake_jwt(1900000000), _fake_jwt(1950000000)
+    state_file = tmp_path / "auth_state.json"
+    state_file.write_text(json.dumps({"access_token": None, "refresh_token": old_rt}))
+    monkeypatch.setenv("FPL_REFRESH_TOKEN", new_rt)
+
+    assert FPLAuth(state_file=state_file).refresh_token == new_rt
+
+    # And the reverse: a newer cached token is kept over an older env value
+    state_file.write_text(json.dumps({"access_token": None, "refresh_token": new_rt}))
+    monkeypatch.setenv("FPL_REFRESH_TOKEN", old_rt)
+    assert FPLAuth(state_file=state_file).refresh_token == new_rt
+
+
+def test_refresh_picks_up_token_synced_by_another_process(tmp_path):
+    """The daemon must use a refresh token the dashboard wrote after the daemon started."""
+    state_file = tmp_path / "auth_state.json"
+    auth = FPLAuth(token="", refresh_token=_fake_jwt(1900000000), state_file=state_file)
+    client = FPLClient(auth=auth, cache_dir=tmp_path)
+
+    synced_rt = _fake_jwt(1950000000)
+    state_file.write_text(json.dumps({"access_token": None, "refresh_token": synced_rt}))
+
+    ok_resp = MagicMock(status_code=200)
+    ok_resp.json.return_value = {"access_token": "new_access", "refresh_token": "rotated", "expires_in": 3600}
+    with patch("requests.post", return_value=ok_resp) as mock_post:
+        assert client.refresh_access_token() is True
+        assert mock_post.call_args[1]["data"]["refresh_token"] == synced_rt
+    assert json.loads(state_file.read_text())["refresh_token"] == "rotated"
+
+
+def test_rejected_refresh_token_fails_cleanly(tmp_path, caplog):
+    """invalid_grant returns False after one request and logs how to re-sync."""
+    auth = FPLAuth(token="", refresh_token="revoked", state_file=tmp_path / "auth_state.json")
+    client = FPLClient(auth=auth, cache_dir=tmp_path)
+
+    bad_resp = MagicMock(status_code=400, text="{}")
+    bad_resp.json.return_value = {"error": "invalid_grant", "error_description": "Refresh token does not exist"}
+    with patch("requests.post", return_value=bad_resp) as mock_post:
+        assert client.refresh_access_token() is False
+        assert mock_post.call_count == 1
+        assert mock_post.call_args[0][0] == "https://account.premierleague.com/as/token"
+    assert "re-sync" in caplog.text
+    assert client.auth.access_token == ""

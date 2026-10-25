@@ -114,8 +114,7 @@ Populate your `.env` configuration:
 ```env
 # --- FPL Credentials & IDs ---
 FPL_TEAM_ID=your_team_id
-FPL_EMAIL=your_fpl_email
-FPL_PASSWORD=your_fpl_password
+FPL_REFRESH_TOKEN=your_fpl_refresh_token   # see "FPL login tokens" below
 FPL_LEAGUE_ID=your_primary_mini_league_id
 
 # --- Data Feeds & Underlying Stats ---
@@ -141,6 +140,14 @@ FIRECRAWL_API_KEY=your_optional_firecrawl_api_key
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
+
+#### FPL login tokens
+FPL signs in through PingOne (`account.premierleague.com`) and has no password login for scripts, so Gegenbot uses an OAuth refresh token taken from your browser:
+
+1. Log in at https://fantasy.premierleague.com.
+2. Send the tokens to Gegenbot with the dashboard bookmarklet (`/api/auth/sync`), or copy `refresh_token` from DevTools → Application → Local Storage → `oidc.user:...` into `FPL_REFRESH_TOKEN` in `.env`.
+
+PingOne issues a new refresh token every time one is used and revokes the old one. Gegenbot saves each new pair to `data/auth_state.json`, which is the live copy (Docker mounts `.env` read-only), so don't delete that file. If the token is ever rejected, the daemon sends a Telegram alert; repeat the steps above.
 
 ### 3. Run with Python or Docker Compose
 
