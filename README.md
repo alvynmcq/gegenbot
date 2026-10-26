@@ -147,6 +147,8 @@ FPL signs in through PingOne (`account.premierleague.com`) and has no password l
 1. Log in at https://fantasy.premierleague.com.
 2. Send the tokens to Gegenbot with the dashboard bookmarklet (`/api/auth/sync`), or copy `refresh_token` from DevTools → Application → Local Storage → `oidc.user:...` into `FPL_REFRESH_TOKEN` in `.env`.
 
+To check the login works, run `python3 src/main.py --check-auth` (or `docker exec fpl_worker python src/main.py --check-auth`). It prints `OK` or `FAILED` with the reason.
+
 PingOne issues a new refresh token every time one is used and revokes the old one. Gegenbot saves each new pair to `data/auth_state.json`, which is the live copy (Docker mounts `.env` read-only), so don't delete that file. If the token is ever rejected, the daemon sends a Telegram alert; repeat the steps above.
 
 ### 3. Run with Python or Docker Compose

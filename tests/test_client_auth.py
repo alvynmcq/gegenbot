@@ -293,3 +293,23 @@ def test_rejected_refresh_token_fails_cleanly(tmp_path, caplog):
         assert mock_post.call_args[0][0] == "https://account.premierleague.com/as/token"
     assert "re-sync" in caplog.text
     assert client.auth.access_token == ""
+
+
+def test_check_auth_reports_result(monkeypatch, capsys):
+    from unittest.mock import MagicMock
+
+    from src.main import run_check_auth
+
+    client = MagicMock()
+    monkeypatch.setenv("FPL_TEAM_ID", "123")
+    client.validate_auth.return_value = (True, "Authentication token valid.")
+    assert run_check_auth(client) == 0
+    client.validate_auth.assert_called_with(123)
+    assert capsys.readouterr().out.startswith("OK")
+
+    client.validate_auth.return_value = (False, "refresh failed")
+    assert run_check_auth(client) == 1
+    assert capsys.readouterr().out.startswith("FAILED")
+
+    monkeypatch.setenv("FPL_TEAM_ID", "")
+    assert run_check_auth(client) == 1

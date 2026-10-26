@@ -1138,6 +1138,17 @@ def run_daemon(client: FPLClient):
             time.sleep(60)
 
 
+def run_check_auth(client: FPLClient) -> int:
+    """Check that the FPL login works. Returns a shell exit code (0 = valid)."""
+    team_id_str = os.getenv("FPL_TEAM_ID", "").strip()
+    if not team_id_str.isdigit():
+        print("FAILED - FPL_TEAM_ID is not configured.")
+        return 1
+    ok, msg = client.validate_auth(int(team_id_str))
+    print(f"{'OK' if ok else 'FAILED'} - {msg}")
+    return 0 if ok else 1
+
+
 def main():
     load_environment()
 
@@ -1145,6 +1156,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Run full optimization simulation without live API submission")
     parser.add_argument("--execute", action="store_true", help="Execute live transfers & lineup on FPL API and alert Telegram")
     parser.add_argument("--post-deadline", action="store_true", help="Scan mini-league rivals and send post-deadline intelligence briefing")
+    parser.add_argument("--check-auth", action="store_true", help="Check that the FPL login works, then exit (exit code 1 if not)")
     parser.add_argument("--daemon", action="store_true", help="Run autonomous background scheduler loop (T-90m execution, T+5m scanner)")
     parser.add_argument(
         "--mode",
@@ -1166,7 +1178,9 @@ def main():
     force_mode = args.mode.upper() if args.mode else None
     force_chip = args.chip.lower() if args.chip else None
 
-    if args.daemon:
+    if args.check_auth:
+        sys.exit(run_check_auth(client))
+    elif args.daemon:
         run_daemon(client)
     elif args.post_deadline:
         run_post_deadline_intel(client)
