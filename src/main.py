@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
+from src.state import atomic_write_json
+from src.execution import build_plan, execute_plan, execution_path
+from src.chips import available_chips
 from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher, VaastavDataFetcher
 from src.engine.metrics import calculate_player_metrics
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
@@ -420,6 +423,17 @@ def run_pipeline(
     gw_id, deadline_time, is_next = get_active_gameweek(events)
     logger.info(f"Target Gameweek: GW{gw_id} | Deadline: {deadline_time}")
 
+    # Resume the original persisted decision, never optimize a second transfer plan after a restart.
+    resume_team = (os.getenv("FPL_TEAM_ID") or os.getenv("TEAM_ID") or "").strip()
+    if execute and resume_team:
+        saved_path = execution_path(int(resume_team), gw_id, deadline_time)
+        if saved_path.exists():
+            result = execute_plan(client, saved_path)
+            atomic_write_json(Path(os.getenv("STATE_DIR", "data")) / "latest_decision.json", result)
+            if result["status"] != "success":
+                logger.error("Saved execution remains unresolved for GW%s; check the live team", gw_id)
+            return result
+
     fixtures = []
     try:
         fixtures = client.get_fixtures()
@@ -461,8 +475,9 @@ def run_pipeline(
     )
 
     # 3. Retrieve current squad, selling prices, and bank
-    team_id_str = os.getenv("FPL_TEAM_ID", "").strip()
+    team_id_str = resume_team
     current_squad_ids: List[int] = []
+    live_chip_inventory = None
     selling_prices: Optional[Dict[int, float]] = None
     bank_m: float = custom_bank_m
     free_transfers: int = custom_ft
@@ -483,6 +498,7 @@ def run_pipeline(
 
                 logger.info(f"Fetching live squad for Team ID {team_id}...")
                 my_team_data = client.get_my_team(team_id)
+                live_chip_inventory = my_team_data.get("chips")
                 picks = my_team_data.get("picks", [])
                 current_squad_ids = [p["element"] for p in picks]
                 selling_prices = {
@@ -647,6 +663,38 @@ def run_pipeline(
                 f"Invalid forced risk mode '{forced_mode}'. Valid choices: DEFEND, NEUTRAL, CHASE. Using auto-derived mode."
             )
 
+    # Automated Chip Strategy Evaluation & Forced Chip Handling
+    enable_auto_chips = os.getenv("ENABLE_AUTO_CHIPS", "false").lower() in ("true", "1", "yes")
+    forced_chip = (force_chip or os.getenv("FORCE_CHIP", "")).strip().lower() or None
+    if forced_chip and forced_chip not in ("wildcard", "freehit", "bboost", "3xc"):
+        logger.warning(
+            f"Invalid forced chip '{forced_chip}'. Valid choices: wildcard, freehit, bboost, 3xc. Ignoring."
+        )
+        forced_chip = None
+
+    eligible_chips = available_chips(gw_id, live_chip_inventory, entry_history_data)
+    if eligible_chips is None:
+        eligible_chips = []
+        logger.warning("Chip availability could not be verified; chip activation disabled.")
+    chip_season_plan["chips_remaining"] = eligible_chips
+    logger.info("Eligible new chip activations for GW%s: %s", gw_id, eligible_chips)
+
+    # Enforce live availability for forced and automatic chips alike.
+    if forced_chip:
+        used_chips = set(chip_season_plan.get("chips_used", []))
+        if not used_chips and entry_history_data:
+            used_chips = {c.get("name") for c in entry_history_data.get("chips", []) if isinstance(c, dict)}
+        if forced_chip not in eligible_chips:
+            logger.warning(
+                f"⚠️ Cannot force chip '{forced_chip}': It is unavailable for this gameweek "
+                f"(used chips: {list(used_chips)}). Aborting forced chip activation."
+            )
+            forced_chip = None
+            enable_auto_chips = False
+        else:
+            chip_season_plan["forced_chip"] = forced_chip
+
+
     # 5. PuLP MILP Optimization & Automated Chip Evaluation
     logger.info("Running PuLP MILP solver (Multi-Period Horizon, Real Selling Prices & EO Shielding)...")
     opt_result = optimizer.optimize(
@@ -657,6 +705,8 @@ def run_pipeline(
         eo_weights=eo_weights,
         current_gw=gw_id,
         evaluate_chips=True,
+        available_chips=eligible_chips,
+        include_chip_candidates=enable_auto_chips or bool(forced_chip),
     )
 
     logger.info(f"Generated {len(opt_result.candidates)} candidate options:")
@@ -664,29 +714,6 @@ def run_pipeline(
         logger.info(
             f"  [{idx}] {cand.name} ➔ Net xP: {cand.net_xp:.2f} | 3-GW xP: {cand.multi_gw_xp:.2f} | Formation: {cand.formation} | Captain: {cand.captain.web_name if cand.captain else 'N/A'}"
         )
-
-    # Automated Chip Strategy Evaluation & Forced Chip Handling
-    enable_auto_chips = os.getenv("ENABLE_AUTO_CHIPS", "false").lower() in ("true", "1", "yes")
-    forced_chip = (force_chip or os.getenv("FORCE_CHIP", "")).strip().lower() or None
-    if forced_chip and forced_chip not in ("wildcard", "freehit", "bboost", "3xc"):
-        logger.warning(
-            f"Invalid forced chip '{forced_chip}'. Valid choices: wildcard, freehit, bboost, 3xc. Ignoring."
-        )
-        forced_chip = None
-
-    # Guard: verify forced chip has not already been used this season
-    if forced_chip:
-        used_chips = set(chip_season_plan.get("chips_used", []))
-        if not used_chips and entry_history_data:
-            used_chips = {c.get("name") for c in entry_history_data.get("chips", []) if isinstance(c, dict)}
-        if forced_chip in used_chips:
-            logger.warning(
-                f"⚠️ Cannot force chip '{forced_chip}': It has already been played this season "
-                f"(used chips: {list(used_chips)}). Aborting forced chip activation."
-            )
-            forced_chip = None
-        else:
-            chip_season_plan["forced_chip"] = forced_chip
 
     recommended_chip: Optional[str] = None
     triggered_chip_eval: Optional[Dict[str, Any]] = None
@@ -815,8 +842,19 @@ def run_pipeline(
             eo_weights=eo_weights,
             current_gw=gw_id,
             evaluate_chips=True,
+            available_chips=eligible_chips,
+            include_chip_candidates=enable_auto_chips or bool(forced_chip),
         )
         logger.info(f"Re-solved! Generated {len(opt_result.candidates)} clean candidate options without vetoed players.")
+        recommended_chip = forced_chip or (
+            opt_result.chip_evaluation.recommended_chip
+            if enable_auto_chips and opt_result.chip_evaluation else None
+        )
+        triggered_chip_eval = (
+            opt_result.chip_evaluation.evaluations[recommended_chip].model_dump()
+            if recommended_chip and opt_result.chip_evaluation else None
+        )
+
 
         decision = director.evaluate_and_decide(
             opt_result,
@@ -848,6 +886,10 @@ def run_pipeline(
         active_chip = forced_chip
         decision.selected_candidate.active_chip = active_chip
 
+    if active_chip and (active_chip not in eligible_chips or not (enable_auto_chips or forced_chip)):
+        # Do not clear just the flag: a chip squad may be unaffordable without that chip.
+        raise RuntimeError(f"Refusing candidate with unavailable or disabled chip: {active_chip}")
+
     logger.info("=" * 60)
     logger.info(f"FINAL DECISION: {decision.chosen_move_name} (Source: {decision.source})")
     if active_chip:
@@ -862,104 +904,14 @@ def run_pipeline(
             logger.info(f"  🚨 {alert}")
     logger.info("=" * 60)
 
-    # 7. Live Execution (if requested)
-    live_execution_success = False
-    if execute:
-        if not team_id_str:
-            logger.error("Live execution aborted: FPL_TEAM_ID is not configured.")
-        elif not client.ensure_authenticated():
-            logger.error("❌ Live execution aborted: Client authentication failed (token expired and refresh failed).")
-            TelegramNotifier().send_message(
-                f"🚨 *[LIVE EXECUTION ABORTED: AUTH FAILED]*\n\n"
-                f"Gameweek {gw_id} live transfers could *not* be submitted to FPL servers automatically.\n\n"
-                f"⏰ *Action Needed:* You have ~88 minutes before the deadline to apply manually:\n"
-                f"• *Transfers:* {decision.transfers_description}\n"
-                f"• *Captain:* {decision.captain_name} (C) | *Vice:* {decision.vice_captain_name} (VC)\n"
-                f"• *Hit Cost:* -{decision.selected_candidate.hit_cost} pts\n\n"
-                f"👉 Please make these changes in the FPL app or click your 'Sync Gegenbot' bookmark to retry."
-            )
-        else:
-            team_id = int(team_id_str)
-            cand = decision.selected_candidate
-            tx_success = True
-            lineup_success = True
-
-            # 7a. Transfers submission
-            if cand.transfers_count > 0 or cand.active_chip in ("wildcard", "freehit"):
-                chip_tx = cand.active_chip if cand.active_chip in ("wildcard", "freehit") else None
-                logger.info(
-                    f"Submitting {cand.transfers_count} live transfer(s) to FPL API "
-                    f"(Chip: {chip_tx or 'None'})..."
-                )
-                transfers_payload = {
-                    "chips": chip_tx,
-                    "chip": chip_tx,
-                    "entry": team_id,
-                    "event": gw_id,
-                    "transfers": [
-                        {
-                            "element_in": t.player_in.id,
-                            "element_out": t.player_out.id,
-                            "purchase_price": int(t.player_in.cost_m * 10),
-                            "selling_price": int(t.player_out.cost_m * 10),
-                        }
-                        for t in cand.transfers
-                    ],
-                }
-                try:
-                    tx_resp = client.post_transfers(transfers_payload)
-                    logger.info(f"Transfers successfully submitted: {tx_resp}")
-                except Exception as e:
-                    logger.error(f"Live transfer submission failed: {e}")
-                    tx_success = False
-
-            # 7b. Lineup & Captaincy submission
-            chip_lineup = cand.active_chip if cand.active_chip in ("bboost", "3xc") else None
-            logger.info(
-                f"Submitting live lineup & captaincy to FPL API "
-                f"(Chip: {chip_lineup or 'None'})..."
-            )
-            # 11 starters + 4 bench
-            picks_payload = []
-            # Starters 1-11 must be ordered by ascending element_type (GKP=1, DEF=2, MID=3, FWD=4)
-            sorted_starters = sorted(cand.starters, key=lambda p: p.element_type)
-            for idx, p in enumerate(sorted_starters, start=1):
-                picks_payload.append({
-                    "element": p.id,
-                    "position": idx,
-                    "is_captain": p.is_captain,
-                    "is_vice_captain": p.is_vice_captain,
-                })
-            # Bench 12-15
-            for idx, p in enumerate(cand.bench, start=12):
-                picks_payload.append({
-                    "element": p.id,
-                    "position": idx,
-                    "is_captain": False,
-                    "is_vice_captain": False,
-                })
-
-            lineup_payload = {
-                "chip": chip_lineup,
-                "picks": picks_payload,
-            }
-            try:
-                lineup_resp = client.post_lineup(team_id, lineup_payload)
-                logger.info(f"Lineup successfully submitted: {lineup_resp}")
-            except Exception as e:
-                logger.error(f"Live lineup submission failed: {e}")
-                lineup_success = False
-
-            live_execution_success = tx_success and lineup_success
-
-    # 8. Persist State to data/latest_decision.json
-    state_dir = Path("data")
+    # Build the decision snapshot before journaling live execution.
+    state_dir = Path(os.getenv("STATE_DIR", "data"))
     state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / "latest_decision.json"
 
     output_payload = {
-        "status": "success" if (not execute or live_execution_success) else "execution_failed",
-        "mode": "live_execution" if live_execution_success else ("dry_run" if not execute else "execution_failed"),
+        "status": "success",
+        "mode": "dry_run",
         "gameweek": gw_id,
         "deadline_time": deadline_time,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -971,8 +923,23 @@ def run_pipeline(
         "news_intelligence": [v.model_dump() for v in news_intel.values()] if news_intel else [],
     }
 
-    with open(state_file, "w", encoding="utf-8") as f:
-        json.dump(output_payload, f, indent=2)
+    live_execution_success = False
+    if execute:
+        if not team_id_str:
+            output_payload.update(status="execution_failed", mode="execution_failed",
+                                  execution_error="FPL_TEAM_ID is not configured")
+        else:
+            plan = build_plan(decision.selected_candidate, int(team_id_str), gw_id, output_payload)
+            output_payload = execute_plan(client, execution_path(int(team_id_str), gw_id, deadline_time), plan)
+        decision = DecisionOutput.model_validate(output_payload["decision"])
+        active_chip = output_payload["active_chip"]
+        live_execution_success = output_payload["status"] == "success"
+        if not live_execution_success:
+            TelegramNotifier().send_message(
+                f"🚨 Live execution incomplete for GW{gw_id}. Check your live team before making further changes."
+            )
+
+    atomic_write_json(state_file, output_payload)
     logger.info(f"State persisted to {state_file}")
 
     # 8b. Append to decision history log for autonomous performance tracking
@@ -1018,7 +985,7 @@ def run_post_deadline_intel(client: FPLClient, target_gw: Optional[int] = None):
     scanner = LeagueScanner(client)
 
     # Load my squad if available in latest_decision.json
-    state_file = Path("data/latest_decision.json")
+    state_file = Path(os.getenv("STATE_DIR", "data")) / "latest_decision.json"
     my_team_set: Set[int] = set()
     if state_file.exists():
         try:
@@ -1043,8 +1010,7 @@ def run_post_deadline_intel(client: FPLClient, target_gw: Optional[int] = None):
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             data["league_analysis"] = analysis.model_dump()
-            with open(state_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(state_file, data)
         except Exception as e:
             logger.warning(f"Could not update state file: {e}")
 
@@ -1111,8 +1077,9 @@ def run_daemon(client: FPLClient):
             # Trigger T-90m Pre-Deadline Execution
             if 0 < delta_minutes <= 90 and gw_id not in executed_gameweeks:
                 logger.info(f"⚡ T-90m threshold reached for GW{gw_id}! Triggering squad optimization & execution...")
-                run_pipeline(client, dry_run=False, execute=True)
-                executed_gameweeks.add(gw_id)
+                result = run_pipeline(client, dry_run=False, execute=True)
+                if result.get("status") == "success":
+                    executed_gameweeks.add(gw_id)
 
             # Trigger T+5m Post-Deadline Scan
             if -180 <= delta_minutes <= -5 and gw_id not in post_scanned_gameweeks:

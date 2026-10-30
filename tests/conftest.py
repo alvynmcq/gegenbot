@@ -1,11 +1,30 @@
 """Shared pytest fixtures for Gegenbot test suite."""
 
+import os
+
+# Disable dotenv before application modules are imported during test collection.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 import pytest
+import requests
 
 
 @pytest.fixture(autouse=True)
 def isolate_test_data_dir(tmp_path, monkeypatch):
     """Ensure test runs never overwrite live production data directory."""
+    for key in tuple(os.environ):
+        if key.startswith(("FPL_", "LLM_", "TELEGRAM_", "FIRECRAWL_", "TAVILY_", "THE_ODDS_")):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("DASHBOARD_SYNC_SECRET", raising=False)
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "false")
+    monkeypatch.setenv("ENABLE_LIVE_NEWS", "false")
+    monkeypatch.setenv("ENABLE_REDDIT_NEWS", "false")
+
+    def block_network(*args, **kwargs):
+        raise AssertionError("Tests must mock HTTP requests")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", block_network)
+    monkeypatch.chdir(tmp_path)
     test_data = tmp_path / "data"
     test_data.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("STATE_DIR", str(test_data))

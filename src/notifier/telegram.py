@@ -80,8 +80,7 @@ class TelegramNotifier:
             logger.info("Telegram notification successfully dispatched.")
             return True
         except Exception as e:
-            err_detail = getattr(e, "response", None)
-            detail_msg = err_detail.text if err_detail is not None else str(e)
+            detail_msg = type(e).__name__
             logger.warning(f"Telegram dispatch with parse_mode={parse_mode} failed ({detail_msg}). Retrying with plain text fallback...")
             try:
                 payload.pop("parse_mode", None)
@@ -90,7 +89,7 @@ class TelegramNotifier:
                 logger.info("Telegram notification successfully dispatched (plain text fallback).")
                 return True
             except Exception as e2:
-                logger.error(f"Failed to dispatch Telegram message: {e2}")
+                logger.error("Failed to dispatch Telegram message (%s)", type(e2).__name__)
                 return False
 
     def build_pre_deadline_alert(

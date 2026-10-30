@@ -225,10 +225,11 @@ def test_api_auth_sync_endpoint(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("FPL_AUTH_TOKEN=\nFPL_REFRESH_TOKEN=\n")
     from src.dashboard.app import create_app
+    monkeypatch.setenv("DASHBOARD_SYNC_SECRET", "test-pairing-secret")
     app = create_app()
     test_client = app.test_client()
 
-    res = test_client.post("/api/auth/sync", json={
+    res = test_client.post("/api/auth/sync", headers={"X-Gegenbot-Sync-Secret": "test-pairing-secret"}, json={
         "access_token": "mock_browser_access",
         "refresh_token": "mock_browser_refresh",
     })
@@ -313,3 +314,65 @@ def test_check_auth_reports_result(monkeypatch, capsys):
 
     monkeypatch.setenv("FPL_TEAM_ID", "")
     assert run_check_auth(client) == 1
+
+
+def test_auth_sync_requires_secret_and_restricts_origins(monkeypatch):
+    from src.dashboard.app import create_app
+    monkeypatch.setenv("DASHBOARD_SYNC_SECRET", "pairing-secret")
+    client = create_app().test_client()
+    payload = {"access_token": "browser-token"}
+    assert client.post("/api/auth/sync", json=payload).status_code == 403
+    headers = {"X-Gegenbot-Sync-Secret": "pairing-secret", "Origin": "https://untrusted.example"}
+    rejected = client.post("/api/auth/sync", json=payload, headers=headers)
+    assert rejected.status_code == 403
+    assert "Access-Control-Allow-Origin" not in rejected.headers
+    preflight = client.options("/api/auth/sync", headers={"Origin": "https://fantasy.premierleague.com"})
+    assert preflight.headers["Access-Control-Allow-Origin"] == "https://fantasy.premierleague.com"
+    assert "X-Gegenbot-Sync-Secret" in preflight.headers["Access-Control-Allow-Headers"]
+
+
+def test_auth_sync_works_without_writing_read_only_env(tmp_path, monkeypatch):
+    from src.dashboard.app import create_app
+    monkeypatch.setenv("DASHBOARD_SYNC_SECRET", "pairing-secret")
+    env_file = tmp_path / ".env"
+    original = "FPL_AUTH_TOKEN=old\nFPL_REFRESH_TOKEN=old-refresh\n"
+    env_file.write_text(original)
+    env_file.chmod(0o400)
+    client = create_app().test_client()
+    response = client.post("/api/auth/sync", json={"access_token": "new", "refresh_token": "new-refresh"},
+                           headers={"X-Gegenbot-Sync-Secret": "pairing-secret"})
+    assert response.status_code == 200
+    assert env_file.read_text() == original
+    saved = json.loads(FPLAuth.DEFAULT_STATE_PATH.read_text())
+    assert saved["refresh_token"] == "new-refresh"
+    assert FPLAuth.DEFAULT_STATE_PATH.stat().st_mode & 0o777 == 0o600
+
+
+def test_auth_sync_reports_persistence_failure(monkeypatch):
+    from src.dashboard.app import create_app
+    monkeypatch.setenv("DASHBOARD_SYNC_SECRET", "pairing-secret")
+    monkeypatch.setattr(FPLAuth, "save_state", lambda self: False)
+    response = create_app().test_client().post("/api/auth/sync", json={"access_token": "new"},
+                                             headers={"X-Gegenbot-Sync-Secret": "pairing-secret"})
+    assert response.status_code == 500
+
+
+@pytest.mark.parametrize("payload", [[], {"access_token": 123}, {"access_token": "new", "refresh_token": []}])
+def test_auth_sync_rejects_invalid_payloads(monkeypatch, payload):
+    from src.dashboard.app import create_app
+    monkeypatch.setenv("DASHBOARD_SYNC_SECRET", "pairing-secret")
+    response = create_app().test_client().post("/api/auth/sync", json=payload,
+                                             headers={"X-Gegenbot-Sync-Secret": "pairing-secret"})
+    assert response.status_code == 400
+
+
+def test_generated_pairing_secret_survives_dashboard_restart(tmp_path):
+    from src.dashboard.app import create_app
+    create_app()
+    secret_file = tmp_path / "data" / "dashboard_sync_secret.json"
+    secret = json.loads(secret_file.read_text())["secret"]
+    assert len(secret) >= 32
+    assert secret_file.stat().st_mode & 0o777 == 0o600
+    response = create_app().test_client().post("/api/auth/sync", json={"access_token": "new"},
+                                             headers={"X-Gegenbot-Sync-Secret": secret})
+    assert response.status_code == 200

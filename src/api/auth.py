@@ -8,8 +8,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from src.state import atomic_write_json
+
 from dotenv import dotenv_values, load_dotenv
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,9 @@ class FPLAuth:
         token_expiry: Optional[float] = None,
         state_file: Optional[Union[str, Path]] = None,
     ):
-        self.state_file = Path(state_file) if state_file else self.DEFAULT_STATE_PATH
+        self.state_file = (Path(state_file) if state_file else
+                           Path(os.environ["STATE_DIR"]) / "auth_state.json"
+                           if os.getenv("STATE_DIR") else self.DEFAULT_STATE_PATH)
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = refresh_token
         self.token_expiry: Optional[float] = token_expiry
@@ -175,17 +179,7 @@ class FPLAuth:
                 "token_type": "Bearer",
                 "updated_at": time.time(),
             }
-            tmp_path = self.state_file.with_suffix(".tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-            try:
-                tmp_path.replace(self.state_file)
-            except PermissionError:
-                if self.state_file.exists():
-                    self.state_file.unlink()
-                    tmp_path.replace(self.state_file)
-                else:
-                    raise
+            atomic_write_json(self.state_file, payload)
             logger.info(f"Saved active authentication tokens to {self.state_file}")
             return True
         except Exception as e:
@@ -204,7 +198,8 @@ class FPLAuth:
             self.refresh_token = refresh_token.strip()
         if expires_in is not None:
             self.token_expiry = time.time() + float(expires_in)
-        self.save_state()
+        if not self.save_state():
+            raise RuntimeError("Could not persist authentication state")
 
     def get_headers(self, authenticated: bool = False) -> Dict[str, str]:
         """Generate request headers with optional authentication token headers."""

@@ -1068,6 +1068,7 @@ def test_pipeline_with_auto_chip_execution(tmp_path, mock_bootstrap_data, mock_f
     mock_client.get_bootstrap_static.return_value = mock_bootstrap_data
     mock_client.get_fixtures.return_value = mock_fixtures_data
     mock_client.get_my_team.return_value = {
+        "chips": [{"name": name, "status_for_entry": "available", "start_event": 1, "stop_event": 38} for name in ("wildcard", "freehit", "bboost", "3xc")],
         "picks": [{"element": i} for i in [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]],
         "transfers": {"bank": 10, "limit": 1},
     }
@@ -1108,6 +1109,7 @@ def test_pipeline_wildcard_recommended_but_standard_move_selected(tmp_path, mock
     mock_client.get_fixtures.return_value = mock_fixtures_data
     mock_client.get_entry_history.return_value = {}
     mock_client.get_my_team.return_value = {
+        "chips": [{"name": name, "status_for_entry": "available", "start_event": 1, "stop_event": 38} for name in ("wildcard", "freehit", "bboost", "3xc")],
         # Squad with low form players so Wildcard scratch squad provides massive xP gain
         "picks": [{"element": i, "selling_price": 65} for i in [3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 27, 28, 29]],
         "transfers": {"bank": 100, "limit": 1},
@@ -1170,6 +1172,7 @@ def test_pipeline_wildcard_recommended_and_rebuild_selected(tmp_path, mock_boots
     mock_client.get_fixtures.return_value = mock_fixtures_data
     mock_client.get_entry_history.return_value = {}
     mock_client.get_my_team.return_value = {
+        "chips": [{"name": name, "status_for_entry": "available", "start_event": 1, "stop_event": 38} for name in ("wildcard", "freehit", "bboost", "3xc")],
         # Squad with low form players so Wildcard scratch squad provides massive xP gain
         "picks": [{"element": i, "selling_price": 65} for i in [3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 27, 28, 29]],
         "transfers": {"bank": 100, "limit": 1},
@@ -1261,6 +1264,7 @@ def test_pipeline_force_chip_triple_captain(mock_bootstrap_data, mock_fixtures_d
     mock_client.get_fixtures.return_value = mock_fixtures_data
     mock_client.get_entry_history.return_value = {"chips": []}
     mock_client.get_my_team.return_value = {
+        "chips": [{"name": name, "status_for_entry": "available", "start_event": 1, "stop_event": 38} for name in ("wildcard", "freehit", "bboost", "3xc")],
         "picks": [{"element": i} for i in [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]],
         "transfers": {"bank": 10, "limit": 1},
     }
@@ -1295,6 +1299,7 @@ def test_pipeline_force_chip_wildcard(mock_bootstrap_data, mock_fixtures_data, m
     mock_client.get_fixtures.return_value = mock_fixtures_data
     mock_client.get_entry_history.return_value = {"chips": []}
     mock_client.get_my_team.return_value = {
+        "chips": [{"name": name, "status_for_entry": "available", "start_event": 1, "stop_event": 38} for name in ("wildcard", "freehit", "bboost", "3xc")],
         "picks": [{"element": i, "selling_price": 50} for i in [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]],
         "transfers": {"bank": 50, "limit": 1},
     }
@@ -1317,6 +1322,7 @@ def test_pipeline_force_chip_wildcard(mock_bootstrap_data, mock_fixtures_data, m
 
 def test_pipeline_force_chip_already_used_guard(mock_bootstrap_data, mock_fixtures_data, monkeypatch):
     """Verify that forcing a chip that has already been used in FPL entry history is safely aborted."""
+    monkeypatch.setenv("ENABLE_AUTO_CHIPS", "true")
     monkeypatch.setenv("FPL_TEAM_ID", "123456")
 
     mock_client = MagicMock(spec=FPLClient)

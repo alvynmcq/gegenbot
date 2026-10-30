@@ -130,7 +130,7 @@ class BookmakerOddsFetcher:
                 logger.debug(f"The-Odds-API returned status {res.status_code}: {res.text}")
                 return None
         except Exception as e:
-            logger.warning(f"Could not reach The-Odds-API endpoint: {e}")
+            logger.warning("Could not reach The-Odds-API endpoint (%s)", type(e).__name__)
             return None
 
     def compute_player_odds_profiles(

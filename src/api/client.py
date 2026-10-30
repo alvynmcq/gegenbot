@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from .auth import FPLAuth
+from src.state import state_lock
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,10 @@ class FPLClient:
             self.session.cookies.set("access_token", clean_token, domain=".premierleague.com", path="/")
 
     def refresh_access_token(self) -> bool:
+        with state_lock(self.auth.state_file):
+            return self._refresh_access_token_locked()
+
+    def _refresh_access_token_locked(self) -> bool:
         """
         Exchange the refresh token for a new access token.
         PingOne rotates the refresh token on every exchange, so the new pair is saved
@@ -116,30 +121,8 @@ class FPLClient:
             expires_in=data.get("expires_in", 3600),
         )
         self._sync_session_cookies()
-        self._sync_tokens_to_env(new_access, new_refresh)
         logger.info("Refreshed FPL access token and saved it to auth_state.json.")
         return True
-
-    def _sync_tokens_to_env(self, access_token: str, refresh_token: Optional[str] = None) -> None:
-        """Persist refreshed access and refresh tokens to .env file if present."""
-        if "PYTEST_CURRENT_TEST" in os.environ:
-            return
-        env_path = Path(".env")
-        if not env_path.exists():
-            return
-        if not os.access(env_path, os.W_OK):
-            logger.debug(".env is read-only; tokens are kept in auth_state.json only.")
-            return
-        try:
-            import re
-            content = env_path.read_text(encoding="utf-8")
-            content = re.sub(r"^FPL_AUTH_TOKEN=.*$", f"FPL_AUTH_TOKEN={access_token}", content, flags=re.MULTILINE)
-            if refresh_token:
-                content = re.sub(r"^FPL_REFRESH_TOKEN=.*$", f"FPL_REFRESH_TOKEN={refresh_token}", content, flags=re.MULTILINE)
-            env_path.write_text(content, encoding="utf-8")
-            logger.info("Synchronized updated tokens to .env file.")
-        except Exception as e:
-            logger.warning(f"Could not persist refreshed tokens to .env: {e}")
 
     def ensure_authenticated(self) -> bool:
         """
@@ -168,6 +151,9 @@ class FPLClient:
         backoff_factor: float = 1.5,
     ) -> Any:
         """Execute HTTP request with 429 rate limit backoff, 401 token refresh interceptor, and error handling."""
+        # Mutations may have committed even if their response was lost. Reconcile instead of replaying.
+        if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+            max_retries = 1
         url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
         token_refreshed = False
 

@@ -1424,6 +1424,8 @@ class FPLOptimizer:
         eo_weights: Optional[Dict[int, float]] = None,
         current_gw: Optional[int] = None,
         evaluate_chips: bool = True,
+        available_chips: Optional[List[str]] = None,
+        include_chip_candidates: bool = True,
     ) -> OptimizationResult:
         """
         Generate 7 strategic candidate moves with exact FPL selling math,
@@ -1520,11 +1522,12 @@ class FPLOptimizer:
                 baseline_candidate=best_candidate,
                 current_gw=current_gw,
                 eo_weights=eo_weights,
+                available_chips=available_chips,
             )
 
         # Option 7: Recommended Active Chip Candidate or Rank #3 2-Transfer Move
         opt_7_added = False
-        if chip_result and chip_result.recommended_chip:
+        if include_chip_candidates and chip_result and chip_result.recommended_chip:
             rec_chip_eval = chip_result.evaluations.get(chip_result.recommended_chip)
             if rec_chip_eval and rec_chip_eval.squad_candidate:
                 chip_cand = rec_chip_eval.squad_candidate.model_copy(deep=True)

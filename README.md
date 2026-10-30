@@ -147,6 +147,16 @@ FPL signs in through PingOne (`account.premierleague.com`) and has no password l
 1. Log in at https://fantasy.premierleague.com.
 2. Send the tokens to Gegenbot with the dashboard bookmarklet (`/api/auth/sync`), or copy `refresh_token` from DevTools → Application → Local Storage → `oidc.user:...` into `FPL_REFRESH_TOKEN` in `.env`.
 
+Token syncing requires a pairing secret. After starting the dashboard, open `data/dashboard_sync_secret.json` locally and copy its `secret` value. You can instead set `DASHBOARD_SYNC_SECRET` in `.env` before starting the dashboard. Keep this value private; it authorizes replacing the bot's login tokens.
+
+Replace any older sync bookmarklet with a bookmark whose URL is the following code. Run it while signed in at `https://fantasy.premierleague.com`; enter your dashboard URL and pairing secret when prompted. The secret is not stored in the bookmark.
+
+```javascript
+javascript:(async()=>{try{const k=Object.keys(localStorage).find(k=>k.startsWith('oidc.user:'));if(!k)throw Error('No FPL login found. Sign in first.');const t=JSON.parse(localStorage.getItem(k));const u=prompt('Gegenbot dashboard URL','http://localhost:5000');if(!u)return;const s=prompt('Gegenbot pairing secret');if(!s)return;const r=await fetch(new URL('/api/auth/sync',u),{method:'POST',headers:{'Content-Type':'application/json','X-Gegenbot-Sync-Secret':s},body:JSON.stringify({access_token:t.access_token,refresh_token:t.refresh_token||''})});const d=await r.json();alert(d.message||'Sync finished');}catch(e){alert('Sync failed: '+e.message);}})();
+```
+
+Browser security settings may block requests from the HTTPS FPL site to a plain HTTP dashboard. In that case, use HTTPS for the dashboard or copy the refresh token into `.env` as described above.
+
 To check the login works, run `python3 src/main.py --check-auth` (or `docker exec fpl_worker python src/main.py --check-auth`). It prints `OK` or `FAILED` with the reason.
 
 PingOne issues a new refresh token every time one is used and revokes the old one. Gegenbot saves each new pair to `data/auth_state.json`, which is the live copy (Docker mounts `.env` read-only), so don't delete that file. If the token is ever rejected, the daemon sends a Telegram alert; repeat the steps above.
@@ -171,6 +181,8 @@ docker compose up -d --build
 ```
 Access the web dashboard at `http://localhost:5000`.
 
+Live execution keeps a journal under `data/executions/`, keyed by team, gameweek, and deadline. Restarting resumes the saved plan. Completed plans are not submitted again, and failed runs are not marked complete. When a response is lost, the bot compares the live squad, lineup, and chip history before continuing. If the outcome cannot be confirmed, it leaves execution paused and sends an alert. Check the FPL app and the journal before taking further action; deleting a journal can allow a second submission. A paused plan can be completed manually in FPL, then reconciled by running `--execute` again before the deadline. Do not delete `data/` during upgrades.
+
 ---
 
 ## 🛠️ Testing & Verification
@@ -180,7 +192,7 @@ Gegenbot includes a comprehensive unit test suite covering auth, data fetchers, 
 ```bash
 pytest
 ```
-*All 73 tests passing (100%).*
+The suite includes mocked execution recovery checks and blocks unmocked network requests. Tests use temporary state directories and do not load `.env`.
 
 ---
 
@@ -192,7 +204,7 @@ pytest
 ├── requirements.txt         # Python dependencies (PuLP, highspy, requests, pandas, Flask, etc.)
 ├── .env.example             # Template configuration file
 ├── data/                    # Local cache (projections, decisions, auth tokens)
-├── tests/                   # Full unit and integration test suite (73 tests)
+├── tests/                   # Full unit and integration test suite
 └── src/
     ├── agent/               # AI Decision Director (LLM reasoning, quote decryption, veto logic)
     ├── api/                 # FPL API clients, auth token manager, and endpoint handlers
