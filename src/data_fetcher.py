@@ -1,12 +1,14 @@
 """Data ingestion and mapping helper for external FPL Core Insights and expected points datasets."""
 
+import datetime as dt
 import io
 import logging
+import math
 import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import requests
@@ -39,6 +41,71 @@ def _normalize_name(name: str) -> str:
     # Convert to lowercase and strip punctuation/extra whitespace
     clean_name = re.sub(r"[^a-zA-Z0-9\s]", "", ascii_name).strip().lower()
     return re.sub(r"\s+", " ", clean_name)
+
+
+def forecast_season(events):
+    """Derive the FPL season from GW1, independent of the host date."""
+    opener = next((event for event in events if event.get("id") == 1), {})
+    try:
+        year = dt.date.fromisoformat(opener["deadline_time"][:10]).year
+    except (KeyError, TypeError, ValueError):
+        return None
+    return f"{year}-{year + 1}"
+
+
+def fresh_projection_rows(df, season, gameweek, now=None):
+    """Require explicit provenance, including the forecast issue time, for runtime CSVs."""
+    if df is None or season is None or not {"season", "target_gameweek", "as_of"} <= set(df.columns):
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    issued = pd.to_datetime(df["as_of"], format="ISO8601", utc=True, errors="coerce")
+    rows = df.loc[
+        df["season"].astype(str).str.strip().eq(season)
+        & pd.to_numeric(df["target_gameweek"], errors="coerce").eq(gameweek)
+        & issued.between(now - dt.timedelta(hours=48), now)
+    ]
+    if rows.empty:
+        return None
+    # A file may contain multiple snapshots of the same player.
+    return rows.loc[issued.loc[rows.index].eq(issued.loc[rows.index].max())]
+
+
+def verified_match_logs(df, fixtures, target_gameweek):
+    """Bind archived rows to completed official fixtures by ID, round and kickoff."""
+    required = {"fixture", "kickoff_time", "minutes"}
+    if df is None or not required <= set(df.columns):
+        return None
+    round_column = "round" if "round" in df.columns else "GW"
+    element_column = "element" if "element" in df.columns else "id"
+    if not {round_column, element_column} <= set(df.columns):
+        return None
+    completed = {
+        fixture["id"]: (fixture["event"], fixture["kickoff_time"])
+        for fixture in fixtures
+        if fixture.get("finished") and fixture.get("event") is not None
+        and fixture["event"] < target_gameweek and fixture.get("id") and fixture.get("kickoff_time")
+    }
+    if not completed:
+        return None
+    df = df.reset_index(drop=True)
+    ids = pd.to_numeric(df["fixture"], errors="coerce")
+    rounds = pd.to_numeric(df[round_column], errors="coerce")
+    kickoff = pd.to_datetime(df["kickoff_time"], format="ISO8601", utc=True, errors="coerce")
+    expected_round = ids.map({key: value[0] for key, value in completed.items()})
+    expected_kickoff = pd.to_datetime(
+        ids.map({key: value[1] for key, value in completed.items()}),
+        format="ISO8601", utc=True, errors="coerce",
+    )
+    minutes = pd.to_numeric(df["minutes"], errors="coerce")
+    matches = rounds.eq(expected_round) & kickoff.eq(expected_kickoff) & minutes.between(0, 90)
+    latest_round = max(event for event, _ in completed.values())
+    latest_ids = {key for key, (event, _) in completed.items() if event == latest_round}
+    if not latest_ids <= set(ids.loc[matches]):
+        return None
+    verified = df.loc[matches].drop_duplicates([element_column, "fixture"], keep="last").copy()
+    verified["minutes"] = minutes.loc[verified.index]
+    verified[round_column] = rounds.loc[verified.index]
+    return verified
 
 
 class FPLCoreInsightsFetcher:
@@ -88,11 +155,15 @@ class FPLCoreInsightsFetcher:
         self,
         csv_content: Optional[str] = None,
         force_url: Optional[str] = None,
+        *, season: Optional[str] = None, gameweek: Optional[int] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch and parse projections CSV from string content, local file, or remote URL.
         Local CSV files take priority over remote scraping.
         """
+        def validate(frame):
+            return fresh_projection_rows(frame, season, gameweek) if gameweek is not None else frame
+
         # 1. Direct CSV content provided (e.g. in unit tests or memory cache)
         if csv_content is not None:
             try:
@@ -102,7 +173,7 @@ class FPLCoreInsightsFetcher:
                     return None
                 df = pd.read_csv(io.StringIO(csv_content))
                 logger.info(f"Loaded {len(df)} projection records from provided CSV content.")
-                return df
+                return validate(df)
             except Exception as e:
                 logger.warning(f"Failed to parse provided CSV content: {e}")
                 return None
@@ -123,8 +194,8 @@ class FPLCoreInsightsFetcher:
                     if header_preview.startswith("<!DOCTYPE") or header_preview.startswith("<html"):
                         logger.warning(f"Local file {candidate} contains HTML instead of CSV projections. Skipping.")
                         continue
-                    df = pd.read_csv(candidate)
-                    if not df.empty:
+                    df = validate(pd.read_csv(candidate))
+                    if df is not None and not df.empty:
                         logger.info(f"Loaded {len(df)} projection records from local file: {candidate}")
                         return df
                 except Exception as e:
@@ -135,8 +206,11 @@ class FPLCoreInsightsFetcher:
         if force_url:
             target_urls.append(force_url)
         elif self.url:
-            target_urls.append(self.url)
-            if self.FALLBACK_GITHUB_URL not in target_urls:
+            url = self.url
+            if season and url == self.PRIMARY_GITHUB_URL:
+                url = url.replace("/2026-2027/", f"/{season}/")
+            target_urls.append(url)
+            if gameweek is None and self.FALLBACK_GITHUB_URL not in target_urls:
                 target_urls.append(self.FALLBACK_GITHUB_URL)
 
         headers = {
@@ -152,8 +226,8 @@ class FPLCoreInsightsFetcher:
                     text_content = resp.text.strip()
                     if text_content and not text_content.startswith("<!DOCTYPE") and not text_content.startswith("<html"):
                         try:
-                            df = pd.read_csv(io.StringIO(text_content))
-                            if not df.empty:
+                            df = validate(pd.read_csv(io.StringIO(text_content)))
+                            if df is not None and not df.empty:
                                 logger.info(f"Successfully fetched and parsed {len(df)} records from {target_url}")
                                 return df
                         except Exception as parse_err:
@@ -221,13 +295,6 @@ class FPLCoreInsightsFetcher:
             if gw_col:
                 break
 
-        if gw_col is None:
-            # Fallback to first numeric column that might represent projections
-            for col in df.columns:
-                if col not in [id_col, name_col, team_col] and pd.api.types.is_numeric_dtype(df[col]):
-                    gw_col = col
-                    break
-
         if gw_col is None and "ep_next" not in cols_lower:
             logger.warning("Projections DataFrame does not contain recognizable ID, Name, or xP columns.")
             return {}
@@ -288,7 +355,7 @@ class FPLCoreInsightsFetcher:
             if gw_col and gw_col in row:
                 try:
                     raw_val = float(row[gw_col])
-                    if not pd.isna(raw_val):
+                    if math.isfinite(raw_val):
                         xp_val = round(max(0.0, raw_val), 2)
                 except (ValueError, TypeError):
                     pass
@@ -296,7 +363,7 @@ class FPLCoreInsightsFetcher:
             if xp_val is None and "ep_next" in cols_lower:
                 try:
                     raw_ep = float(row[cols_lower["ep_next"]])
-                    if not pd.isna(raw_ep):
+                    if math.isfinite(raw_ep):
                         xp_val = round(max(0.0, raw_ep), 2)
                 except (ValueError, TypeError):
                     pass
@@ -305,13 +372,15 @@ class FPLCoreInsightsFetcher:
                 continue
 
             # Calculate discounted multi-week projection with dynamic decay weighting
+            xp_by_gameweek = {current_event: xp_val}
             multi_gw_sum = xp_val
             has_future_cols = False
             for t_idx, col_name in future_gw_cols:
                 if col_name in row:
                     try:
                         p_future = float(row[col_name])
-                        if not pd.isna(p_future):
+                        if math.isfinite(p_future):
+                            xp_by_gameweek[current_event + t_idx] = max(0.0, p_future)
                             multi_gw_sum += decay_weights[t_idx] * max(0.0, p_future)
                             has_future_cols = True
                     except (ValueError, TypeError):
@@ -366,6 +435,7 @@ class FPLCoreInsightsFetcher:
                 mapped_projections[matched_element_id] = {
                     "fplreview_xp": xp_val,
                     "fplreview_xp_3gw": xp_3gw_val,
+                    "xp_by_gameweek": xp_by_gameweek,
                     "xg_90": xg_90,
                     "xa_90": xa_90,
                     "xgi_90": xgi_90,
@@ -494,7 +564,6 @@ class VaastavDataFetcher:
     Supplies rolling xGI/90, xGC/90, actual minutes, and start reliability.
     """
     DEFAULT_SEASON = "2026-27"
-    FALLBACK_SEASONS = ["2026-27", "2025-26", "2024-25"]
     BASE_GITHUB_RAW = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
 
     def __init__(
@@ -509,41 +578,34 @@ class VaastavDataFetcher:
         self.local_dir = Path(local_dir or os.getenv("VAASTAV_LOCAL_DIR", "data"))
         self.timeout = timeout
 
-    def fetch_merged_gw(self) -> Optional[pd.DataFrame]:
+    def fetch_merged_gw(self, *, fixtures=None, gameweek=None) -> Optional[pd.DataFrame]:
         """Fetch merged_gw.csv from local cache or remote GitHub repository."""
-        candidate_paths = [
-            self.local_dir / "vaastav_merged_gw.csv",
-            self.local_dir / "merged_gw.csv",
-            Path("data/vaastav_merged_gw.csv"),
-            Path("data/merged_gw.csv"),
-        ]
+        def validate(frame):
+            return verified_match_logs(frame, fixtures, gameweek) if gameweek is not None else frame
+
+        candidate_paths = [self.local_dir / self.season / "merged_gw.csv"]
         for p in candidate_paths:
-            if p.exists() and p.is_file():
+            if p.is_file() and dt.datetime.now().timestamp() - p.stat().st_mtime < 21600:
                 try:
-                    df = pd.read_csv(p)
-                    if not df.empty:
+                    df = validate(pd.read_csv(p))
+                    if df is not None and not df.empty:
                         logger.info(f"Loaded {len(df)} records from local Vaastav merged_gw file: {p}")
                         return df
                 except Exception as e:
                     logger.warning(f"Failed to read local Vaastav merged_gw CSV ({p}): {e}")
 
         target_urls = [f"{self.base_url}/gws/merged_gw.csv"]
-        for s in self.FALLBACK_SEASONS:
-            fallback_url = f"{self.BASE_GITHUB_RAW}/{s}/gws/merged_gw.csv"
-            if fallback_url not in target_urls:
-                target_urls.append(fallback_url)
-
         headers = {"User-Agent": "Gegenbot-FPL-Engine/2.0", "Accept": "text/csv, text/plain, */*"}
         for url in target_urls:
             try:
                 resp = requests.get(url, headers=headers, timeout=self.timeout)
                 if resp.status_code == 200 and resp.text.strip() and not resp.text.strip().startswith("<!DOCTYPE") and not resp.text.strip().startswith("<html"):
-                    df = pd.read_csv(io.StringIO(resp.text))
-                    if not df.empty:
+                    df = validate(pd.read_csv(io.StringIO(resp.text)))
+                    if df is not None and not df.empty:
                         logger.info(f"Successfully fetched {len(df)} Vaastav gameweek records from {url}")
                         try:
-                            self.local_dir.mkdir(parents=True, exist_ok=True)
-                            df.to_csv(self.local_dir / "vaastav_merged_gw.csv", index=False)
+                            candidate_paths[0].parent.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(candidate_paths[0], index=False)
                         except Exception:
                             pass
                         return df
@@ -554,14 +616,9 @@ class VaastavDataFetcher:
 
     def fetch_players_raw(self) -> Optional[pd.DataFrame]:
         """Fetch players_raw.csv from local cache or remote GitHub repository."""
-        candidate_paths = [
-            self.local_dir / "vaastav_players_raw.csv",
-            self.local_dir / "players_raw.csv",
-            Path("data/vaastav_players_raw.csv"),
-            Path("data/players_raw.csv"),
-        ]
+        candidate_paths = [self.local_dir / self.season / "players_raw.csv"]
         for p in candidate_paths:
-            if p.exists() and p.is_file():
+            if p.is_file() and dt.datetime.now().timestamp() - p.stat().st_mtime < 21600:
                 try:
                     df = pd.read_csv(p)
                     if not df.empty:
@@ -571,11 +628,6 @@ class VaastavDataFetcher:
                     logger.warning(f"Failed to read local Vaastav players_raw CSV ({p}): {e}")
 
         target_urls = [f"{self.base_url}/players_raw.csv"]
-        for s in self.FALLBACK_SEASONS:
-            fallback_url = f"{self.BASE_GITHUB_RAW}/{s}/players_raw.csv"
-            if fallback_url not in target_urls:
-                target_urls.append(fallback_url)
-
         headers = {"User-Agent": "Gegenbot-FPL-Engine/2.0", "Accept": "text/csv, text/plain, */*"}
         for url in target_urls:
             try:
@@ -585,8 +637,8 @@ class VaastavDataFetcher:
                     if not df.empty:
                         logger.info(f"Successfully fetched {len(df)} Vaastav players_raw records from {url}")
                         try:
-                            self.local_dir.mkdir(parents=True, exist_ok=True)
-                            df.to_csv(self.local_dir / "vaastav_players_raw.csv", index=False)
+                            candidate_paths[0].parent.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(candidate_paths[0], index=False)
                         except Exception:
                             pass
                         return df
@@ -690,6 +742,7 @@ class VaastavDataFetcher:
                         rolling_xgi_90 = round((total_xgi / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgi_90", 0.0))
                         rolling_xgc_90 = round((total_xgc / (total_mins / 90.0)), 2) if total_mins >= 45 else (results.get(p_id, {}).get("season_xgc_90", 0.0))
                         avg_mins = round(total_mins / matches_count, 1) if matches_count > 0 else 0.0
+                        appearances = int((group["minutes"] > 0).sum()) if "minutes" in group else 0
                         starts_ratio = round(total_starts / matches_count, 2) if matches_count > 0 else 1.0
 
                         # Regression delta over recent window: positive means underperformed expected (buy candidate)
@@ -705,6 +758,7 @@ class VaastavDataFetcher:
                             "rolling_xgi_90": rolling_xgi_90,
                             "rolling_xgc_90": rolling_xgc_90,
                             "rolling_minutes_avg": avg_mins,
+                            "rolling_minutes_when_playing": round(total_mins / appearances, 1) if appearances else None,
                             "starts_ratio": starts_ratio,
                             "recent_matches_count": matches_count,
                             "xgi_delta": xgi_delta,

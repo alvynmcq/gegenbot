@@ -347,14 +347,17 @@ class FPLOptimizer:
         for _, row in self.df.iterrows():
             stat = row.get("status", "a")
             chance = row.get("chance_of_playing_next_round")
-            mult = get_player_injury_multiplier(stat, chance)
+            adjusted = row.get("xp_availability_adjusted") is True
+            mult = (float(row["availability"]) if adjusted
+                    else get_player_injury_multiplier(stat, chance))
             multipliers.append(mult)
             raw_val = row.get("raw_xp")
             if raw_val is not None and not pd.isna(raw_val):
                 raw = float(raw_val)
             else:
                 raw = float(row.get("xp", 0.0) or 0.0)
-            disc = round(raw * mult, 2)
+            score_multiplier = 1.0 if adjusted else mult
+            disc = round(raw * score_multiplier, 2)
             discounted_xps.append(disc)
             raw_3gw_val = row.get("xp_3gw")
             if raw_3gw_val is not None and not pd.isna(raw_3gw_val):
@@ -364,7 +367,7 @@ class FPLOptimizer:
                     raw_3gw = raw * self.decay_sum
             else:
                 raw_3gw = raw * self.decay_sum
-            discounted_3gw.append(round(raw_3gw * mult, 2))
+            discounted_3gw.append(round(raw_3gw * score_multiplier, 2))
 
         self.df["injury_multiplier"] = multipliers
         self.df["discounted_xp"] = discounted_xps

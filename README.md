@@ -119,7 +119,6 @@ FPL_LEAGUE_ID=your_primary_mini_league_id
 
 # --- Data Feeds & Underlying Stats ---
 VAASTAV_DATA_ENABLED=true
-VAASTAV_SEASON=2026-27
 THE_ODDS_API_KEY=your_optional_odds_api_key
 
 # --- Mathematical Solver Configuration ---
@@ -141,7 +140,20 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-#### FPL login tokens
+#### Forecast data freshness
+
+Gegenbot derives the season from the official GW1 deadline. Optional projection CSVs
+must include `season` (for example `2026-2027`), `target_gameweek`, and an ISO 8601
+`as_of` timestamp within 48 hours. Use explicit gameweek columns such as `GW11` for
+forward projections. CSVs that lack usable provenance fall back to official FPL data.
+
+Match archives must match official completed fixtures by fixture ID, round, and kickoff
+time and cover the latest completed round. Otherwise the minutes model falls back to
+official season minutes. Live decisions require an official fixture schedule. The model
+sums heuristic points across each fixture in a double and gives blanks zero points.
+Published gameweek totals are used once.
+
+### FPL login tokens
 FPL signs in through PingOne (`account.premierleague.com`) and has no password login for scripts, so Gegenbot uses an OAuth refresh token taken from your browser:
 
 1. Log in at https://fantasy.premierleague.com.

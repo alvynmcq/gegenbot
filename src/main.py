@@ -23,8 +23,10 @@ from src.api.client import FPLClient
 from src.state import atomic_write_json
 from src.execution import build_plan, execute_plan, execution_path, planning_snapshot
 from src.chips import available_chips
-from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher, VaastavDataFetcher
-from src.engine.metrics import calculate_player_metrics
+from src.data_fetcher import (
+    FPLCoreInsightsFetcher, VaastavDataFetcher, forecast_season,
+)
+from src.engine.metrics import calculate_player_metrics, verified_fixture_schedule
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
 from src.notifier.telegram import TelegramNotifier
 from src.tracker.league_scanner import LeagueAnalysis, LeagueScanner
@@ -497,32 +499,45 @@ def run_pipeline(
     fixtures = []
     try:
         fixtures = client.get_fixtures()
-    except Exception as e:
-        logger.warning(f"Could not fetch fixtures: {e}. Using baseline FDR ratings.")
+    except Exception as exc:
+        logger.warning("Could not fetch FPL fixtures (%s)", type(exc).__name__)
 
-    # 2. Ingest external datasets (olbauday/FPL-Core-Insights & vaastav/Fantasy-Premier-League)
-    logger.info("Fetching FPL Core Insights dataset (olbauday/FPL-Core-Insights)...")
-    core_fetcher = FPLCoreInsightsFetcher()
-    core_insights_df = core_fetcher.fetch_projections()
-    if core_insights_df is not None and not core_insights_df.empty:
-        logger.info(f"Loaded {len(core_insights_df)} player records from FPL Core Insights data feed.")
-    else:
-        logger.warning(
-            "External FPL Core Insights unavailable. Seamlessly falling back to default FPL expected points (ep_next / baseline)."
-        )
+    team_ids = {team["id"] for team in bootstrap.get("teams", [])}
+    schedule_complete = verified_fixture_schedule(fixtures, team_ids, gw_id)
+    season = forecast_season(events)
+    if execute and (not schedule_complete or season is None):
+        result = {"status": "execution_failed", "mode": "execution_failed", "gameweek": gw_id,
+                  "execution_error": "The current FPL season and fixture schedule could not be verified."}
+        atomic_write_json(Path(os.getenv("STATE_DIR", "data")) / "latest_decision.json", result)
+        return result
+    if not isinstance(fixtures, list) or any(not isinstance(f, dict) for f in fixtures):
+        fixtures = []
 
-    # Ingest Vaastav dataset for underlying stats (xGI/90, xGC/90, minutes tracking)
-    vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None
+    core_insights_df = None
+    vaastav_stats = None
+    archive_verified = False
+    if season:
+        core_insights_df = FPLCoreInsightsFetcher().fetch_projections(season=season, gameweek=gw_id)
+        if core_insights_df is None:
+            logger.info("No fresh projections for season %s GW%s. Using official FPL data.", season, gw_id)
+
     enable_vaastav = os.getenv("VAASTAV_DATA_ENABLED", "true").lower() in ("true", "1", "yes")
-    if enable_vaastav:
+    if enable_vaastav and season and schedule_complete:
         try:
-            logger.info("Fetching Vaastav FPL dataset (vaastav/Fantasy-Premier-League)...")
-            vaastav_fetcher = VaastavDataFetcher()
-            vaastav_stats = vaastav_fetcher.calculate_player_underlying_metrics()
-            if vaastav_stats:
-                logger.info(f"Loaded underlying metrics for {len(vaastav_stats)} players from Vaastav dataset.")
-        except Exception as e:
-            logger.warning(f"Could not load Vaastav FPL dataset: {e}. Continuing with standard projections.")
+            from pandas import DataFrame
+
+            start, end = season.split("-")
+            fetcher = VaastavDataFetcher(season=f"{start}-{end[-2:]}")
+            history = fetcher.fetch_merged_gw(fixtures=fixtures, gameweek=gw_id)
+            vaastav_stats = fetcher.calculate_player_underlying_metrics(
+                merged_gw_df=history if history is not None else DataFrame(),
+                players_raw_df=DataFrame(bootstrap["elements"]),
+            )
+            archive_verified = history is not None
+            if not archive_verified:
+                logger.info("No verified current-season match logs. Using official season minutes.")
+        except Exception as exc:
+            logger.warning("Could not load rolling match stats (%s)", type(exc).__name__)
 
     # 3. Enrich player metrics with xP, underlying stats, and market odds
     logger.info("Computing expected points (xP), underlying form, FDR weighting, and market implied odds...")
@@ -532,6 +547,7 @@ def run_pipeline(
         current_event=gw_id,
         fplreview_df=core_insights_df,
         vaastav_stats=vaastav_stats,
+        schedule_complete=schedule_complete,
     )
 
     optimizer = FPLOptimizer(players_df)
@@ -936,6 +952,12 @@ def run_pipeline(
         "mode": "dry_run",
         "gameweek": gw_id,
         "deadline_time": deadline_time,
+        "forecast_data": {
+            "season": season,
+            "schedule_verified": schedule_complete,
+            "match_archive_verified": archive_verified,
+            "sources": players_df["xp_source"].value_counts().to_dict(),
+        },
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "decision": decision.model_dump(),
         "optimization": opt_result.model_dump(),

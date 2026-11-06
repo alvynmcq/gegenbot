@@ -1060,6 +1060,16 @@ def mock_execution_readback(client, bootstrap, monkeypatch):
     from copy import deepcopy
 
     bootstrap["events"][1]["deadline_time"] = "2099-01-01T12:00:00Z"
+    fixtures = client.get_fixtures.return_value
+    covered = {fixture[key] for fixture in fixtures if fixture["event"] == 2
+               for key in ("team_h", "team_a")}
+    missing = iter(team["id"] for team in bootstrap["teams"] if team["id"] not in covered)
+    fixtures.extend({"event": 2, "team_h": home, "team_a": away}
+                    for home, away in zip(missing, missing))
+    pairs = {(f["team_h"], f["team_a"]) for f in fixtures}
+    teams = [team["id"] for team in bootstrap["teams"]]
+    fixtures.extend({"event": None, "team_h": home, "team_a": away}
+                    for home in teams for away in teams if home != away and (home, away) not in pairs)
     state = client.get_my_team.return_value
     prices = {player["id"]: player["now_cost"] for player in bootstrap["elements"]}
     for pick in state["picks"]:
@@ -1414,6 +1424,9 @@ def test_player_injury_multipliers():
 def test_optimizer_injury_discounting_and_bench_ordering(mock_bootstrap_data, mock_fixtures_data):
     """Test optimizer discounts doubtful players, forbids 0.0 multiplier players from Starting XI, and orders bench."""
     players_df = calculate_player_metrics(mock_bootstrap_data, mock_fixtures_data, current_event=1)
+
+    # This test exercises the optimizer's compatibility path for raw input scores.
+    players_df = players_df.drop(columns=["xp_availability_adjusted"])
 
     # Inject status flags into test player pool
     # Player 17 (MID, premium): Flagged with 75% chance (multiplier 0.80)

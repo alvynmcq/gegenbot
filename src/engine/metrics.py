@@ -1,6 +1,7 @@
 """Expected Points (xP), form, and Fixture Difficulty Rating (FDR) metrics calculation."""
 
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
 import pandas as pd
@@ -30,6 +31,20 @@ POSITION_FLOOR_XP = {
 }
 
 
+def verified_fixture_schedule(fixtures, team_ids, gameweek):
+    """A full FPL schedule has one home fixture per ordered pair of clubs."""
+    if not isinstance(fixtures, list) or len(team_ids) < 2:
+        return False
+    expected_pairs = {(home, away) for home in team_ids for away in team_ids if home != away}
+    if len(fixtures) != len(expected_pairs):
+        return False
+    if not all(isinstance(f, dict) and type(f.get("team_h")) is int and type(f.get("team_a")) is int
+               and (f.get("event") is None or type(f["event"]) is int) for f in fixtures):
+        return False
+    pairs = {(f["team_h"], f["team_a"]) for f in fixtures}
+    return pairs == expected_pairs and any(f.get("event") == gameweek for f in fixtures)
+
+
 def calculate_team_fdr_next_n_fixtures(
     fixtures: List[Dict[str, Any]],
     current_event: int,
@@ -50,8 +65,8 @@ def calculate_team_fdr_next_n_fixtures(
         if event in target_events and not fix.get("finished", False):
             team_h = fix.get("team_h")
             team_a = fix.get("team_a")
-            diff_h = fix.get("team_h_difficulty", 3)
-            diff_a = fix.get("team_a_difficulty", 3)
+            diff_h = _number(fix.get("team_h_difficulty"), 3)
+            diff_a = _number(fix.get("team_a_difficulty"), 3)
 
             if team_h in team_fdr:
                 team_fdr[team_h].append(diff_h)
@@ -78,6 +93,35 @@ def calculate_team_fdr_next_n_fixtures(
     return result
 
 
+def _number(value, default=0.0):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _availability(status, chance):
+    if status in ("i", "s", "u", "n"):
+        return 0.0
+    default = {"a": 1.0, "d": 0.5}.get(status, 0.75)
+    return min(1.0, max(0.0, _number(chance, default * 100) / 100))
+
+
+def _expected_minutes(element, recent, completed_matches, availability):
+    # Prefer recent match logs. Season minutes per club fixture give a fallback for
+    # regular first-team players when an archive isn't available.
+    if recent.get("recent_matches_count", 0) >= 2:
+        key = "rolling_minutes_avg" if availability == 1 else "rolling_minutes_when_playing"
+        if recent.get(key) is not None:
+            return min(90.0, max(0.0, _number(recent[key])))
+    if completed_matches >= 3 and element.get("minutes") is not None:
+        # Shrink sparse or mid-season arrival samples towards a 60-minute prior.
+        total = max(0.0, _number(element["minutes"]))
+        return min(90.0, (total + 2 * 60) / (completed_matches + 2))
+    return None
+
+
 def calculate_player_metrics(
     bootstrap_data: Dict[str, Any],
     fixtures: Optional[List[Dict[str, Any]]] = None,
@@ -86,6 +130,7 @@ def calculate_player_metrics(
     fplreview_xp_map: Optional[Dict[int, Any]] = None,
     vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     odds_data: Optional[Dict[int, Dict[str, Any]]] = None,
+    *, schedule_complete: bool = False,
 ) -> pd.DataFrame:
     """
     Process raw FPL bootstrap data, fixtures, optional external FPL Review projections,
@@ -115,20 +160,27 @@ def calculate_player_metrics(
     team_names = {t["id"]: t["name"] for t in teams_raw}
     team_short = {t["id"]: t["short_name"] for t in teams_raw}
 
-    # FDR calculation & Next Opponent Mapping
-    fdr_lookup = {}
-    team_opponents: Dict[int, List[int]] = {t["id"]: [] for t in teams_raw}
-    if fixtures:
-        fdr_lookup = calculate_team_fdr_next_n_fixtures(fixtures, current_event, n_gameweeks=3)
-        for fix in fixtures:
-            if fix.get("event") == current_event and not fix.get("finished", False):
-                th = fix.get("team_h")
-                ta = fix.get("team_a")
-                if th and ta:
-                    if ta not in team_opponents.setdefault(th, []):
-                        team_opponents[th].append(ta)
-                    if th not in team_opponents.setdefault(ta, []):
-                        team_opponents[ta].append(th)
+    # Keep individual fixtures for scoring, including multiple fixtures in one gameweek.
+    fdr_lookup = calculate_team_fdr_next_n_fixtures(fixtures or [], current_event)
+    horizon = max(1, int(os.getenv("HORIZON_LENGTH", "3")))
+    decay = float(os.getenv("DECAY_FACTOR", "0.85"))
+    weights = [round(decay ** offset, 4) for offset in range(horizon)]
+    by_team_event = {}
+    completed_matches = {}
+    seen = set()
+    for fixture in fixtures or []:
+        event = fixture.get("event")
+        home, away = fixture.get("team_h"), fixture.get("team_a")
+        identity = fixture.get("id") or (event, home, away)
+        if type(event) is not int or not home or not away or identity in seen:
+            continue
+        seen.add(identity)
+        for team, opponent, is_home in ((home, away, True), (away, home, False)):
+            if fixture.get("finished") and event < current_event:
+                completed_matches[team] = completed_matches.get(team, 0) + 1
+            elif current_event <= event < current_event + horizon and not fixture.get("finished"):
+                difficulty = _number(fixture.get("team_h_difficulty" if is_home else "team_a_difficulty"), 3)
+                by_team_event.setdefault((team, event), []).append((difficulty, is_home, opponent))
 
     # Resolve FPL Review mapped projections
     fplreview_map: Dict[int, Any] = {}
@@ -159,16 +211,8 @@ def calculate_player_metrics(
         now_cost = el.get("now_cost", 50)  # in tenths of millions (e.g. 100 = 10.0m)
         cost_m = now_cost / 10.0
 
-        # Form & PPG
-        try:
-            form = float(el.get("form", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            form = 0.0
-
-        try:
-            ppg = float(el.get("points_per_game", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            ppg = 0.0
+        form = _number(el.get("form"))
+        ppg = _number(el.get("points_per_game"))
 
         # Official FPL ep_next
         try:
@@ -182,33 +226,20 @@ def calculate_player_metrics(
         status = el.get("status", "a")
         chance_next = el.get("chance_of_playing_next_round")
 
-        # Availability multiplier
-        if chance_next is not None:
-            try:
-                availability = float(chance_next) / 100.0
-            except (ValueError, TypeError):
-                availability = 1.0
-        elif status == "a":
-            availability = 1.0
-        elif status == "d":
-            availability = 0.5
-        elif status in ["i", "s", "u"]:
-            availability = 0.0
-        else:
-            availability = 0.75
-
-        # Fixture Difficulty Multiplier
-        team_fdr_info = fdr_lookup.get(team_id, {"avg_fdr": 3.0, "next_is_home": False, "next_fdr": 3.0})
+        availability = _availability(status, chance_next)
+        team_fdr_info = fdr_lookup.get(team_id, {})
         avg_fdr = team_fdr_info.get("avg_fdr", 3.0)
         next_fdr = team_fdr_info.get("next_fdr", 3.0)
-        next_is_home = team_fdr_info.get("next_is_home", False)
+        current_fixtures = by_team_event.get((team_id, current_event), [])
+        expected_minutes = _expected_minutes(el, (vaastav_stats or {}).get(player_id, {}),
+                                             completed_matches.get(team_id, 0), availability)
 
         # Vaastav underlying statistics & Moneyball metrics
         v_data = (vaastav_stats or {}).get(player_id, {})
         rolling_xgi_90 = float(v_data.get("rolling_xgi_90", 0.0) or 0.0)
         rolling_xgc_90 = float(v_data.get("rolling_xgc_90", 0.0) or 0.0)
-        rolling_minutes_avg = float(v_data.get("rolling_minutes_avg", 90.0) or 90.0)
-        starts_ratio = float(v_data.get("starts_ratio", 1.0) or 1.0)
+        rolling_minutes_avg = _number(v_data.get("rolling_minutes_avg"), 90.0)
+        starts_ratio = _number(v_data.get("starts_ratio"), 1.0)
         recent_matches_count = int(v_data.get("recent_matches_count", 0) or 0)
         xgi_delta = float(v_data.get("xgi_delta", 0.0) or 0.0)
         xgc_delta = float(v_data.get("xgc_delta", 0.0) or 0.0)
@@ -272,61 +303,51 @@ def calculate_player_metrics(
         if is_corner_taker:
             base_xp += 0.3
 
-        # FDR Scaling: Each FDR point below 3.0 gives +8% boost, above 3.0 gives -8% penalty
-        fdr_multiplier = max(0.6, 1.0 + (3.0 - next_fdr) * 0.08)
-        if next_is_home:
-            fdr_multiplier *= 1.05  # 5% home advantage boost
+        # Published xP is already a gameweek total. Apply the minutes model to the
+        # heuristic, and use it as a ceiling when availability or minutes are low.
+        minutes_factor = expected_minutes / 90.0 if expected_minutes is not None else 1.0
+        entry = fplreview_map.get(player_id, {})
+        external_by_event = entry.get("xp_by_gameweek", {}) if isinstance(entry, dict) else {}
+        fplreview_val = entry.get("fplreview_xp") if isinstance(entry, dict) else entry
+        source_tag = entry.get("source", "fpl_core_insights") if isinstance(entry, dict) else "fplreview"
 
-        heuristic_xp = round(max(0.0, base_xp * fdr_multiplier * availability), 2)
-
-        # Default FPL fallback expected points: official ep_next (if valid) or FDR heuristic
-        if ep_next_val is not None and ep_next_val > 0:
-            default_fpl_xp = round(max(0.0, ep_next_val * availability), 2)
-            default_source = "fpl_ep_next"
-        else:
-            default_fpl_xp = heuristic_xp
-            default_source = "fpl_heuristic"
-
-        # Check FPL Core Insights / External projection
-        fplreview_val: Optional[float] = None
-        fplreview_3gw_val: Optional[float] = None
-        n_horizon = int(os.getenv("HORIZON_LENGTH", "3"))
-        decay_factor = float(os.getenv("DECAY_FACTOR", "0.85"))
-        decay_weights = [round(decay_factor ** t, 4) for t in range(max(1, n_horizon))]
-        decay_sum = sum(decay_weights)
-        source_tag = "fpl_core_insights"
-
-        if player_id in fplreview_map:
-            entry = fplreview_map[player_id]
-            if isinstance(entry, dict):
-                fplreview_val = entry.get("fplreview_xp")
-                fplreview_3gw_val = entry.get("fplreview_xp_3gw")
-                source_tag = entry.get("source", "fpl_core_insights")
-            elif isinstance(entry, (int, float)):
-                fplreview_val = float(entry)
-                fplreview_3gw_val = round(fplreview_val * decay_sum, 2)
-                source_tag = "fplreview"
+        forecasts = {}
+        xp_source = "fpl_heuristic"
+        for offset in range(horizon):
+            event = current_event + offset
+            matches = by_team_event.get((team_id, event), [])
+            if schedule_complete and not matches:
+                forecasts[event] = 0.0
+                if offset == 0:
+                    xp_source = "blank_gameweek"
+                continue
+            # A next-round flag is not a prognosis for the full horizon.
+            chance = 0.0 if status in ("u", "n") else min(1.0, availability + 0.25 * offset)
+            fixture_weight = sum(max(0.6, 1 + (3 - difficulty) * 0.08) * (1.05 if home else 1)
+                                 for difficulty, home, _ in matches) if matches else 1.0
+            heuristic = base_xp * minutes_factor * chance * fixture_weight
+            published = external_by_event.get(event)
+            source = source_tag
+            if offset == 0 and published is None:
+                published = fplreview_val
+                if published is None and ep_next_val is not None and math.isfinite(ep_next_val) and ep_next_val > 0:
+                    published, source = ep_next_val, "fpl_ep_next"
+            forecast = _number(published, heuristic)
+            if published is None:
+                source = "fpl_heuristic"
+            elif chance < 1.0 or (expected_minutes is not None and expected_minutes < 60):
+                forecast = min(forecast, heuristic)
+            forecasts[event] = round(max(0.0, forecast), 2)
+            if offset == 0:
+                xp_source = source
+        xp = forecasts[current_event]
+        xp_3gw = round(sum(forecasts[current_event + i] * weight for i, weight in enumerate(weights)), 2)
 
         # Market Implied Probabilities
         o_info = (odds_data or {}).get(player_id, {})
-        implied_cs_pct = float(o_info.get("implied_cs_pct", 0.0) or 0.0)
-        implied_goal_pct = float(o_info.get("implied_goal_pct", 0.0) or 0.0)
-        odds_xp_val = float(o_info.get("odds_xp", 0.0) or 0.0)
-
-        if fplreview_val is not None:
-            # Respect availability if fully unavailable (injured/suspended)
-            xp = round(max(0.0, fplreview_val * availability), 2) if availability == 0.0 else fplreview_val
-            xp_source = source_tag
-        else:
-            xp = default_fpl_xp
-            xp_source = default_source
-
-        # 3-gameweek projection xP
-        if fplreview_3gw_val is not None:
-            xp_3gw = fplreview_3gw_val
-        else:
-            fdr_3gw_mult = max(0.6, 1.0 + (3.0 - avg_fdr) * 0.08)
-            xp_3gw = round(max(0.0, base_xp * fdr_3gw_mult * availability * decay_sum), 2)
+        implied_cs_pct = _number(o_info.get("implied_cs_pct"))
+        implied_goal_pct = _number(o_info.get("implied_goal_pct"))
+        odds_xp_val = _number(o_info.get("odds_xp"))
 
         try:
             transfers_in_event = int(el.get("transfers_in_event", 0) or 0)
@@ -368,7 +389,7 @@ def calculate_player_metrics(
             2,
         )
 
-        opp_list = team_opponents.get(team_id, [])
+        opp_list = list(dict.fromkeys(opponent for _, _, opponent in current_fixtures))
         primary_opp = opp_list[0] if opp_list else None
 
         records.append({
@@ -390,6 +411,12 @@ def calculate_player_metrics(
             "status": status,
             "chance_of_playing_next_round": chance_next,
             "availability": availability,
+            "fixtures_in_gw": len(current_fixtures) if schedule_complete or current_fixtures else 1,
+            "expected_minutes_per_fixture": (
+                round(expected_minutes * availability, 1) if expected_minutes is not None else None
+            ),
+            "xp_by_gameweek": forecasts,
+            "xp_availability_adjusted": True,
             "ep_next": ep_next_val,
             "fdr_next": next_fdr,
             "fdr_avg_3gw": avg_fdr,
