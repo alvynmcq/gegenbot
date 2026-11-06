@@ -507,7 +507,10 @@ def run_pipeline(
                 }
                 transfers_info = my_team_data.get("transfers", {})
                 bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
+                # "limit" is the gameweek's total; subtract transfers already made this gameweek.
                 free_transfers = transfers_info.get("limit", 1)
+                if isinstance(free_transfers, int):
+                    free_transfers = max(0, free_transfers - int(transfers_info.get("made") or 0))
                 logger.info(
                     f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
                 )
