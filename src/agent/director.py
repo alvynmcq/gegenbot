@@ -89,6 +89,14 @@ class AIDirector:
 
         return alerts
 
+    @staticmethod
+    def _is_temperature_rejection(resp) -> bool:
+        try:
+            err = resp.json().get("error") or {}
+        except ValueError:
+            return False
+        return err.get("param") == "temperature" or "temperature" in str(err.get("message", ""))
+
     def _build_fallback_decision(
         self,
         optimization_result: OptimizationResult,
@@ -387,6 +395,11 @@ class AIDirector:
                     return self._build_fallback_decision(optimization_result, f"LLM timeout/network error: {net_err}", news_intel)
             except requests.exceptions.HTTPError as http_err:
                 status_code = resp.status_code if 'resp' in locals() and resp is not None else 0
+                if status_code == 400 and "temperature" in body and self._is_temperature_rejection(resp):
+                    # Newer reasoning models (e.g. GPT-5/6) only accept the default temperature.
+                    logger.info(f"Model {self.model} rejected custom temperature; retrying with the default.")
+                    body.pop("temperature")
+                    continue
                 if status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
                     sleep_time = attempt * 2
                     logger.warning(
