@@ -1056,6 +1056,38 @@ def test_evaluate_wildcard_and_free_hit(mock_bootstrap_data, mock_fixtures_data)
     assert fh_eval.squad_candidate.hit_cost == 0
 
 
+def mock_execution_readback(client, bootstrap, monkeypatch):
+    from copy import deepcopy
+
+    bootstrap["events"][1]["deadline_time"] = "2099-01-01T12:00:00Z"
+    state = client.get_my_team.return_value
+    prices = {player["id"]: player["now_cost"] for player in bootstrap["elements"]}
+    for pick in state["picks"]:
+        pick.setdefault("selling_price", prices[pick["element"]])
+    state["transfers"]["made"] = 0
+    monkeypatch.setenv("FPL_MAX_HIT_POINTS", "8")
+    client.get_my_team.side_effect = lambda team: deepcopy(state)
+
+    def activate(chip):
+        if chip:
+            for item in state["chips"]:
+                if item["name"] == chip:
+                    item["status_for_entry"] = "active"
+
+    def transfers(payload):
+        for move in payload["transfers"]:
+            state["picks"] = [p for p in state["picks"] if p["element"] != move["element_out"]]
+            state["picks"].append({"element": move["element_in"]})
+        activate(payload["chip"])
+
+    def lineup(team, payload):
+        state["picks"] = deepcopy(payload["picks"])
+        activate(payload["chip"])
+
+    client.post_transfers.side_effect = transfers
+    client.post_lineup.side_effect = lineup
+
+
 def test_pipeline_with_auto_chip_execution(tmp_path, mock_bootstrap_data, mock_fixtures_data, monkeypatch):
     """Test main pipeline triggering automated chip execution, setting payload chips, and Telegram notification."""
     monkeypatch.setenv("ENABLE_AUTO_CHIPS", "true")
@@ -1074,6 +1106,7 @@ def test_pipeline_with_auto_chip_execution(tmp_path, mock_bootstrap_data, mock_f
     }
     mock_client.post_transfers.return_value = {"status": "ok"}
     mock_client.post_lineup.return_value = {"status": "ok"}
+    mock_execution_readback(mock_client, mock_bootstrap_data, monkeypatch)
 
     from src.main import run_pipeline
     with patch("src.main.TelegramNotifier") as mock_notifier_cls:
@@ -1116,6 +1149,7 @@ def test_pipeline_wildcard_recommended_but_standard_move_selected(tmp_path, mock
     }
     mock_client.post_transfers.return_value = {"status": "ok"}
     mock_client.post_lineup.return_value = {"status": "ok"}
+    mock_execution_readback(mock_client, mock_bootstrap_data, monkeypatch)
 
     from src.main import run_pipeline
 
@@ -1179,6 +1213,7 @@ def test_pipeline_wildcard_recommended_and_rebuild_selected(tmp_path, mock_boots
     }
     mock_client.post_transfers.return_value = {"status": "ok"}
     mock_client.post_lineup.return_value = {"status": "ok"}
+    mock_execution_readback(mock_client, mock_bootstrap_data, monkeypatch)
 
     from src.main import run_pipeline
 
@@ -1270,6 +1305,7 @@ def test_pipeline_force_chip_triple_captain(mock_bootstrap_data, mock_fixtures_d
     }
     mock_client.post_transfers.return_value = {"status": "ok"}
     mock_client.post_lineup.return_value = {"status": "ok"}
+    mock_execution_readback(mock_client, mock_bootstrap_data, monkeypatch)
 
     from src.main import run_pipeline
     with patch("src.main.TelegramNotifier") as mock_notifier_cls:
@@ -1305,6 +1341,7 @@ def test_pipeline_force_chip_wildcard(mock_bootstrap_data, mock_fixtures_data, m
     }
     mock_client.post_transfers.return_value = {"status": "ok"}
     mock_client.post_lineup.return_value = {"status": "ok"}
+    mock_execution_readback(mock_client, mock_bootstrap_data, monkeypatch)
 
     from src.main import run_pipeline
     with patch("src.main.TelegramNotifier") as mock_notifier_cls:
@@ -2067,3 +2104,20 @@ def test_director_recency_history_and_captain_guardrail(tmp_path):
         assert decision.captain_name != "DEF_3"
         assert decision.selected_candidate.captain.position in ("MID", "FWD")
 
+
+
+    original = opt_res.candidates[0]
+    promoted = original.vice_captain
+    assert promoted.element_type in (3, 4)
+    mock_resp.json.return_value["choices"][0]["message"]["content"] = json.dumps({
+        "selected_candidate_index": 0,
+        "captain_override": promoted.web_name,
+        "vice_captain_override": promoted.web_name,
+    })
+    with patch("requests.post", return_value=mock_resp):
+        decision = director.evaluate_and_decide(opt_res)
+    starters = decision.selected_candidate.starters
+    assert [p.id for p in starters if p.is_captain] == [promoted.id]
+    assert [p.id for p in starters if p.is_vice_captain] == [decision.selected_candidate.vice_captain.id]
+    assert decision.selected_candidate.vice_captain.id != promoted.id
+    assert original.vice_captain.id == promoted.id

@@ -428,7 +428,7 @@ class AIDirector:
         veto_player_ids = [int(pid) for pid in raw_veto_ids if str(pid).isdigit()]
         veto_reason = parsed.get("veto_reason")
 
-        chosen = candidates[chosen_idx]
+        chosen = candidates[chosen_idx].model_copy(deep=True)
 
         # Process Captain Override with Safety Guardrails
         if captain_override and isinstance(captain_override, str):
@@ -460,33 +460,26 @@ class AIDirector:
                                 break
 
                     if not shield_protected:
+                        if current_cap:
+                            gain = (p.xp - current_cap.xp) * (2 if chosen.active_chip == "3xc" else 1)
+                            chosen.net_xp = round(chosen.net_xp + gain, 2)
                         for s in chosen.starters:
                             s.is_captain = (s.id == p.id)
                         chosen.captain = p
                         logger.info(f"AI Director overrode captain to: {p.web_name}")
                     break
 
-        # Process Vice-Captain Override if valid starter in chosen squad
+        # Preserve a distinct deputy when the captain override promotes the existing one.
+        vice = chosen.vice_captain
         if vice_captain_override and isinstance(vice_captain_override, str):
-            target_norm = vice_captain_override.strip().lower()
-            for p in chosen.starters:
-                if p.web_name.lower() == target_norm and not p.is_captain:
-                    for s in chosen.starters:
-                        s.is_vice_captain = (s.id == p.id)
-                    chosen.vice_captain = p
-                    logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
-                    break
-
-        # Process Vice-Captain Override if valid starter in chosen squad
-        if vice_captain_override and isinstance(vice_captain_override, str):
-            target_norm = vice_captain_override.strip().lower()
-            for p in chosen.starters:
-                if p.web_name.lower() == target_norm and not p.is_captain:
-                    for s in chosen.starters:
-                        s.is_vice_captain = (s.id == p.id)
-                    chosen.vice_captain = p
-                    logger.info(f"AI Director overrode vice-captain to: {p.web_name}")
-                    break
+            target = vice_captain_override.strip().lower()
+            vice = next((p for p in chosen.starters if p.web_name.lower() == target
+                         and not p.is_captain), vice)
+        if vice is None or vice.id == chosen.captain.id:
+            vice = max((p for p in chosen.starters if not p.is_captain), key=lambda p: p.xp)
+        for starter in chosen.starters:
+            starter.is_vice_captain = starter.id == vice.id
+        chosen.vice_captain = vice
 
         c_name = chosen.captain.web_name if chosen.captain else "Unknown"
         vc_name = chosen.vice_captain.web_name if chosen.vice_captain else "Unknown"

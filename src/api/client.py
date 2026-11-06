@@ -152,7 +152,8 @@ class FPLClient:
     ) -> Any:
         """Execute HTTP request with 429 rate limit backoff, 401 token refresh interceptor, and error handling."""
         # Mutations may have committed even if their response was lost. Reconcile instead of replaying.
-        if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+        read_only = method.upper() in ("GET", "HEAD", "OPTIONS")
+        if not read_only:
             max_retries = 1
         url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
         token_refreshed = False
@@ -167,7 +168,11 @@ class FPLClient:
                     params=params,
                     json=json_data,
                     timeout=15,
+                    allow_redirects=read_only,
                 )
+
+                if not read_only and (300 <= response.status_code < 400 or response.status_code == 429):
+                    raise FPLClientError(f"Write rejected with HTTP {response.status_code}")
 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
@@ -179,7 +184,7 @@ class FPLClient:
 
                 # 401 / 403 Interceptor & Auto-Retry
                 if (response.status_code == 401 or response.status_code == 403) and authenticated:
-                    if not token_refreshed and self.auth.can_refresh:
+                    if method.upper() == "GET" and not token_refreshed and self.auth.can_refresh:
                         logger.info(f"Received HTTP {response.status_code} on {url}. Intercepting to refresh token...")
                         if self.refresh_access_token():
                             token_refreshed = True
@@ -209,7 +214,7 @@ class FPLClient:
                     raise FPLClientError(f"Resource not found (404) for {url}")
 
                 if 400 <= response.status_code < 500:
-                    logger.warning(f"Client error ({response.status_code}) on {url}: {response.text}")
+                    logger.warning(f"Client error ({response.status_code}) on {url}")
                     raise FPLClientError(f"Client error ({response.status_code}) for {url}")
 
                 response.raise_for_status()

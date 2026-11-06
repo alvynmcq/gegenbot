@@ -21,7 +21,7 @@ from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
 from src.state import atomic_write_json
-from src.execution import build_plan, execute_plan, execution_path
+from src.execution import build_plan, execute_plan, execution_path, planning_snapshot
 from src.chips import available_chips
 from src.data_fetcher import FPLCoreInsightsFetcher, FPLReviewFetcher, VaastavDataFetcher
 from src.engine.metrics import calculate_player_metrics
@@ -418,7 +418,7 @@ def run_pipeline(
     logger.info("=" * 60)
 
     # 1. Fetch bootstrap and fixtures
-    bootstrap = client.get_bootstrap_static()
+    bootstrap = client.get_bootstrap_static(force_refresh=execute)
     events = bootstrap.get("events", [])
     gw_id, deadline_time, is_next = get_active_gameweek(events)
     logger.info(f"Target Gameweek: GW{gw_id} | Deadline: {deadline_time}")
@@ -433,6 +433,66 @@ def run_pipeline(
             if result["status"] != "success":
                 logger.error("Saved execution remains unresolved for GW%s; check the live team", gw_id)
             return result
+
+    # Retrieve the squad and finances before using external projections.
+    team_id_str = resume_team
+    current_squad_ids: List[int] = []
+    live_chip_inventory = None
+    live_baseline = None
+    selling_prices: Optional[Dict[int, float]] = None
+    bank_m: float = custom_bank_m
+    free_transfers: int = custom_ft
+
+    if custom_squad_ids:
+        current_squad_ids = custom_squad_ids
+    elif team_id_str:
+        team_id = int(team_id_str)
+        if client.ensure_authenticated():
+            try:
+                logger.info(f"Fetching live squad for Team ID {team_id}...")
+                my_team_data = client.get_my_team(team_id)
+                if execute:
+                    live_baseline = planning_snapshot(my_team_data)
+                live_chip_inventory = my_team_data.get("chips")
+                picks = my_team_data.get("picks", [])
+                current_squad_ids = [p["element"] for p in picks]
+                selling_prices = {
+                    p["element"]: float(p.get("selling_price", p.get("now_cost", 50))) / 10.0
+                    for p in picks
+                }
+                transfers_info = my_team_data.get("transfers", {})
+                bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
+                # "limit" is the gameweek's total; subtract transfers already made this gameweek.
+                free_transfers = transfers_info.get("limit", 1)
+                free_transfers = (max(0, free_transfers - int(transfers_info.get("made") or 0))
+                                  if isinstance(free_transfers, int) else 0)
+                logger.info(
+                    f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
+                )
+            except Exception as exc:
+                logger.warning("Authenticated squad retrieval failed (%s)", type(exc).__name__)
+
+        # Fallback to public entry picks if authenticated retrieval failed or unauthenticated
+        if not execute and not current_squad_ids:
+            try:
+                latest_gw = get_latest_live_gameweek(events) or max(1, gw_id - 1)
+                logger.info(f"Fetching public squad picks for Team ID {team_id} (GW{latest_gw})...")
+                entry_picks = client.get_entry_picks(team_id, latest_gw)
+                picks = entry_picks.get("picks", [])
+                current_squad_ids = [p["element"] for p in picks]
+                history = entry_picks.get("entry_history", {})
+                bank_m = round(history.get("bank", 0) / 10.0, 1)
+                logger.info(
+                    f"Public squad retrieved: {len(current_squad_ids)} players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch public picks for Team ID {team_id}: {e}. Initializing default squad from top performers.")
+
+    if execute and live_baseline is None:
+        result = {"status": "execution_failed", "mode": "execution_failed", "gameweek": gw_id,
+                  "execution_error": "A complete authenticated squad is required for live execution."}
+        atomic_write_json(Path(os.getenv("STATE_DIR", "data")) / "latest_decision.json", result)
+        return result
 
     fixtures = []
     try:
@@ -473,65 +533,6 @@ def run_pipeline(
         fplreview_df=core_insights_df,
         vaastav_stats=vaastav_stats,
     )
-
-    # 3. Retrieve current squad, selling prices, and bank
-    team_id_str = resume_team
-    current_squad_ids: List[int] = []
-    live_chip_inventory = None
-    selling_prices: Optional[Dict[int, float]] = None
-    bank_m: float = custom_bank_m
-    free_transfers: int = custom_ft
-
-    if custom_squad_ids:
-        current_squad_ids = custom_squad_ids
-    elif team_id_str:
-        team_id = int(team_id_str)
-        if client.ensure_authenticated():
-            try:
-                auth_res = client.validate_auth(team_id)
-                if isinstance(auth_res, tuple) and len(auth_res) == 2:
-                    auth_ok, auth_msg = auth_res
-                else:
-                    auth_ok, auth_msg = bool(auth_res), "Auth validation checked"
-                if not auth_ok:
-                    logger.warning(f"FPL Authentication warning: {auth_msg}")
-
-                logger.info(f"Fetching live squad for Team ID {team_id}...")
-                my_team_data = client.get_my_team(team_id)
-                live_chip_inventory = my_team_data.get("chips")
-                picks = my_team_data.get("picks", [])
-                current_squad_ids = [p["element"] for p in picks]
-                selling_prices = {
-                    p["element"]: float(p.get("selling_price", p.get("now_cost", 50))) / 10.0
-                    for p in picks
-                }
-                transfers_info = my_team_data.get("transfers", {})
-                bank_m = round(transfers_info.get("bank", 0) / 10.0, 1)
-                # "limit" is the gameweek's total; subtract transfers already made this gameweek.
-                free_transfers = transfers_info.get("limit", 1)
-                if isinstance(free_transfers, int):
-                    free_transfers = max(0, free_transfers - int(transfers_info.get("made") or 0))
-                logger.info(
-                    f"Live squad retrieved: 15 players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to fetch live team via authenticated API: {e}. Falling back to public picks.")
-
-        # Fallback to public entry picks if authenticated retrieval failed or unauthenticated
-        if not current_squad_ids:
-            try:
-                latest_gw = get_latest_live_gameweek(events) or max(1, gw_id - 1)
-                logger.info(f"Fetching public squad picks for Team ID {team_id} (GW{latest_gw})...")
-                entry_picks = client.get_entry_picks(team_id, latest_gw)
-                picks = entry_picks.get("picks", [])
-                current_squad_ids = [p["element"] for p in picks]
-                history = entry_picks.get("entry_history", {})
-                bank_m = round(history.get("bank", 0) / 10.0, 1)
-                logger.info(
-                    f"Public squad retrieved: {len(current_squad_ids)} players | Bank: £{bank_m}m | Free Transfers: {free_transfers}"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to fetch public picks for Team ID {team_id}: {e}. Initializing default squad from top performers.")
 
     optimizer = FPLOptimizer(players_df)
 
@@ -675,7 +676,7 @@ def run_pipeline(
         )
         forced_chip = None
 
-    eligible_chips = available_chips(gw_id, live_chip_inventory, entry_history_data)
+    eligible_chips = available_chips(gw_id, live_chip_inventory, None if execute else entry_history_data)
     if eligible_chips is None:
         eligible_chips = []
         logger.warning("Chip availability could not be verified; chip activation disabled.")
@@ -692,6 +693,8 @@ def run_pipeline(
                 f"⚠️ Cannot force chip '{forced_chip}': It is unavailable for this gameweek "
                 f"(used chips: {list(used_chips)}). Aborting forced chip activation."
             )
+            if execute:
+                raise RuntimeError("Forced chip is unavailable in the live inventory")
             forced_chip = None
             enable_auto_chips = False
         else:
@@ -709,7 +712,7 @@ def run_pipeline(
         current_gw=gw_id,
         evaluate_chips=True,
         available_chips=eligible_chips,
-        include_chip_candidates=enable_auto_chips or bool(forced_chip),
+        include_chip_candidates=enable_auto_chips and not forced_chip,
     )
 
     logger.info(f"Generated {len(opt_result.candidates)} candidate options:")
@@ -742,12 +745,6 @@ def run_pipeline(
                     f"⚡ USER FORCED CHIP ACTIVATED: {f_eval.display_name} "
                     f"(Projected: {f_eval.projected_xp:.2f} pts | Gain: +{f_eval.xp_gain:.2f} xP)"
                 )
-                if forced_chip in ("wildcard", "freehit") and f_eval.squad_candidate:
-                    chip_cand = f_eval.squad_candidate.model_copy(deep=True)
-                    chip_cand.active_chip = forced_chip
-                    chip_cand.name = f"Option 1: Forced {f_eval.display_name} Squad Rebuild"
-                    chip_cand.strategic_value_score = 999.0
-                    opt_result.candidates.insert(0, chip_cand)
         elif enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
             recommended_chip = opt_result.chip_evaluation.recommended_chip
             c_eval = opt_result.chip_evaluation.evaluations[recommended_chip]
@@ -794,6 +791,17 @@ def run_pipeline(
 
     recent_performance = _load_recent_performance_history(limit=3)
 
+    def restrict_forced_rebuild(result):
+        if forced_chip in ("wildcard", "freehit"):
+            evaluation = result.chip_evaluation
+            rebuild = evaluation.evaluations.get(forced_chip) if evaluation else None
+            if rebuild is None or rebuild.squad_candidate is None:
+                raise RuntimeError("Forced chip has no valid squad rebuild")
+            candidate = rebuild.squad_candidate.model_copy(deep=True)
+            candidate.active_chip = forced_chip
+            result.candidates = [candidate]
+
+    restrict_forced_rebuild(opt_result)
     logger.info("Consulting AI Decision Director...")
     director = AIDirector()
     decision = director.evaluate_and_decide(
@@ -846,7 +854,7 @@ def run_pipeline(
             current_gw=gw_id,
             evaluate_chips=True,
             available_chips=eligible_chips,
-            include_chip_candidates=enable_auto_chips or bool(forced_chip),
+            include_chip_candidates=enable_auto_chips and not forced_chip,
         )
         logger.info(f"Re-solved! Generated {len(opt_result.candidates)} clean candidate options without vetoed players.")
         recommended_chip = forced_chip or (
@@ -859,6 +867,7 @@ def run_pipeline(
         )
 
 
+        restrict_forced_rebuild(opt_result)
         decision = director.evaluate_and_decide(
             opt_result,
             league_analysis,
@@ -868,26 +877,36 @@ def run_pipeline(
             recent_performance=recent_performance,
         )
 
-    # Determine the actual active chip:
-    # 1) If the chosen candidate already carries a chip (e.g. Wildcard / Free Hit rebuild candidate), use it.
-    # 2) If a lineup chip (bboost, 3xc) was recommended & enabled (or forced), apply it to the chosen candidate.
-    active_chip: Optional[str] = decision.selected_candidate.active_chip
-    if (enable_auto_chips or forced_chip) and recommended_chip in ("bboost", "3xc") and not active_chip:
-        active_chip = recommended_chip
-        decision.selected_candidate.active_chip = active_chip
+    # Recheck lineup-chip value against the final XI and captain chosen by the Director.
+    chosen = decision.selected_candidate
+    active_chip = chosen.active_chip
+    lineup_chip = active_chip or recommended_chip
+    if (enable_auto_chips or forced_chip) and lineup_chip in ("bboost", "3xc"):
+        baseline = chosen.model_copy(deep=True)
         if active_chip == "bboost":
-            bench_xp = sum(p.xp for p in decision.selected_candidate.bench)
-            decision.projected_net_xp = round(decision.selected_candidate.net_xp + bench_xp, 2)
-            if "Bench Boost" not in decision.chosen_move_name:
-                decision.chosen_move_name += " + Bench Boost"
+            baseline.net_xp -= sum(p.xp for p in baseline.bench)
         elif active_chip == "3xc":
-            c_xp = decision.selected_candidate.captain.xp if decision.selected_candidate.captain else 0.0
-            decision.projected_net_xp = round(decision.selected_candidate.net_xp + c_xp, 2)
-            if "Triple Captain" not in decision.chosen_move_name:
-                decision.chosen_move_name += " + Triple Captain"
-    elif forced_chip and forced_chip in ("wildcard", "freehit") and not active_chip:
-        active_chip = forced_chip
-        decision.selected_candidate.active_chip = active_chip
+            baseline.net_xp -= baseline.captain.xp
+        if lineup_chip == "bboost":
+            threshold = float(os.getenv("BENCH_BOOST_MIN_BENCH_XP", "16.0"))
+            evaluation = optimizer.evaluate_bench_boost(baseline, min_bench_xp=threshold, current_gw=gw_id)
+        else:
+            threshold = float(os.getenv("TRIPLE_CAPTAIN_MIN_XP", "11.5"))
+            evaluation = optimizer.evaluate_triple_captain(baseline, min_captain_xp=threshold, current_gw=gw_id)
+        active_chip = lineup_chip if evaluation.threshold_met or forced_chip == lineup_chip else None
+        chosen.active_chip = active_chip
+        chosen.net_xp = evaluation.projected_xp if active_chip else round(baseline.net_xp, 2)
+        decision.projected_net_xp = chosen.net_xp
+        triggered_chip_eval = evaluation.model_dump() if active_chip else None
+        if active_chip and forced_chip == lineup_chip:
+            triggered_chip_eval.update(threshold_met=True, forced=True)
+        if active_chip and evaluation.display_name not in decision.chosen_move_name:
+            decision.chosen_move_name += f" + {evaluation.display_name}"
+        elif not active_chip and baseline.active_chip:
+            name = f"Option {decision.selected_candidate_index + 1}: {chosen.transfers_count} transfers"
+            decision.chosen_move_name = chosen.name = name
+    if triggered_chip_eval and triggered_chip_eval.get("chip_name") != active_chip:
+        triggered_chip_eval = None
 
     if active_chip and (active_chip not in eligible_chips or not (enable_auto_chips or forced_chip)):
         # Do not clear just the flag: a chip squad may be unaffordable without that chip.
@@ -932,7 +951,7 @@ def run_pipeline(
             output_payload.update(status="execution_failed", mode="execution_failed",
                                   execution_error="FPL_TEAM_ID is not configured")
         else:
-            plan = build_plan(decision.selected_candidate, int(team_id_str), gw_id, output_payload)
+            plan = build_plan(decision.selected_candidate, int(team_id_str), gw_id, output_payload, live_baseline)
             output_payload = execute_plan(client, execution_path(int(team_id_str), gw_id, deadline_time), plan)
         decision = DecisionOutput.model_validate(output_payload["decision"])
         active_chip = output_payload["active_chip"]

@@ -753,6 +753,7 @@ class FPLOptimizer:
         chip_name: Optional[str] = None,
         squad_title: str = "Optimal Squad From Scratch",
         eo_weights: Optional[Dict[int, float]] = None,
+        selling_prices: Optional[Dict[int, float]] = None,
     ) -> Optional[CandidateSquad]:
         """
         Solve MILP for a brand new 15-man squad from scratch (Wildcard / Free Hit) with 0 hits.
@@ -786,8 +787,12 @@ class FPLOptimizer:
         for t in set(team_ids):
             prob += pulp.lpSum([squad_vars[i] for i in indices if team_ids[i] == t]) <= 3, f"Max3Team_{t}"
 
-        # 4. Budget
-        prob += pulp.lpSum([costs[i] * squad_vars[i] for i in indices]) <= total_budget_m, "BudgetLimit"
+        # Retained players consume their liquidation value, just as in the transfer solver.
+        current = current_squad_ids or set()
+        sp_map = selling_prices or {}
+        effective_costs = [sp_map.get(pid, cost) if pid in current else cost
+                           for pid, cost in zip(player_ids, costs)]
+        prob += pulp.lpSum([effective_costs[i] * squad_vars[i] for i in indices]) <= total_budget_m, "BudgetLimit"
 
         # 5. Starters constraints
         for i in indices:
@@ -845,9 +850,8 @@ class FPLOptimizer:
         captain_idx = next(i for i in indices if pulp.value(captain_vars[i]) > 0.5)
 
         selected_squad_ids = {player_ids[i] for i in selected_squad_indices}
-        curr_set = current_squad_ids or set()
-        transfers_out_ids = curr_set - selected_squad_ids
-        transfers_in_ids = selected_squad_ids - curr_set
+        transfers_out_ids = current - selected_squad_ids
+        transfers_in_ids = selected_squad_ids - current
 
         actual_transfers_count = len(transfers_out_ids)
 
@@ -856,7 +860,7 @@ class FPLOptimizer:
         transfers_list: List[TransferMove] = []
         for out_id, in_id in zip(transfers_out_sorted, transfers_in_sorted):
             transfers_list.append(TransferMove(
-                player_out=self._build_player_pick(out_id),
+                player_out=self._build_player_pick(out_id, selling_price_m=sp_map.get(out_id)),
                 player_in=self._build_player_pick(in_id),
             ))
 
@@ -877,7 +881,7 @@ class FPLOptimizer:
         # Multi-GW decayed outlook sum (3-GW)
         multi_gw_sum = round(sum(p.xp_3gw or (p.xp * self.decay_sum) for p in starters) + (captain_pick.xp_3gw or (captain_pick.xp * self.decay_sum)), 2)
 
-        total_cost_m = round(sum(self.player_map[pid]["cost_m"] for pid in selected_squad_ids), 2)
+        total_cost_m = round(sum(effective_costs[i] for i in selected_squad_indices), 2)
         bank_remaining_m = round(total_budget_m - total_cost_m, 2)
 
         return CandidateSquad(
@@ -1157,6 +1161,7 @@ class FPLOptimizer:
         current_gw: Optional[int] = None,
         target_gws: Optional[List[int]] = None,
         eo_weights: Optional[Dict[int, float]] = None,
+        selling_prices: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluation:
         """
         Evaluate Wildcard chip: solves optimal 15-man squad from scratch with zero hit penalties.
@@ -1167,6 +1172,7 @@ class FPLOptimizer:
             current_squad_ids=set(current_squad_ids),
             chip_name="wildcard",
             squad_title="Wildcard Squad (Free Rebuild)",
+            selling_prices=selling_prices,
             eo_weights=eo_weights,
         )
 
@@ -1221,6 +1227,7 @@ class FPLOptimizer:
         current_gw: Optional[int] = None,
         target_gws: Optional[List[int]] = None,
         eo_weights: Optional[Dict[int, float]] = None,
+        selling_prices: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluation:
         """
         Evaluate Free Hit chip: solves optimal 15-man squad for 1 GW only without persisting transfers.
@@ -1231,6 +1238,7 @@ class FPLOptimizer:
             current_squad_ids=set(current_squad_ids),
             chip_name="freehit",
             squad_title="Free Hit Squad (1-GW Optimization)",
+            selling_prices=selling_prices,
             eo_weights=eo_weights,
         )
 
@@ -1379,6 +1387,7 @@ class FPLOptimizer:
         current_gw: Optional[int] = None,
         available_chips: Optional[List[str]] = None,
         eo_weights: Optional[Dict[int, float]] = None,
+        selling_prices: Optional[Dict[int, float]] = None,
     ) -> ChipEvaluationResult:
         """
         Evaluate all chips against environment thresholds and select the best recommendation.
@@ -1389,8 +1398,8 @@ class FPLOptimizer:
         tc_min = float(os.getenv("TRIPLE_CAPTAIN_MIN_XP", "11.5"))
 
         evals: Dict[str, ChipEvaluation] = {
-            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw, eo_weights=eo_weights),
-            "freehit": self.evaluate_free_hit(current_squad_ids, total_budget_m, baseline_candidate, min_gain=fh_min, current_gw=current_gw, eo_weights=eo_weights),
+            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw, eo_weights=eo_weights, selling_prices=selling_prices),
+            "freehit": self.evaluate_free_hit(current_squad_ids, total_budget_m, baseline_candidate, min_gain=fh_min, current_gw=current_gw, eo_weights=eo_weights, selling_prices=selling_prices),
             "bboost": self.evaluate_bench_boost(baseline_candidate, min_bench_xp=bb_min, current_gw=current_gw),
             "3xc": self.evaluate_triple_captain(baseline_candidate, min_captain_xp=tc_min, current_gw=current_gw),
         }
@@ -1523,6 +1532,7 @@ class FPLOptimizer:
                 current_gw=current_gw,
                 eo_weights=eo_weights,
                 available_chips=available_chips,
+                selling_prices=selling_prices,
             )
 
         # Option 7: Recommended Active Chip Candidate or Rank #3 2-Transfer Move
