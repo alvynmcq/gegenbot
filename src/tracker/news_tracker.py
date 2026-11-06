@@ -196,6 +196,7 @@ class NewsTracker:
         """Lightweight keyword-based sentiment scorer. Returns -1 (bad) to +1 (good)."""
         bad_words = [
             "ruled out", "out for", "hamstring", "injury", "injured", "doubt",
+            "injuries", "doubtful", "knocks", "misses", "missed", "missing", "suspension",
             "scan", "knock", "miss", "concern", "unavailable", "suspended",
             "edema", "sprain", "sprained", "sidelined", "broken", "fracture", "torn", "acl", "mcl",
         ]
@@ -203,15 +204,29 @@ class NewsTracker:
             "fit", "trained", "fully fit", "back", "available", "cleared",
             "no concerns", "should be fine", "returns", "ready",
         ]
-        text_l = text.lower()
+        # "no doubt" is an idiom, not a fitness doubt.
+        text_l = re.sub(r"\bno doubt\b", " ", text.lower())
+
+        def has(word: str) -> bool:
+            # Whole words only, so "miss" doesn't match "mission" or "fit" match "benefit".
+            return re.search(rf"\b{re.escape(word)}\b", text_l) is not None
+
         score = 0.0
         for w in bad_words:
-            if w in text_l:
+            if has(w):
                 score -= 0.25
         for w in good_words:
-            if w in text_l:
+            if has(w):
                 score += 0.25
         return round(max(-1.0, min(1.0, score)), 2)
+
+    @staticmethod
+    def _mentions_player(text: str, web_name: str) -> bool:
+        """True if the text names the player (surname from web_name, e.g. 'N.Jackson' -> 'jackson')."""
+        surname = web_name.split(".")[-1].strip().lower()
+        if len(surname) < 3:
+            surname = web_name.strip().lower()
+        return bool(surname) and re.search(rf"\b{re.escape(surname)}\b", text.lower()) is not None
 
     def build_player_intel(
         self,
@@ -243,12 +258,17 @@ class NewsTracker:
             except Exception:
                 pass
 
-        # Compute sentiment from all available text
-        combined_text = " ".join([official_fpl_news] + snippets)
+        # Search results often cover teammates or other clubs. For a player FPL lists
+        # as fully available, only snippets that actually name them may raise their risk.
+        if risk == "CLEARED":
+            relevant_snippets = [s for s in snippets if self._mentions_player(s, web_name)]
+        else:
+            relevant_snippets = snippets
+        combined_text = " ".join([official_fpl_news] + relevant_snippets)
         sentiment = self._compute_sentiment(combined_text) if combined_text.strip() else 0.0
 
         # If live snippets indicate definitive breaking news, adjust risk level
-        if snippets:
+        if relevant_snippets:
             # Check for strong negative sentiment or explicit absence phrases
             severe_phrases = ["ruled out", "will miss", "out of action", "surgery", "broken", "fracture", "torn", "not available", "sidelined"]
             has_severe = any(p in combined_text.lower() for p in severe_phrases)
@@ -265,7 +285,7 @@ class NewsTracker:
             chance_of_playing_next_round=chance_of_playing_next_round,
             official_fpl_news=official_fpl_news,
             news_added=news_added,
-            live_search_snippets=snippets,
+            live_search_snippets=relevant_snippets,
             risk_level=risk,
             news_freshness_hours=freshness_hours,
             sentiment_score=sentiment,

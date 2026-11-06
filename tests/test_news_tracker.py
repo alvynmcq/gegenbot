@@ -517,3 +517,20 @@ def test_ai_director_squad_news_prioritization():
         assert "João Pedro" in breaking[0]
 
 
+
+
+def test_news_tracker_ignores_snippets_about_other_players():
+    """Severe words in search results about other players must not rule out an available player."""
+    tracker = NewsTracker()
+    unrelated = [
+        "Chelsea goalkeeper Emiliano Martinez is hoping to return after suffering a broken jaw.",
+        "[r/FantasyPL] Rate My Team: ... N.Jackson attack. No damn clue who",
+    ]
+    with patch.object(tracker, "_search_web_snippets", return_value=unrelated):
+        intel = tracker.build_player_intel(166, "N.Jackson", "Aston Villa", status="a", is_focal=True)
+    assert intel.risk_level == "CLEARED"
+
+    relevant = ["Emery confirms Nicolas Jackson has been ruled out for three weeks."]
+    with patch.object(tracker, "_search_web_snippets", return_value=relevant):
+        intel = tracker.build_player_intel(166, "N.Jackson", "Aston Villa", status="a", is_focal=True)
+    assert intel.risk_level == "RULED_OUT"
