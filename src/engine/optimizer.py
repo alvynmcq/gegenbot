@@ -180,7 +180,8 @@ class CandidateSquad(BaseModel):
     hit_cost: int
     net_xp: float
     multi_gw_xp: float = 0.0
-    strategic_value_score: float = 0.0  # Net xP + Rolling transfer bonus + Multi-GW outlook
+    strategic_value_score: float = 0.0
+    rolling_plan: Optional[Dict[str, Any]] = None
     total_cost_m: float
     bank_remaining_m: float
     active_chip: Optional[str] = None  # e.g. "wildcard", "freehit", "bboost", "3xc"
@@ -198,6 +199,8 @@ class ChipEvaluation(BaseModel):
     threshold_met: bool
     squad_candidate: Optional[CandidateSquad] = None
     reason: str = ""
+    opportunity: Optional[Dict[str, Any]] = None
+    target_gameweeks: List[int] = Field(default_factory=list)
 
 
 class ChipEvaluationResult(BaseModel):
@@ -757,6 +760,7 @@ class FPLOptimizer:
         squad_title: str = "Optimal Squad From Scratch",
         eo_weights: Optional[Dict[int, float]] = None,
         selling_prices: Optional[Dict[int, float]] = None,
+        prefer_future_squad: bool = False,
     ) -> Optional[CandidateSquad]:
         """
         Solve MILP for a brand new 15-man squad from scratch (Wildcard / Free Hit) with 0 hits.
@@ -835,10 +839,12 @@ class FPLOptimizer:
             prob += pulp.lpSum([starter_vars[i] for i in indices if elem_types[i] == 2]) - 4 <= is_five_def * 10, "FiveDefConstraint_scratch"
             five_def_penalty_term = self.five_def_penalty * is_five_def
 
+        future = (self.df["discounted_3gw"] - self.df["xp"]).clip(lower=0).tolist()
         prob += pulp.lpSum([
             starter_vars[i] * (xps[i] + eo_boosts[i])
             + captain_vars[i] * xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * xps[i]
+            + squad_vars[i] * (0.5 * future[i] if prefer_future_squad else 0.0)
             for i in indices
         ]) - correlation_penalty - five_def_penalty_term, "TotalXP"
 
@@ -1165,6 +1171,7 @@ class FPLOptimizer:
         target_gws: Optional[List[int]] = None,
         eo_weights: Optional[Dict[int, float]] = None,
         selling_prices: Optional[Dict[int, float]] = None,
+        rolling_strategy: bool = False,
     ) -> ChipEvaluation:
         """
         Evaluate Wildcard chip: solves optimal 15-man squad from scratch with zero hit penalties.
@@ -1176,6 +1183,7 @@ class FPLOptimizer:
             chip_name="wildcard",
             squad_title="Wildcard Squad (Free Rebuild)",
             selling_prices=selling_prices,
+            prefer_future_squad=rolling_strategy,
             eo_weights=eo_weights,
         )
 
@@ -1217,6 +1225,7 @@ class FPLOptimizer:
             xp_gain=xp_gain,
             threshold=min_gain,
             threshold_met=threshold_met,
+            target_gameweeks=target_list,
             squad_candidate=wc_squad,
             reason=reason,
         )
@@ -1283,6 +1292,7 @@ class FPLOptimizer:
             xp_gain=xp_gain,
             threshold=min_gain,
             threshold_met=threshold_met,
+            target_gameweeks=target_list,
             squad_candidate=fh_squad,
             reason=reason,
         )
@@ -1329,6 +1339,7 @@ class FPLOptimizer:
             xp_gain=xp_gain,
             threshold=min_bench_xp,
             threshold_met=threshold_met,
+            target_gameweeks=target_list,
             squad_candidate=bb_squad,
             reason=reason,
         )
@@ -1378,6 +1389,7 @@ class FPLOptimizer:
             xp_gain=xp_gain,
             threshold=min_captain_xp,
             threshold_met=threshold_met,
+            target_gameweeks=target_list,
             squad_candidate=tc_squad,
             reason=reason,
         )
@@ -1391,6 +1403,7 @@ class FPLOptimizer:
         available_chips: Optional[List[str]] = None,
         eo_weights: Optional[Dict[int, float]] = None,
         selling_prices: Optional[Dict[int, float]] = None,
+        rolling_strategy: bool = False,
     ) -> ChipEvaluationResult:
         """
         Evaluate all chips against environment thresholds and select the best recommendation.
@@ -1401,7 +1414,7 @@ class FPLOptimizer:
         tc_min = float(os.getenv("TRIPLE_CAPTAIN_MIN_XP", "11.5"))
 
         evals: Dict[str, ChipEvaluation] = {
-            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw, eo_weights=eo_weights, selling_prices=selling_prices),
+            "wildcard": self.evaluate_wildcard(current_squad_ids, total_budget_m, baseline_candidate, min_gain=wc_min, current_gw=current_gw, eo_weights=eo_weights, selling_prices=selling_prices, rolling_strategy=rolling_strategy),
             "freehit": self.evaluate_free_hit(current_squad_ids, total_budget_m, baseline_candidate, min_gain=fh_min, current_gw=current_gw, eo_weights=eo_weights, selling_prices=selling_prices),
             "bboost": self.evaluate_bench_boost(baseline_candidate, min_bench_xp=bb_min, current_gw=current_gw),
             "3xc": self.evaluate_triple_captain(baseline_candidate, min_captain_xp=tc_min, current_gw=current_gw),
@@ -1438,6 +1451,7 @@ class FPLOptimizer:
         evaluate_chips: bool = True,
         available_chips: Optional[List[str]] = None,
         include_chip_candidates: bool = True,
+        rolling_strategy: bool = False,
     ) -> OptimizationResult:
         """
         Generate 7 strategic candidate moves with exact FPL selling math,
@@ -1536,6 +1550,7 @@ class FPLOptimizer:
                 eo_weights=eo_weights,
                 available_chips=available_chips,
                 selling_prices=selling_prices,
+                rolling_strategy=rolling_strategy,
             )
 
         # Option 7: Recommended Active Chip Candidate or Rank #3 2-Transfer Move

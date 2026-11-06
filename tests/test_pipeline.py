@@ -2134,3 +2134,40 @@ def test_director_recency_history_and_captain_guardrail(tmp_path):
     assert [p.id for p in starters if p.is_vice_captain] == [decision.selected_candidate.vice_captain.id]
     assert decision.selected_candidate.vice_captain.id != promoted.id
     assert original.vice_captain.id == promoted.id
+
+
+def test_live_pipeline_exposes_rolling_plan_and_only_submits_current_round(
+    mock_bootstrap_data, mock_fixtures_data, monkeypatch,
+):
+    from src.main import run_pipeline
+
+    monkeypatch.setenv("FPL_TEAM_ID", "123456")
+    client = MagicMock(spec=FPLClient)
+    client.get_bootstrap_static.return_value = mock_bootstrap_data
+    client.get_fixtures.return_value = mock_fixtures_data
+    squad = [1, 2, 5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 27, 28, 29]
+    client.get_my_team.return_value = {
+        "picks": [{"element": pid} for pid in squad],
+        "transfers": {"bank": 50, "limit": 1}, "chips": [],
+    }
+    mock_execution_readback(client, mock_bootstrap_data, monkeypatch)
+    third_week = {3: 4, 4: 3, 1: 2, 2: 1, **{i: i + 1 if i % 2 else i - 1 for i in range(5, 21)}}
+    remaining = {f["team_h"] for f in mock_fixtures_data
+                 if f["event"] is None and third_week[f["team_h"]] == f["team_a"]}
+    assert remaining
+    for fixture in mock_fixtures_data:
+        if fixture["event"] is None and third_week[fixture["team_h"]] == fixture["team_a"]:
+            fixture["event"] = 3
+
+    with patch("src.main.TelegramNotifier"):
+        result = run_pipeline(client, execute=True)
+    assert result["status"] == "success"
+    picked = result["decision"]["selected_candidate"]
+    rounds = picked["rolling_plan"]["rounds"]
+    assert [step["gameweek"] for step in rounds] == [2, 3]
+    if picked["transfers_count"]:
+        client.post_transfers.assert_called_once()
+        assert client.post_transfers.call_args.args[0]["event"] == 2
+    else:
+        client.post_transfers.assert_not_called()
+    client.post_lineup.assert_called_once()

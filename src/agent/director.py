@@ -111,7 +111,8 @@ class AIDirector:
         best_candidate_idx = 0
         best_score = -999.0
         for idx, cand in enumerate(candidates):
-            score = cand.strategic_value_score if cand.strategic_value_score != 0.0 else cand.net_xp
+            score = (cand.strategic_value_score if cand.rolling_plan is not None
+                     or cand.strategic_value_score != 0.0 else cand.net_xp)
             if score > best_score:
                 best_score = score
                 best_candidate_idx = idx
@@ -125,8 +126,10 @@ class AIDirector:
         else:
             tx_desc = ", ".join([f"{t.player_out.web_name} ➔ {t.player_in.web_name}" for t in chosen.transfers])
 
+        basis = (f"a rolling strategy score of {chosen.strategic_value_score}"
+                 if chosen.rolling_plan is not None else f"a MILP projection of {chosen.net_xp} net xP")
         rationale = (
-            f"Selected {chosen.name} based on optimal MILP projection of {chosen.net_xp} net xP. "
+            f"Selected {chosen.name} based on {basis}. "
             f"Handing armband to {c_name} with {vc_name} as vice-captain to maximize expected points."
         )
 
@@ -241,6 +244,7 @@ class AIDirector:
                 "net_xp": cand.net_xp,
                 "multi_gw_xp": cand.multi_gw_xp,
                 "strategic_value_score": cand.strategic_value_score,
+                "rolling_plan": cand.rolling_plan,
                 "bank_remaining_m": cand.bank_remaining_m,
                 "xp_data_flags": xp_flags if xp_flags else [],
             })
@@ -322,6 +326,9 @@ class AIDirector:
                 "If risk_mode is DEFEND: strongly prefer rolling, avoid hits, protect shields. "
                 "If risk_mode is CHASE: actively consider high-EV Moneyball differentials (marked [MONEYBALL BUY] with high xGI and low EO%) to close point deficits against mini-league leaders. "
                 "If risk_mode is NEUTRAL: balance xP optimisation with risk management. "
+                "When rolling_plan is present, use strategic_value_score to compare discounted net points, "
+                "downside, and any chip opportunity cost. Future transfers are provisional. "
+                "Only the first gameweek of the selected option is being decided now. "
                 "CRITICAL GAME THEORY (EO SHIELDING & CAPTAINCY): "
                 "- A vice-captain does NOT shield you from rival Effective Ownership (EO) if your captain plays. "
                 "- When a premium asset (e.g. Haaland, Salah) has high EO (>=80%) in your mini-league, captaining against them is devastating if they haul. Do NOT override the armband to a low-EO differential in early/mid season (GW1-28) unless the premium has confirmed injury/rotation news. "

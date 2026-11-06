@@ -28,6 +28,7 @@ from src.data_fetcher import (
 )
 from src.engine.metrics import calculate_player_metrics, verified_fixture_schedule
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
+from src.engine.strategy import RollingPlanner
 from src.notifier.telegram import TelegramNotifier
 from src.tracker.league_scanner import LeagueAnalysis, LeagueScanner
 from src.tracker.news_tracker import NewsTracker
@@ -717,19 +718,55 @@ def run_pipeline(
             chip_season_plan["forced_chip"] = forced_chip
 
 
-    # 5. PuLP MILP Optimization & Automated Chip Evaluation
-    logger.info("Running PuLP MILP solver (Multi-Period Horizon, Real Selling Prices & EO Shielding)...")
-    opt_result = optimizer.optimize(
-        current_squad_ids=current_squad_ids,
-        bank_m=bank_m,
-        free_transfers=free_transfers,
-        selling_prices=selling_prices,
-        eo_weights=eo_weights,
-        current_gw=gw_id,
-        evaluate_chips=True,
-        available_chips=eligible_chips,
-        include_chip_candidates=enable_auto_chips and not forced_chip,
-    )
+    # Build legal first moves with MILP, then price their possible continuations.
+    scheduled = {f.get("event") for f in fixtures if not f.get("finished")}
+    planning_weeks = [gw_id]
+    if schedule_complete:
+        for week in range(gw_id + 1, gw_id + min(4, optimizer.horizon_length)):
+            if week not in scheduled:
+                break
+            planning_weeks.append(week)
+
+    def restrict_forced_rebuild(result):
+        if forced_chip in ("wildcard", "freehit"):
+            evaluation = result.chip_evaluation
+            rebuild = evaluation.evaluations.get(forced_chip) if evaluation else None
+            if rebuild is None or rebuild.squad_candidate is None:
+                raise RuntimeError("Forced chip has no valid squad rebuild")
+            candidate = rebuild.squad_candidate.model_copy(deep=True)
+            candidate.active_chip = forced_chip
+            result.candidates = [candidate]
+
+    def optimize_strategy(veto=()):
+        planner = None
+        if len(planning_weeks) > 1:
+            planner = RollingPlanner(
+                optimizer, gw_id, planning_weeks, current_squad_ids, bank_m, free_transfers,
+                selling_prices=selling_prices,
+                max_hit_points=max(0, int(os.getenv("FPL_MAX_HIT_POINTS", "0"))),
+                risk_mode=competitive_context.get("risk_mode", "NEUTRAL"),
+                transfers_made=live_baseline["made"] if live_baseline else 0,
+                transfer_limit=live_baseline["limit"] if live_baseline else None,
+            )
+        result = optimizer.optimize(
+            current_squad_ids=current_squad_ids,
+            bank_m=bank_m,
+            free_transfers=free_transfers,
+            selling_prices=selling_prices,
+            eo_weights=eo_weights,
+            current_gw=gw_id,
+            evaluate_chips=True,
+            available_chips=eligible_chips,
+            include_chip_candidates=planner is None and enable_auto_chips and not forced_chip,
+            rolling_strategy=planner is not None,
+        )
+        if planner is not None:
+            planner.annotate(result, live_chip_inventory, enable_auto_chips and not forced_chip,
+                             forced_chip=forced_chip, veto=veto)
+        restrict_forced_rebuild(result)
+        return result, planner
+
+    opt_result, planner = optimize_strategy()
 
     logger.info(f"Generated {len(opt_result.candidates)} candidate options:")
     for idx, cand in enumerate(opt_result.candidates, start=1):
@@ -758,7 +795,7 @@ def run_pipeline(
                 triggered_chip_eval["threshold_met"] = True
                 triggered_chip_eval["forced"] = True
                 logger.info(
-                    f"⚡ USER FORCED CHIP ACTIVATED: {f_eval.display_name} "
+                    f"⚡ USER-FORCED CHIP PROPOSED: {f_eval.display_name} "
                     f"(Projected: {f_eval.projected_xp:.2f} pts | Gain: +{f_eval.xp_gain:.2f} xP)"
                 )
         elif enable_auto_chips and opt_result.chip_evaluation.recommended_chip:
@@ -766,7 +803,7 @@ def run_pipeline(
             c_eval = opt_result.chip_evaluation.evaluations[recommended_chip]
             triggered_chip_eval = c_eval.model_dump()
             logger.info(
-                f"⚡ AUTOMATED CHIP ACTIVATED: {c_eval.display_name} "
+                f"⚡ AUTOMATIC CHIP PROPOSED: {c_eval.display_name} "
                 f"(Gain: +{c_eval.xp_gain:.2f} xP | Total: {c_eval.projected_xp:.2f} pts)"
             )
             logger.info(f"   Rationale: {c_eval.reason}")
@@ -779,7 +816,7 @@ def run_pipeline(
     news_tracker = NewsTracker(search_timeout=3)
     focal_player_ids: Set[int] = set()
     # Prioritize captains, vice-captains, transfer targets, and starters from top options
-    for cand in opt_result.candidates[:5]:
+    for cand in opt_result.candidates:
         if cand.captain:
             focal_player_ids.add(cand.captain.id)
         if cand.vice_captain:
@@ -807,17 +844,6 @@ def run_pipeline(
 
     recent_performance = _load_recent_performance_history(limit=3)
 
-    def restrict_forced_rebuild(result):
-        if forced_chip in ("wildcard", "freehit"):
-            evaluation = result.chip_evaluation
-            rebuild = evaluation.evaluations.get(forced_chip) if evaluation else None
-            if rebuild is None or rebuild.squad_candidate is None:
-                raise RuntimeError("Forced chip has no valid squad rebuild")
-            candidate = rebuild.squad_candidate.model_copy(deep=True)
-            candidate.active_chip = forced_chip
-            result.candidates = [candidate]
-
-    restrict_forced_rebuild(opt_result)
     logger.info("Consulting AI Decision Director...")
     director = AIDirector()
     decision = director.evaluate_and_decide(
@@ -861,17 +887,7 @@ def run_pipeline(
             optimizer.df.loc[optimizer.df["id"] == pid, "discounted_xp"] = 0.0
             optimizer.df.loc[optimizer.df["id"] == pid, "xp"] = 0.0
 
-        opt_result = optimizer.optimize(
-            current_squad_ids=current_squad_ids,
-            bank_m=bank_m,
-            free_transfers=free_transfers,
-            selling_prices=selling_prices,
-            eo_weights=eo_weights,
-            current_gw=gw_id,
-            evaluate_chips=True,
-            available_chips=eligible_chips,
-            include_chip_candidates=enable_auto_chips and not forced_chip,
-        )
+        opt_result, planner = optimize_strategy(decision.veto_player_ids)
         logger.info(f"Re-solved! Generated {len(opt_result.candidates)} clean candidate options without vetoed players.")
         recommended_chip = forced_chip or (
             opt_result.chip_evaluation.recommended_chip
@@ -883,7 +899,6 @@ def run_pipeline(
         )
 
 
-        restrict_forced_rebuild(opt_result)
         decision = director.evaluate_and_decide(
             opt_result,
             league_analysis,
@@ -896,7 +911,8 @@ def run_pipeline(
     # Recheck lineup-chip value against the final XI and captain chosen by the Director.
     chosen = decision.selected_candidate
     active_chip = chosen.active_chip
-    lineup_chip = active_chip or recommended_chip
+    # A rolling chip comparison is specific to the candidate the Director selected.
+    lineup_chip = active_chip or (recommended_chip if planner is None or forced_chip else None)
     if (enable_auto_chips or forced_chip) and lineup_chip in ("bboost", "3xc"):
         baseline = chosen.model_copy(deep=True)
         if active_chip == "bboost":
@@ -909,7 +925,22 @@ def run_pipeline(
         else:
             threshold = float(os.getenv("TRIPLE_CAPTAIN_MIN_XP", "11.5"))
             evaluation = optimizer.evaluate_triple_captain(baseline, min_captain_xp=threshold, current_gw=gw_id)
+        opportunity = (opt_result.chip_evaluation.evaluations[lineup_chip].opportunity
+                       if planner is not None and opt_result.chip_evaluation else None)
+        if opportunity is not None:
+            evaluation.opportunity = opportunity
         active_chip = lineup_chip if evaluation.threshold_met or forced_chip == lineup_chip else None
+        if active_chip and planner is not None and not forced_chip:
+            ordinary = max(c.strategic_value_score for c in opt_result.candidates if not c.active_chip)
+            chosen.net_xp = evaluation.projected_xp
+            later = (opportunity or {}).get("best_later_gain") or 0.0
+            planner.record(chosen, opportunity_cost=later)
+            edge = round(chosen.strategic_value_score - ordinary, 2)
+            if evaluation.opportunity is not None:
+                evaluation.opportunity = {**opportunity, "play_now_gain": round(edge + later, 2),
+                                          "play_now_edge": edge}
+            if edge <= 0:
+                active_chip = None
         chosen.active_chip = active_chip
         chosen.net_xp = evaluation.projected_xp if active_chip else round(baseline.net_xp, 2)
         decision.projected_net_xp = chosen.net_xp
@@ -921,6 +952,9 @@ def run_pipeline(
         elif not active_chip and baseline.active_chip:
             name = f"Option {decision.selected_candidate_index + 1}: {chosen.transfers_count} transfers"
             decision.chosen_move_name = chosen.name = name
+    if planner is not None and chosen.rolling_plan is not None:
+        opportunity_cost = chosen.rolling_plan["chip_opportunity_cost"] if active_chip else 0.0
+        planner.record(chosen, opportunity_cost=opportunity_cost)
     if triggered_chip_eval and triggered_chip_eval.get("chip_name") != active_chip:
         triggered_chip_eval = None
 

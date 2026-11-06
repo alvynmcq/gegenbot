@@ -153,6 +153,24 @@ official season minutes. Live decisions require an official fixture schedule. Th
 sums heuristic points across each fixture in a double and gives blanks zero points.
 Published gameweek totals are used once.
 
+### Rolling strategy
+
+With a verified fixture schedule, Gegenbot evaluates current MILP candidates over
+up to four consecutive gameweeks. It forecasts the bank, selling prices, free
+transfers and hits after each move, searches up to two future transfers per round,
+and credits saved transfers at the end of the horizon. Future prices are held
+constant. Only the current round can reach the execution journal.
+
+The decision records discounted net expected points and a downside estimate for
+appearance uncertainty, rotation, captaincy exposure and shared club results.
+DEFEND penalizes that uncertainty more than NEUTRAL or CHASE. These risk estimates
+are model assumptions and have yet to be calibrated in replay.
+
+Automatic chip proposals compare playing now with the strongest eligible use of
+the same chip in the forecast horizon. The comparison carries Wildcard changes
+forward and restores the original squad after a Free Hit. It keeps the existing
+activation opt-in and does not value chip opportunities beyond the forecast horizon.
+
 ### FPL login tokens
 FPL signs in through PingOne (`account.premierleague.com`) and has no password login for scripts, so Gegenbot uses an OAuth refresh token taken from your browser:
 
