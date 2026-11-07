@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 import requests
 from pydantic import BaseModel, Field
 
-from src.engine.optimizer import CandidateSquad, OptimizationResult
+from src.engine.optimizer import CandidateSquad, OptimizationResult, optimizer_choice_index
 from src.tracker.league_scanner import LeagueAnalysis
 from src.tracker.news_tracker import PlayerNewsIntel
 
@@ -108,15 +108,7 @@ class AIDirector:
         if not candidates:
             raise ValueError("No candidates available for fallback decision.")
 
-        best_candidate_idx = 0
-        best_score = -999.0
-        for idx, cand in enumerate(candidates):
-            score = (cand.strategic_value_score if cand.rolling_plan is not None
-                     or cand.strategic_value_score != 0.0 else cand.net_xp)
-            if score > best_score:
-                best_score = score
-                best_candidate_idx = idx
-
+        best_candidate_idx = optimizer_choice_index(optimization_result)
         chosen = candidates[best_candidate_idx]
         c_name = chosen.captain.web_name if chosen.captain else "Unknown"
         vc_name = chosen.vice_captain.web_name if chosen.vice_captain else "Unknown"

@@ -171,6 +171,47 @@ the same chip in the forecast horizon. The comparison carries Wildcard changes
 forward and restores the original squad after a Free Hit. It keeps the existing
 activation opt-in and does not value chip opportunities beyond the forecast horizon.
 
+### Historical replay and Director evaluation
+
+A live decision with a verified schedule freezes its first pre-deadline replay
+snapshot in `data/replay/snapshots/<season>/gwNN.json`. It records forecast
+numbers and scoring lineups. It does not store auth tokens, account details, or
+Director prompts. The archive evaluates recommendations even if a later write
+fails. A dry run does not create a production snapshot.
+
+Collect finalized results and score the snapshots separately:
+
+```bash
+python -m src.replay fetch-outcomes data/replay/snapshots data/replay/outcomes
+python -m src.replay score data/replay/snapshots data/replay/outcomes --output data/replay/report.json
+```
+
+The fetch command uses only public current-season FPL results marked finished and
+checked. For earlier seasons, supply one outcome JSON file per gameweek under the
+season directory. It needs `version: 1`, `season`, `gameweek`, `finalized: true`,
+`deadline`, `collected_at`, and `players` keyed by FPL ID with `minutes`,
+`points`, and optional `cards`. The scoring command is offline. It handles substitutions, captain and vice
+captain, chips, and points hits. Player forecast error and calibration compare
+Gegenbot, official `ep_next`, and season points per game times scheduled fixtures
+on the same player-gameweeks. Coverage is reported separately.
+
+Optimizer-only, immediate-xP, and roll policies share the same starting state
+and candidate pool. The Director's paired score includes its final selection
+and captaincy but holds the final candidate pool fixed, so it does not measure
+the separate effect of news vetoes. Forced chips and model fallbacks are excluded
+from the AI comparison. Bootstrap intervals are exploratory and only appear
+after eight paired gameweeks. Each gameweek is a separate counterfactual, with no
+simulated transfer carryover between historical observations.
+
+To replay older weeks without a Gegenbot capture, run
+`python -m src.replay reconstruct bundle.json data/replay/snapshots`.
+A bundle supplies `captured_at` (UTC ISO timestamp), `provenance`, `gameweek`,
+the archived `bootstrap` and `fixtures` responses, and the starting `squad`
+(player IDs), `bank_m`, `free_transfers`, and `selling_prices` (ID to £m).
+An optional `max_hit_points` defaults to zero. Use a separate snapshot directory
+for alternate experiments. Reconstruction runs offline and reports optimizer
+benchmarks without creating a retrospective AI decision.
+
 ### FPL login tokens
 FPL signs in through PingOne (`account.premierleague.com`) and has no password login for scripts, so Gegenbot uses an OAuth refresh token taken from your browser:
 

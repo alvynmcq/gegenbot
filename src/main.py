@@ -21,6 +21,7 @@ from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
 from src.state import atomic_write_json
+from src.replay import capture_snapshot
 from src.execution import build_plan, execute_plan, execution_path, planning_snapshot
 from src.chips import available_chips
 from src.data_fetcher import (
@@ -908,6 +909,8 @@ def run_pipeline(
             recent_performance=recent_performance,
         )
 
+    # Keep the shared candidate set as it was before final captain/chip adjustments.
+    replay_options = opt_result.model_copy(deep=True) if execute and schedule_complete else None
     # Recheck lineup-chip value against the final XI and captain chosen by the Director.
     chosen = decision.selected_candidate
     active_chip = chosen.active_chip
@@ -1000,6 +1003,19 @@ def run_pipeline(
         "league_analysis": league_analysis.model_dump() if league_analysis else None,
         "news_intelligence": [v.model_dump() for v in news_intel.values()] if news_intel else [],
     }
+
+    if replay_options is not None and season:
+        try:
+            limit = live_baseline["limit"]
+            previous_hit = 4 * max(0, live_baseline["made"] - limit) if limit is not None else 0
+            capture_snapshot(
+                state_dir / "replay" / "snapshots", season=season, gameweek=gw_id,
+                deadline=deadline_time, players=players_df, bootstrap=bootstrap,
+                optimization=replay_options, decision=decision, model=director.model,
+                previous_hit=previous_hit, forced_chip=forced_chip, veto_count=len(auto_veto_ids),
+            )
+        except Exception as exc:
+            logger.warning("Could not freeze replay snapshot (%s)", type(exc).__name__)
 
     live_execution_success = False
     if execute:

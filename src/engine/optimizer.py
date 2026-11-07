@@ -219,6 +219,17 @@ class OptimizationResult(BaseModel):
     chip_evaluation: Optional[ChipEvaluationResult] = None
 
 
+def optimizer_choice_index(result: OptimizationResult) -> int:
+    """Select the deterministic optimizer-only policy on an ordered candidate set."""
+    def score(index):
+        candidate = result.candidates[index]
+        if candidate.rolling_plan is not None or candidate.strategic_value_score != 0:
+            return candidate.strategic_value_score
+        return candidate.net_xp
+
+    return max(range(len(result.candidates)), key=score)
+
+
 def _parse_target_gws(env_var_name: str) -> List[int]:
     """Parse comma-separated gameweek targets from environment variable."""
     raw = os.getenv(env_var_name, "").strip()

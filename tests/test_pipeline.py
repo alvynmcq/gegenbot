@@ -2137,7 +2137,7 @@ def test_director_recency_history_and_captain_guardrail(tmp_path):
 
 
 def test_live_pipeline_exposes_rolling_plan_and_only_submits_current_round(
-    mock_bootstrap_data, mock_fixtures_data, monkeypatch,
+    mock_bootstrap_data, mock_fixtures_data, monkeypatch, tmp_path,
 ):
     from src.main import run_pipeline
 
@@ -2165,6 +2165,10 @@ def test_live_pipeline_exposes_rolling_plan_and_only_submits_current_round(
     picked = result["decision"]["selected_candidate"]
     rounds = picked["rolling_plan"]["rounds"]
     assert [step["gameweek"] for step in rounds] == [2, 3]
+    archive = json.loads((tmp_path / "data/replay/snapshots/2026-2027/gw02.json").read_text())
+    assert archive["director_source"] == "MATHEMATICAL_FALLBACK"
+    assert set(archive["policies"]) == {"optimizer_only", "immediate_xp", "roll"}
+    assert len(archive["forecasts"]) == len(mock_bootstrap_data["elements"])
     if picked["transfers_count"]:
         client.post_transfers.assert_called_once()
         assert client.post_transfers.call_args.args[0]["event"] == 2
