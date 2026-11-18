@@ -29,6 +29,7 @@ from src.data_fetcher import (
 )
 from src.engine.metrics import calculate_player_metrics, verified_fixture_schedule
 from src.engine.optimizer import FPLOptimizer, OptimizationResult
+from src.engine.rivalry import choose_target
 from src.engine.strategy import RollingPlanner
 from src.notifier.telegram import TelegramNotifier
 from src.tracker.league_scanner import LeagueAnalysis, LeagueScanner
@@ -656,6 +657,7 @@ def run_pipeline(
                 gameweek=scan_gw,
                 my_team_ids=set(current_squad_ids),
                 bootstrap_data=bootstrap,
+                my_entry_id=int(team_id_str) if team_id_str and team_id_str.isdigit() else None,
             )
             eo_weights = league_analysis.raw_eo
             logger.info(
@@ -687,6 +689,26 @@ def run_pipeline(
             )
         except Exception as e:
             logger.warning(f"Could not enrich competitive context with league standings: {e}")
+
+    # Head-to-head target: the leader when behind, the nearest chaser when leading.
+    head_to_head: Optional[Dict[str, Any]] = None
+    if (league_analysis and league_analysis.rival_picks and team_id_str and team_id_str.isdigit()
+            and os.getenv("HEAD_TO_HEAD_RISK", "true").lower() in ("true", "1", "yes")):
+        standings = [{"entry": r.entry_id, "rank": r.rank, "total": r.total_points} for r in league_analysis.rivals]
+        target = choose_target(standings, int(team_id_str))
+        if target and target[0] in league_analysis.rival_picks:
+            entry, gap = target
+            name = next((r.player_name for r in league_analysis.rivals if r.entry_id == entry), str(entry))
+            head_to_head = {"entry": entry, "name": name, "gap": gap,
+                            "weeks_remaining": max(1, 39 - gw_id),
+                            "rival": league_analysis.rival_picks[entry]}
+            competitive_context["head_to_head_target"] = {
+                "rival": name, "points_gap": gap, "weeks_remaining": head_to_head["weeks_remaining"],
+                "note": ("Risk is measured on your score minus this rival's; spread is sought when "
+                         "behind and avoided when ahead, more strongly as the season runs out."),
+            }
+            logger.info("Head-to-head target: %s (%+.0f pts, %d GWs left)", name, gap,
+                        head_to_head["weeks_remaining"])
 
     # Tactical Mode Override (CLI --mode or FORCE_RISK_MODE env var)
     forced_mode = (force_mode or os.getenv("FORCE_RISK_MODE", "")).strip().upper() or None
@@ -768,13 +790,23 @@ def run_pipeline(
                 risk_mode=competitive_context.get("risk_mode", "NEUTRAL"),
                 transfers_made=live_baseline["made"] if live_baseline else 0,
                 transfer_limit=live_baseline["limit"] if live_baseline else None,
+                rival=head_to_head["rival"] if head_to_head else None,
+                rival_gap=head_to_head["gap"] if head_to_head else None,
+                weeks_remaining=head_to_head["weeks_remaining"] if head_to_head else None,
             )
+        rival_eo = eo_weights
+        optimizer.variance_weight = 0.0
+        if planner is not None and planner.rival is not None:
+            optimizer.variance_weight = planner.variance_weight
+            rival_eo = {pid: 100.0 * m for pid, m in planner.rival.items()}
+            logger.info("Head-to-head risk price %+.3f pts per point of weekly spread (spread %.1f).",
+                        planner.risk_price, planner.base_sd)
         result = optimizer.optimize(
             current_squad_ids=current_squad_ids,
             bank_m=bank_m,
             free_transfers=free_transfers,
             selling_prices=selling_prices,
-            eo_weights=eo_weights,
+            eo_weights=rival_eo,
             current_gw=gw_id,
             evaluate_chips=True,
             available_chips=eligible_chips,
@@ -1116,6 +1148,7 @@ def run_post_deadline_intel(client: FPLClient, target_gw: Optional[int] = None):
         gameweek=gw_id,
         my_team_ids=my_team_set,
         bootstrap_data=bootstrap,
+        my_entry_id=int(os.getenv("FPL_TEAM_ID", "0").strip() or 0) or None,
     )
 
     # Update state file with new league analysis

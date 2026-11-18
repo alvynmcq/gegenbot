@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field
 
 from src.api.client import FPLClient
+from src.engine.rivalry import lineup_multipliers
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ class LeagueAnalysis(BaseModel):
     captain_distribution: Dict[str, int] = Field(default_factory=dict)
     threat_matrix: ThreatMatrix = Field(default_factory=ThreatMatrix)
     raw_eo: Dict[int, float] = Field(default_factory=dict)
+    # Each rival's last lineup: entry -> {player: 0 bench, 1 starter, 2 captain}
+    rival_picks: Dict[int, Dict[int, float]] = Field(default_factory=dict)
 
 
 class LeagueScanner:
@@ -92,6 +95,7 @@ class LeagueScanner:
         gameweek: Optional[int] = None,
         my_team_ids: Optional[Set[int]] = None,
         bootstrap_data: Optional[Dict[str, Any]] = None,
+        my_entry_id: Optional[int] = None,
     ) -> LeagueAnalysis:
         """
         Scan all managers in the specified mini-league concurrently for the target gameweek.
@@ -132,6 +136,9 @@ class LeagueScanner:
             )
 
         total_managers = len(results)
+        # Your own picks are not rival ownership.
+        rival_count = sum(1 for m in results if m.get("entry") != my_entry_id) or 1
+        rival_picks: Dict[int, Dict[int, float]] = {}
         player_ownership_count: Dict[int, int] = {}
         player_eo_weighted: Dict[int, float] = {}
         captain_counts: Dict[str, int] = {}
@@ -170,6 +177,8 @@ class LeagueScanner:
             )
 
             picks_data = picks_results.get(entry_id)
+            if picks_data and entry_id != my_entry_id:
+                rival_picks[entry_id] = lineup_multipliers(picks_data.get("picks", []))
             if picks_data:
                 entry_history = picks_data.get("entry_history", {})
                 rival_summary.event_transfers_cost = entry_history.get("event_transfers_cost", 0)
@@ -177,6 +186,8 @@ class LeagueScanner:
 
                 picks = picks_data.get("picks", [])
                 for pick in picks:
+                    if entry_id == my_entry_id:
+                        break
                     pid = pick["element"]
                     multiplier = pick.get("multiplier", 1)
                     is_captain = pick.get("is_captain", False)
@@ -195,8 +206,8 @@ class LeagueScanner:
         eo_percentages: Dict[int, float] = {}
         ownership_percentages: Dict[int, float] = {}
         for pid, weighted_val in player_eo_weighted.items():
-            eo_percentages[pid] = round((weighted_val / total_managers) * 100.0, 1)
-            ownership_percentages[pid] = round((player_ownership_count.get(pid, 0) / total_managers) * 100.0, 1)
+            eo_percentages[pid] = round((weighted_val / rival_count) * 100.0, 1)
+            ownership_percentages[pid] = round((player_ownership_count.get(pid, 0) / rival_count) * 100.0, 1)
 
         # Build Threat Matrix lists
         shields: List[ThreatPlayer] = []
@@ -280,4 +291,5 @@ class LeagueScanner:
             captain_distribution=captain_counts,
             threat_matrix=threat_matrix,
             raw_eo=eo_percentages,
+            rival_picks=rival_picks,
         )

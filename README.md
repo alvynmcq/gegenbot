@@ -55,6 +55,7 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 * **Bench Strength / Sub-Factor Optimization:** Weighs substitute players at $10\%$ expected auto-sub utility, ensuring reliable £4.0m/£4.5m playing bench depth while avoiding non-playing deadwood.
 * **Exact Selling Price Accounting:** Ingests live `selling_price` from the FPL API to calculate precise squad liquidation values (half-profit rule), preventing HTTP 400 transfer rejections.
 * **Game-Theoretic Effective Ownership (EO%) Shielding:** Scans rival squads in configured mini-leagues to identify **Shields** (high-ownership rivals), **Vulnerabilities**, and **Daggers** (differentials) to protect or gain rank.
+* **Head-to-Head Risk Pricing (`src/engine/rivalry.py`):** Targets the mini-league leader when behind (or the nearest chaser when leading) and measures risk on *your score minus theirs*, using that rival's last lineup. Rival ownership never changes expected advantage, only its spread (per-player variance ≈ 3.5 × xP, from a 2025-26 backtest). Spread is priced at `gap ÷ (weeks left × weekly spread)`, capped at ±1: sought when behind, avoided when ahead, and small early in the season. The solver and rolling planner both use it, and the planner weighs the top three captain options. Falls back to the DEFEND/NEUTRAL/CHASE weights when rival picks are unavailable.
 * **Banked Free Transfer Valuation:** Awards $+1.5\text{ xP}$ strategic value to banking a free transfer, preventing unnecessary lateral churn.
 
 ### 2. Moneyball Analytics & Sabermetrics Engine
@@ -127,6 +128,7 @@ DECAY_FACTOR=0.85                # Horizon Decay Factor (gamma)
 HORIZON_LENGTH=3                 # Lookahead horizon in Gameweeks (1 to 5)
 POINTS_MODEL_ENABLED=true        # Build Gegenbot's own fixture-level points model
 FORECAST_NEXT_GW_SOURCE=ep_next  # ep_next (default) or model, for the next gameweek only
+HEAD_TO_HEAD_RISK=true           # Price risk against the target rival (false = fixed mode weights)
 BENCH_WEIGHT_FACTOR=0.10         # Auto-sub utility weight for bench players
 HIT_MIN_NET_XP_GAIN=5.0          # Minimum net xP gain required to justify taking a -4 hit
 ROLLING_BONUS_XP=1.5             # Strategic valuation for rolling/banking a Free Transfer

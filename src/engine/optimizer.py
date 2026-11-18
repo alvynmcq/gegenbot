@@ -16,6 +16,8 @@ import pandas as pd
 import pulp
 from pydantic import BaseModel, Field
 
+from src.engine.rivalry import player_variance
+
 logger = logging.getLogger(__name__)
 
 
@@ -283,6 +285,9 @@ class FPLOptimizer:
             bench_weight if bench_weight is not None else os.getenv("BENCH_WEIGHT_FACTOR", os.getenv("SUB_FACTOR", "0.10"))
         )
         self.decay_weights, self.decay_sum = calculate_decay_weights(self.horizon_length, self.decay_factor)
+        # Weight on head-to-head variance vs a target rival (see src/engine/rivalry.py).
+        # Zero leaves the objective as plain expected points; eo_weights then has no effect.
+        self.variance_weight = 0.0
 
         # Correlation & fixture clash parameters
         self.enable_correlation_penalties = (
@@ -660,6 +665,23 @@ class FPLOptimizer:
 
         return starters, bench, captain_pick, vc_pick, formation
 
+    def _rival_variance_term(self, starter_vars, captain_vars, indices, eo_map, xps):
+        """Linear change in head-to-head variance from starting/captaining each player.
+
+        With m = starter + captain and rival multiplier e, (m - e)^2 - e^2 = m^2 - 2me,
+        and for binaries with captain <= starter, m^2 = starter + 3 * captain.
+        """
+        if not self.variance_weight:
+            return 0
+        player_ids = self.df["id"].tolist()
+        terms = []
+        for i in indices:
+            e = eo_map.get(player_ids[i], 0.0) / 100.0
+            variance = player_variance(xps[i])
+            if variance:
+                terms.append(variance * ((1 - 2 * e) * starter_vars[i] + (3 - 2 * e) * captain_vars[i]))
+        return self.variance_weight * pulp.lpSum(terms) if terms else 0
+
     def _add_correlation_penalties(
         self,
         prob: pulp.LpProblem,
@@ -837,8 +859,7 @@ class FPLOptimizer:
         prob += pulp.lpSum([captain_vars[i] for i in indices]) == 1, "OneCaptain"
 
         # 7. Objective with optional EO shield weighting, sub factor bench weighting, correlation penalties, and 5-DEF fragility penalty
-        eo_map = eo_weights or {}
-        eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
+        rival_term = self._rival_variance_term(starter_vars, captain_vars, indices, eo_weights or {}, xps)
 
         correlation_penalty = self._add_correlation_penalties(
             prob, starter_vars, captain_vars, indices
@@ -852,12 +873,12 @@ class FPLOptimizer:
 
         future = (self.df["discounted_3gw"] - self.df["xp"]).clip(lower=0).tolist()
         prob += pulp.lpSum([
-            starter_vars[i] * (xps[i] + eo_boosts[i])
+            starter_vars[i] * xps[i]
             + captain_vars[i] * xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * xps[i]
             + squad_vars[i] * (0.5 * future[i] if prefer_future_squad else 0.0)
             for i in indices
-        ]) - correlation_penalty - five_def_penalty_term, "TotalXP"
+        ]) + rival_term - correlation_penalty - five_def_penalty_term, "TotalXP"
 
         status = _solve_problem(prob)
 
@@ -1024,13 +1045,12 @@ class FPLOptimizer:
                     )
 
         # 9. Objective function with correlation penalties and 5-DEF fragility penalty:
-        eo_map = eo_weights or {}
-        eo_boosts = [(eo_map.get(player_ids[i], 0.0) / 100.0) * 0.02 * xps[i] for i in indices]
-
         blended_xps = [
             round((1.0 - multi_gw_weight) * xps[i] + multi_gw_weight * (xps_3gw[i] / self.decay_sum), 3)
             for i in indices
         ]
+
+        rival_term = self._rival_variance_term(starter_vars, captain_vars, indices, eo_weights or {}, blended_xps)
 
         correlation_penalty = self._add_correlation_penalties(
             prob, starter_vars, captain_vars, indices
@@ -1043,11 +1063,11 @@ class FPLOptimizer:
             five_def_penalty_term = self.five_def_penalty * is_five_def
 
         prob += pulp.lpSum([
-            starter_vars[i] * (blended_xps[i] + eo_boosts[i])
+            starter_vars[i] * blended_xps[i]
             + captain_vars[i] * blended_xps[i]
             + (squad_vars[i] - starter_vars[i]) * self.bench_weight * blended_xps[i]
             for i in indices
-        ]) - correlation_penalty - five_def_penalty_term, "TotalXP"
+        ]) + rival_term - correlation_penalty - five_def_penalty_term, "TotalXP"
 
         status = _solve_problem(prob)
 

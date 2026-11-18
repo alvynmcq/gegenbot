@@ -580,6 +580,13 @@ def test_league_scanner_threat_matrix(mock_bootstrap_data):
         vuln_ids = [p.id for p in analysis.threat_matrix.vulnerabilities]
         assert 25 in vuln_ids
 
+        # Bob (102) is me: his picks are not rival ownership, but Alice's lineup is kept.
+        mine = scanner.scan_league(league_id=999, gameweek=1, my_team_ids=my_team,
+                                   bootstrap_data=mock_bootstrap_data, my_entry_id=102)
+        assert mine.raw_eo[15] == 200.0 and mine.raw_eo[25] == 100.0
+        assert mine.rival_picks == {101: {15: 2.0, 25: 1.0}}
+        assert mine.total_managers == 2
+
 
 def test_get_latest_live_gameweek():
     """Test get_latest_live_gameweek identifies past deadlines and handles pre-season."""

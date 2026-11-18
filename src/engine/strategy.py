@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from math import sqrt
 
 from src.chips import available_chips
+from src.engine.rivalry import relative_sd, risk_price
 
 RISK_WEIGHTS = {"DEFEND": 0.45, "NEUTRAL": 0.22, "CHASE": 0.10}
 REBUILD_CHIPS = {"wildcard", "freehit"}
@@ -36,7 +37,8 @@ class RollingPlanner:
     """Compare legal first moves using a small beam of plausible continuations."""
 
     def __init__(self, optimizer, gameweek, weeks, squad, bank, free, selling_prices=None,
-                 max_hit_points=0, risk_mode="NEUTRAL", transfers_made=0, transfer_limit=None):
+                 max_hit_points=0, risk_mode="NEUTRAL", transfers_made=0, transfer_limit=None,
+                 rival=None, rival_gap=None, weeks_remaining=None):
         self.players = optimizer.player_map
         self.gameweek = gameweek
         self.weeks = tuple(weeks)
@@ -64,6 +66,25 @@ class RollingPlanner:
                 immediate = sorted(ids, key=lambda pid: (-self._points(pid, week), self.buy[pid], pid))
                 self.pools[week][position] = tuple(dict.fromkeys(best[:5] + cheap[:3] + immediate[:4]))
 
+        # Head-to-head mode: risk is the spread of (my points - target rival's points),
+        # priced from the gap and the weeks left instead of a fixed mode weight.
+        self.rival = None
+        self.risk_price = None
+        self.base_sd = None
+        if rival and rival_gap is not None and weeks_remaining:
+            self.rival = {pid: float(m) for pid, m in rival.items() if pid in self.players}
+            self.risk_weight = 0.0
+            _, starters, _, captain, _, self.base_sd = self._lineup(squad, gameweek)
+            self.risk_price = round(risk_price(rival_gap, weeks_remaining, self.base_sd), 4)
+            self.risk_weight = -self.risk_price
+            self.lineup_cache = {}
+
+    @property
+    def variance_weight(self):
+        """Linear weight on head-to-head variance for the MILP (d SD = d Var / 2 SD)."""
+        if not self.risk_price or not self.base_sd:
+            return 0.0
+        return self.risk_price / (2 * self.base_sd)
     def _points(self, pid, week):
         row = self.players[pid]
         if week == self.gameweek:
@@ -72,6 +93,11 @@ class RollingPlanner:
 
     def _risk(self, week, starters, captain, bench=(), triple=False):
         """Moment-based downside proxy with shared club and individual appearance risk."""
+        if self.rival is not None:
+            mine = Counter(starters + bench)
+            mine[captain] += 2 if triple else 1
+            points = {pid: self._points(pid, week) for pid in set(mine) | set(self.rival)}
+            return relative_sd(mine, self.rival, points)
         independent = 0.0
         clubs = Counter()
         appearances = Counter(starters + bench)
@@ -106,12 +132,14 @@ class RollingPlanner:
                 attackers = [pid for pid in starters if self.players[pid]["element_type"] in (3, 4)
                              and self._points(pid, week) > 0]
                 captain_pool = starters if self.allow_defensive_captain else attackers or starters
-                captain = max(captain_pool, key=lambda pid: (self._points(pid, week), -pid))
-                mean = sum(self._points(pid, week) for pid in starters) + self._points(captain, week)
-                risk = self._risk(week, starters, captain)
-                value = mean - self.risk_weight * risk
-                if best is None or value > best[0]:
-                    best = (value, starters, tuple(sorted(squad.difference(starters))), captain, mean, risk)
+                ranked = sorted(captain_pool, key=lambda pid: (-self._points(pid, week), pid))
+                # When spread has a price, the armband is a lever too: weigh the top three.
+                for captain in ranked[:3] if self.rival is not None and self.risk_weight else ranked[:1]:
+                    mean = sum(self._points(pid, week) for pid in starters) + self._points(captain, week)
+                    risk = self._risk(week, starters, captain)
+                    value = mean - self.risk_weight * risk
+                    if best is None or value > best[0]:
+                        best = (value, starters, tuple(sorted(squad.difference(starters))), captain, mean, risk)
         self.lineup_cache[key] = best
         return best
 
@@ -260,6 +288,8 @@ class RollingPlanner:
             "discounted_net_xp": round(sum(self.weights[step.gameweek] * step.mean for step in path), 2),
             "downside_sd": round(sqrt(sum((self.weights[step.gameweek] * step.deviation) ** 2 for step in path)), 2),
             "risk_weight": self.risk_weight,
+            "head_to_head": None if self.rival is None else {
+                "risk_price": self.risk_price, "weekly_sd": round(self.base_sd, 2)},
             "terminal_transfer_value": round(self._saved_transfer_value(path), 2),
             "rounds": [{
                 "gameweek": step.gameweek,
