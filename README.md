@@ -73,7 +73,8 @@ Gegenbot pairs mathematical mixed-integer linear programming (**HiGHS MILP**) wi
 | `OVERVALUED_HAULER` | $xGI\text{ Delta} \le -1.20$, $\text{Form} \ge 5.0$ | Sell candidate; lucky conversion rate overdue negative regression |
 
 ### 3. Multi-Source Ingestion & Underlying Statistics
-* **`olbauday/FPL-Core-Insights`:** Automatically ingests live expected points ($xP$), expected goal involvement ($xGI/90$), and defensive contribution metrics.
+* **Gegenbot points model (`src/engine/points_model.py`):** Builds fixture-level expected points from FPL's per-gameweek `event/{gw}/live` feeds (cached under `data/event_live/`): minutes and 60+ probability weighted to recent matches, xG/xA per 90 scaled by opponent strength and home advantage, clean-sheet, goals-conceded and save expectations from Poisson team rates, defensive contributions, bonus and cards. It drives every week of the horizon after the next one and any player without a published forecast. For the next gameweek, FPL's `ep_next` remains primary unless `FORECAST_NEXT_GW_SOURCE=model`; the model's forecast is frozen in replay snapshots either way, and `data/replay/report.json` compares the two (`points_model_vs_official`).
+* **`olbauday/FPL-Core-Insights`:** Only used when a file carries `season`, `target_gameweek` and a recent `as_of`. The public `playerstats.csv` is a snapshot of FPL statistics rather than a forecast, so it is not used as a projection source.
 * **`vaastav/Fantasy-Premier-League`:** Ingests match logs and computes rolling $xGI/90$, $xGC/90$, average minutes in recent appearances, and starts reliability.
 * **Proactive Injury & Minutes Reliability Multipliers:** Dynamically scales availability ($75\% \rightarrow 0.8\times$, $50\% \rightarrow 0.4\times$, $25\% \rightarrow 0.1\times$, $0\% \rightarrow 0.0\times$) and flags minutes fragility.
 
@@ -124,6 +125,8 @@ THE_ODDS_API_KEY=your_optional_odds_api_key
 # --- Mathematical Solver Configuration ---
 DECAY_FACTOR=0.85                # Horizon Decay Factor (gamma)
 HORIZON_LENGTH=3                 # Lookahead horizon in Gameweeks (1 to 5)
+POINTS_MODEL_ENABLED=true        # Build Gegenbot's own fixture-level points model
+FORECAST_NEXT_GW_SOURCE=ep_next  # ep_next (default) or model, for the next gameweek only
 BENCH_WEIGHT_FACTOR=0.10         # Auto-sub utility weight for bench players
 HIT_MIN_NET_XP_GAIN=5.0          # Minimum net xP gain required to justify taking a -4 hit
 ROLLING_BONUS_XP=1.5             # Strategic valuation for rolling/banking a Free Transfer

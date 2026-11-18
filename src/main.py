@@ -541,6 +541,25 @@ def run_pipeline(
         except Exception as exc:
             logger.warning("Could not load rolling match stats (%s)", type(exc).__name__)
 
+    # Gegenbot's own fixture-level points model, built from finalized gameweek feeds.
+    model_forecasts = None
+    if season and schedule_complete and os.getenv("POINTS_MODEL_ENABLED", "true").lower() in ("true", "1", "yes"):
+        try:
+            from src.engine import points_model
+
+            history = points_model.load_event_history(
+                client.get_event_live, bootstrap, gw_id,
+                Path(os.getenv("STATE_DIR", "data")) / "event_live", season,
+            )
+            if not history.empty:
+                model_forecasts = points_model.forecast_players(
+                    bootstrap, history, fixtures, gw_id, max(1, int(os.getenv("HORIZON_LENGTH", "3"))),
+                )
+                logger.info("Points model built from %d finalized gameweeks.", history["gw"].nunique())
+        except Exception as exc:
+            logger.warning("Points model unavailable (%s: %s). Using form/PPG heuristic.",
+                           type(exc).__name__, exc)
+
     # 3. Enrich player metrics with xP, underlying stats, and market odds
     logger.info("Computing expected points (xP), underlying form, FDR weighting, and market implied odds...")
     players_df = calculate_player_metrics(
@@ -550,6 +569,7 @@ def run_pipeline(
         fplreview_df=core_insights_df,
         vaastav_stats=vaastav_stats,
         schedule_complete=schedule_complete,
+        model_forecasts=model_forecasts,
     )
 
     optimizer = FPLOptimizer(players_df)

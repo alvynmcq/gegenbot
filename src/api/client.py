@@ -265,6 +265,10 @@ class FPLClient:
         params = {"event": event} if event is not None else None
         return self._request("GET", "fixtures/", params=params, authenticated=False)
 
+    def get_event_live(self, event: int) -> Dict[str, Any]:
+        """Fetch per-player stats for one gameweek (public endpoint)."""
+        return self._request("GET", f"event/{int(event)}/live/", authenticated=False)
+
     def get_league_standings(self, league_id: int) -> Dict[str, Any]:
         """Fetch classic mini-league standings and manager metadata."""
         return self._request(

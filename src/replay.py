@@ -18,6 +18,7 @@ from src.state import atomic_write_json, state_lock
 API = "https://fantasy.premierleague.com/api"
 VERSION = 1
 FORECAST_MODELS = ("gegenbot", "official_ep_next", "season_ppg")
+HEAD_TO_HEAD = ("points_model", "official_ep_next")
 
 
 def _timestamp(value):
@@ -57,6 +58,8 @@ def freeze_forecasts(players, bootstrap):
             "gegenbot": _number(row.xp),
             "official_ep_next": official.get(row.id),
             "season_ppg": round(row.points_per_game * row.fixtures_in_gw, 2),
+            # Gegenbot's own points model, frozen even when it is not the primary forecast.
+            "points_model": _number(getattr(row, "model_xp", None)),
             # Which input produced the Gegenbot number, so each source can be judged separately.
             "source": getattr(row, "xp_source", None),
         }
@@ -228,6 +231,7 @@ def _validate_snapshot(snapshot):
 def score_replay(snapshots, outcomes):
     forecasts = defaultdict(list)
     by_source = defaultdict(list)
+    head_to_head = defaultdict(list)
     projections = defaultdict(list)
     coverage = Counter()
     reports, seen, ai_deltas, roll_deltas, immediate_deltas = [], set(), [], [], []
@@ -258,6 +262,10 @@ def score_replay(snapshots, outcomes):
             if gegenbot is not None and int(pid) in actuals:
                 by_source[predictions.get("source") or "unknown"].append(
                     (gegenbot, actuals[int(pid)]["points"]))
+            pair = [_number(predictions.get(model)) for model in HEAD_TO_HEAD]
+            if None not in pair and int(pid) in actuals:
+                for model, prediction in zip(HEAD_TO_HEAD, pair):
+                    head_to_head[model].append((prediction, actuals[int(pid)]["points"]))
             values = [_number(predictions.get(model)) for model in FORECAST_MODELS]
             if None in values or int(pid) not in actuals:
                 continue
@@ -290,6 +298,7 @@ def score_replay(snapshots, outcomes):
         "rounds": reports,
         "forecast_metrics_common_players": {model: _metrics(rows) for model, rows in forecasts.items()},
         "forecast_coverage": dict(coverage),
+        "points_model_vs_official": {model: _metrics(rows) for model, rows in head_to_head.items()},
         "gegenbot_forecast_by_source": {source: _metrics(rows) for source, rows in sorted(by_source.items())},
         "team_projection_by_policy": {name: _metrics(rows) for name, rows in sorted(projections.items())},
         "optimizer_vs_roll": _paired(roll_deltas),

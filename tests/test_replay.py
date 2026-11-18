@@ -52,7 +52,8 @@ def snapshot(selection):
         "version": 1, "season": "2026-2027", "gameweek": 9, "captured_at": "2026-10-31T10:00:00Z",
         "deadline": "2026-10-31T11:00:00Z", "provenance": "gegenbot", "director_source": "LLM_DIRECTOR",
         "director_model": "example", "forecasts": {
-            "8": {"gegenbot": 4, "official_ep_next": 3, "season_ppg": 2, "source": "fpl_core_insights"},
+            "8": {"gegenbot": 4, "official_ep_next": 3, "season_ppg": 2, "source": "fpl_core_insights",
+                  "points_model": 2.5},
             "9": {"gegenbot": 5, "official_ep_next": None, "season_ppg": 4, "source": "fpl_heuristic"},
         },
         "policies": {"optimizer_only": dict(selection, projected_net_xp=60.0), "roll": selection,
@@ -118,6 +119,10 @@ def test_forecast_error_by_source_and_team_projection(snapshot, outcome):
     assert optimizer["samples"] == 1
     assert optimizer["bias"] == 60.0 - report["rounds"][0]["scores"]["optimizer_only"]
     assert "roll" not in report["team_projection_by_policy"]  # no projection frozen
+    # Head-to-head only uses players with both forecasts (player 8).
+    h2h = report["points_model_vs_official"]
+    assert h2h["points_model"]["samples"] == h2h["official_ep_next"]["samples"] == 1
+    assert h2h["points_model"]["bias"] == 0.5 and h2h["official_ep_next"]["bias"] == 1
 
 
 def test_refresh_report_fetches_outcomes_and_writes_report(tmp_path, snapshot, outcome):

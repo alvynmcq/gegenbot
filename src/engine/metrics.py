@@ -131,11 +131,17 @@ def calculate_player_metrics(
     vaastav_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     odds_data: Optional[Dict[int, Dict[str, Any]]] = None,
     *, schedule_complete: bool = False,
+    model_forecasts: Optional[Dict[int, Dict[int, float]]] = None,
 ) -> pd.DataFrame:
     """
     Process raw FPL bootstrap data, fixtures, optional external FPL Review projections,
     vaastav/Fantasy-Premier-League match logs, and bookmaker implied odds into an enriched DataFrame.
+
+    ``model_forecasts`` (from ``src.engine.points_model``) are full-availability expected
+    points per player per gameweek. When present they replace the form/PPG heuristic,
+    and with ``FORECAST_NEXT_GW_SOURCE=model`` they also replace FPL's ep_next.
     """
+    next_gw_source = os.getenv("FORECAST_NEXT_GW_SOURCE", "ep_next").strip().lower()
     from src.data_fetcher import map_fplreview_to_elements
     from src.price_tracker import calculate_price_change_targets
     from src.odds_tracker import BookmakerOddsFetcher
@@ -313,6 +319,8 @@ def calculate_player_metrics(
 
         forecasts = {}
         xp_source = "fpl_heuristic"
+        model_by_event = (model_forecasts or {}).get(player_id)
+        model_xp = None
         for offset in range(horizon):
             event = current_event + offset
             matches = by_team_event.get((team_id, event), [])
@@ -320,21 +328,30 @@ def calculate_player_metrics(
                 forecasts[event] = 0.0
                 if offset == 0:
                     xp_source = "blank_gameweek"
+                    model_xp = 0.0 if model_by_event is not None else None
                 continue
             # A next-round flag is not a prognosis for the full horizon.
             chance = 0.0 if status in ("u", "n") else min(1.0, availability + 0.25 * offset)
             fixture_weight = sum(max(0.6, 1 + (3 - difficulty) * 0.08) * (1.05 if home else 1)
                                  for difficulty, home, _ in matches) if matches else 1.0
-            heuristic = base_xp * minutes_factor * chance * fixture_weight
+            if model_by_event is not None:
+                heuristic = _number(model_by_event.get(event)) * chance
+                fallback_source = "points_model"
+                if offset == 0:
+                    model_xp = round(heuristic, 2)
+            else:
+                heuristic = base_xp * minutes_factor * chance * fixture_weight
+                fallback_source = "fpl_heuristic"
             published = external_by_event.get(event)
             source = source_tag
-            if offset == 0 and published is None:
+            prefer_model = model_by_event is not None and next_gw_source == "model"
+            if offset == 0 and published is None and not prefer_model:
                 published = fplreview_val
                 if published is None and ep_next_val is not None and math.isfinite(ep_next_val) and ep_next_val > 0:
                     published, source = ep_next_val, "fpl_ep_next"
             forecast = _number(published, heuristic)
             if published is None:
-                source = "fpl_heuristic"
+                source = fallback_source
             elif chance < 1.0 or (expected_minutes is not None and expected_minutes < 60):
                 forecast = min(forecast, heuristic)
             forecasts[event] = round(max(0.0, forecast), 2)
@@ -424,6 +441,7 @@ def calculate_player_metrics(
             "xp": xp,
             "xp_3gw": xp_3gw,
             "xp_source": xp_source,
+            "model_xp": model_xp,
             "price_momentum": price_momentum,
             "rolling_xgi_90": rolling_xgi_90,
             "rolling_xgc_90": rolling_xgc_90,
