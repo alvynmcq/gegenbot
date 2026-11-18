@@ -184,6 +184,7 @@ class CandidateSquad(BaseModel):
     multi_gw_xp: float = 0.0
     strategic_value_score: float = 0.0
     rolling_plan: Optional[Dict[str, Any]] = None
+    horizon_plan: Optional[Dict[str, Any]] = None  # multi-week MILP plan (src/engine/horizon.py)
     total_cost_m: float
     bank_remaining_m: float
     active_chip: Optional[str] = None  # e.g. "wildcard", "freehit", "bboost", "3xc"
@@ -955,6 +956,7 @@ class FPLOptimizer:
         multi_gw_weight: float = 0.30,
         rolling_bonus_xp: float = 1.50,
         excluded_transfers_in: Optional[List[Set[int]]] = None,
+        fixed_squad: Optional[Set[int]] = None,
     ) -> Optional[CandidateSquad]:
         """
         Formulate and solve MILP optimization with exact FPL selling price math,
@@ -1043,6 +1045,12 @@ class FPLOptimizer:
                         pulp.lpSum([squad_vars[i] for i in excl_indices]) <= len(excl_indices) - 1,
                         f"ExclTransfersInCut_{cut_idx}",
                     )
+
+        # 8b. A squad chosen elsewhere (multi-week plan): only lineup and captain are free.
+        if fixed_squad:
+            for i in indices:
+                if player_ids[i] in fixed_squad:
+                    prob += squad_vars[i] == 1, f"FixedSquad_{i}"
 
         # 9. Objective function with correlation penalties and 5-DEF fragility penalty:
         blended_xps = [

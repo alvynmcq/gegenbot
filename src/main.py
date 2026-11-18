@@ -17,7 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
-from src.agent.director import AIDirector, DecisionOutput
+from src.agent.director import AIDirector, DecisionOutput, director_mode, limit_to_vetoes
+from src.engine.horizon import add_horizon_candidate
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
 from src.state import atomic_write_json
@@ -813,6 +814,19 @@ def run_pipeline(
             include_chip_candidates=planner is None and enable_auto_chips and not forced_chip,
             rolling_strategy=planner is not None,
         )
+        if planner is not None and os.getenv("MULTI_PERIOD_PLAN", "true").lower() in ("true", "1", "yes"):
+            try:
+                carrier = add_horizon_candidate(
+                    optimizer, planner, result, current_squad_ids=current_squad_ids, bank_m=bank_m,
+                    free_transfers=free_transfers, selling_prices=selling_prices, eo_weights=rival_eo,
+                    already_paid=4 * max(0, planner.transfers_made - planner.chip_free), veto=veto)
+                if carrier is not None:
+                    plan = carrier.horizon_plan
+                    logger.info("Multi-week plan (%s, objective %.2f): %s", carrier.name, plan["objective"],
+                                " | ".join(f"GW{r['gameweek']}: {len(r['in'])} in" + (f", -{r['hits']}" if r["hits"] else "")
+                                           for r in plan["rounds"]))
+            except Exception as exc:
+                logger.warning("Multi-week plan failed (%s); continuing with single-week candidates.", exc)
         if planner is not None:
             planner.annotate(result, live_chip_inventory, enable_auto_chips and not forced_chip,
                              forced_chip=forced_chip, veto=veto)
@@ -897,16 +911,29 @@ def run_pipeline(
 
     recent_performance = _load_recent_performance_history(limit=3)
 
-    logger.info("Consulting AI Decision Director...")
-    director = AIDirector()
-    decision = director.evaluate_and_decide(
-        opt_result,
-        league_analysis,
-        news_intel,
-        competitive_context=competitive_context or None,
-        chip_season_plan=chip_season_plan or None,
-        recent_performance=recent_performance,
-    )
+    mode = director_mode(Path(os.getenv("STATE_DIR", "data")) / "replay" / "report.json")
+    logger.info("Consulting AI Decision Director (mode: %s)...", mode)
+    director = AIDirector(api_key="" if mode == "off" else None)
+
+    def decide():
+        """Final decision, plus the LLM's own pick (None when it did not answer)."""
+        raw = director.evaluate_and_decide(
+            opt_result,
+            league_analysis,
+            news_intel,
+            competitive_context=competitive_context or None,
+            chip_season_plan=chip_season_plan or None,
+            recent_performance=recent_performance,
+        )
+        if raw.source != "LLM_DIRECTOR":
+            return raw, None
+        if mode == "veto_only":
+            solver = director._build_fallback_decision(opt_result, "Director limited to vetoes", news_intel)
+            return limit_to_vetoes(raw, solver), raw
+        return raw, raw
+
+    decision, director_pick = decide()
+    pre_veto_options = None
 
     # Check for AI Director Late Breaking News Veto & Instant Re-Solve
     # Enforce safety veto if a starter in the chosen lineup has an active injury doubt/flag
@@ -940,6 +967,7 @@ def run_pipeline(
             optimizer.df.loc[optimizer.df["id"] == pid, "discounted_xp"] = 0.0
             optimizer.df.loc[optimizer.df["id"] == pid, "xp"] = 0.0
 
+        pre_veto_options = opt_result.model_copy(deep=True)
         opt_result, planner = optimize_strategy(decision.veto_player_ids)
         logger.info(f"Re-solved! Generated {len(opt_result.candidates)} clean candidate options without vetoed players.")
         recommended_chip = forced_chip or (
@@ -951,15 +979,7 @@ def run_pipeline(
             if recommended_chip and opt_result.chip_evaluation else None
         )
 
-
-        decision = director.evaluate_and_decide(
-            opt_result,
-            league_analysis,
-            news_intel,
-            competitive_context=competitive_context or None,
-            chip_season_plan=chip_season_plan or None,
-            recent_performance=recent_performance,
-        )
+        decision, director_pick = decide()
 
     # Keep the shared candidate set as it was before final captain/chip adjustments.
     replay_options = opt_result.model_copy(deep=True) if execute and schedule_complete else None
@@ -1065,6 +1085,7 @@ def run_pipeline(
                 deadline=deadline_time, players=players_df, bootstrap=bootstrap,
                 optimization=replay_options, decision=decision, model=director.model,
                 previous_hit=previous_hit, forced_chip=forced_chip, veto_count=len(auto_veto_ids),
+                director=director_pick, pre_veto=pre_veto_options, director_mode=mode,
             )
         except Exception as exc:
             logger.warning("Could not freeze replay snapshot (%s)", type(exc).__name__)

@@ -19,6 +19,8 @@ API = "https://fantasy.premierleague.com/api"
 VERSION = 1
 FORECAST_MODELS = ("gegenbot", "official_ep_next", "season_ppg")
 HEAD_TO_HEAD = ("points_model", "official_ep_next")
+# Decisions where the LLM answered: in charge, or limited to vetoes with its pick recorded.
+DIRECTOR_SOURCES = ("LLM_DIRECTOR", "SOLVER_DIRECTOR_VETOES")
 
 
 def _timestamp(value):
@@ -81,8 +83,14 @@ def freeze_pick(candidate, previous_hit):
 
 def capture_snapshot(root, *, season, gameweek, deadline, players, bootstrap, optimization,
                      decision=None, model=None, previous_hit=0, forced_chip=None, veto_count=0,
-                     captured_at=None, provenance="gegenbot"):
-    """Keep the first frozen decision for a season and gameweek."""
+                     captured_at=None, provenance="gegenbot", director=None, pre_veto=None,
+                     director_mode=None):
+    """Keep the first frozen decision for a season and gameweek.
+
+    ``director`` is the LLM's own decision when it differs from ``decision`` (the
+    Director was limited to vetoes and its pick was only recorded). ``pre_veto``
+    is the candidate set before any news veto forced a re-solve.
+    """
     from src.engine.optimizer import optimizer_choice_index
 
     captured_at = captured_at or datetime.now(timezone.utc)
@@ -102,8 +110,18 @@ def capture_snapshot(root, *, season, gameweek, deadline, players, bootstrap, op
         if roll is not None:
             policies["roll"] = freeze_pick(roll, previous_hit)
         source = decision.source if decision else None
-        if source == "LLM_DIRECTOR" and not forced_chip:
-            policies["ai_director"] = freeze_pick(decision.selected_candidate, previous_hit)
+        if director is None and source == "LLM_DIRECTOR":
+            director = decision
+        if director is not None and not forced_chip:
+            policies["ai_director"] = freeze_pick(director.selected_candidate, previous_hit)
+            index = director.selected_candidate_index
+            if 0 <= index < len(options):
+                # The Director's option as the solver built it: separates choosing an
+                # option from overriding its captain or lineup chip.
+                policies["ai_candidate"] = freeze_pick(options[index], previous_hit)
+        if pre_veto is not None and pre_veto.candidates:
+            policies["pre_veto_optimizer"] = freeze_pick(
+                pre_veto.candidates[optimizer_choice_index(pre_veto)], previous_hit)
         snapshot = {
             "version": VERSION,
             "season": season,
@@ -114,7 +132,8 @@ def capture_snapshot(root, *, season, gameweek, deadline, players, bootstrap, op
             "forecasts": freeze_forecasts(players, bootstrap),
             "policies": policies,
             "director_source": source,
-            "director_model": model if source == "LLM_DIRECTOR" else None,
+            "director_model": model if director is not None else None,
+            "director_mode": director_mode,
             "forced_chip": forced_chip,
             "veto_count": veto_count,
         }
@@ -235,6 +254,7 @@ def score_replay(snapshots, outcomes):
     projections = defaultdict(list)
     coverage = Counter()
     reports, seen, ai_deltas, roll_deltas, immediate_deltas = [], set(), [], [], []
+    choice_deltas, override_deltas, veto_deltas, same_pick = [], [], [], []
     by_model = defaultdict(list)
     for snapshot in sorted(snapshots, key=_key):
         key = _validate_snapshot(snapshot)
@@ -278,17 +298,27 @@ def score_replay(snapshots, outcomes):
                 projections[name].append((projected, scores[name]))
         ai = scores.get("ai_director")
         baseline = scores.get("optimizer_only")
+        candidate = scores.get("ai_candidate")
+        pre_veto = scores.get("pre_veto_optimizer")
         roll = scores.get("roll")
         immediate = scores.get("immediate_xp")
         row = {"season": key[0], "gameweek": key[1], "status": "scored",
                "provenance": snapshot.get("provenance"), "scores": scores,
                "captured_at": snapshot["captured_at"], "deadline": outcome["deadline"],
                "director_source": snapshot.get("director_source"), "veto_count": snapshot.get("veto_count", 0)}
-        if (ai is not None and baseline is not None and snapshot.get("director_source") == "LLM_DIRECTOR"
-                and not snapshot.get("forced_chip")):
+        if (ai is not None and baseline is not None and not snapshot.get("forced_chip")
+                and snapshot.get("director_source") in DIRECTOR_SOURCES):
             row["ai_delta"] = ai - baseline
             ai_deltas.append(ai - baseline)
             by_model[snapshot.get("director_model") or "unknown"].append(ai - baseline)
+            same_pick.append(_same_pick(snapshot["policies"]["ai_director"],
+                                        snapshot["policies"]["optimizer_only"]))
+            if candidate is not None:
+                choice_deltas.append(candidate - baseline)
+                override_deltas.append(ai - candidate)
+        if pre_veto is not None and baseline is not None:
+            row["veto_delta"] = baseline - pre_veto
+            veto_deltas.append(baseline - pre_veto)
         if baseline is not None and roll is not None:
             roll_deltas.append(baseline - roll)
         if baseline is not None and immediate is not None:
@@ -304,8 +334,38 @@ def score_replay(snapshots, outcomes):
         "optimizer_vs_roll": _paired(roll_deltas),
         "optimizer_vs_immediate_xp": _paired(immediate_deltas),
         "ai_director_vs_optimizer": _paired(ai_deltas),
+        "director_breakdown": {
+            # Picking a different solver option vs the solver's own choice.
+            "option_choice": _paired(choice_deltas),
+            # Captain/vice overrides (and lineup-chip rechecks) on top of the chosen option.
+            "lineup_overrides": _paired(override_deltas),
+            # Re-solving without news-vetoed players vs ignoring the news.
+            "news_vetoes": _paired(veto_deltas),
+            "same_pick_rate": round(mean(same_pick), 3) if same_pick else None,
+        },
+        "director_verdict": director_verdict(_paired(ai_deltas)),
         "director_models": {model: _paired(deltas) for model, deltas in sorted(by_model.items())},
     }
+
+
+def _same_pick(a, b):
+    keys = ("starters", "bench", "captain", "vice", "chip", "hit")
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+MIN_VERDICT_GAMEWEEKS = 8
+
+
+def director_verdict(paired):
+    """'collecting' until enough weeks; then whether the 95% interval excludes zero."""
+    if paired["gameweeks"] < MIN_VERDICT_GAMEWEEKS or paired["bootstrap_95"] is None:
+        return "collecting"
+    low, high = paired["bootstrap_95"]
+    if high < 0:
+        return "costs_points"
+    if low > 0:
+        return "adds_points"
+    return "no_clear_difference"
 
 
 def _public_json(endpoint):

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import requests
 from pydantic import BaseModel, Field
@@ -13,6 +14,42 @@ from src.tracker.league_scanner import LeagueAnalysis
 from src.tracker.news_tracker import PlayerNewsIntel
 
 logger = logging.getLogger(__name__)
+
+
+DIRECTOR_MODES = ("full", "veto_only", "off")
+
+
+def director_mode(report_path: Optional[Path] = None) -> str:
+    """How much authority the LLM Director gets this gameweek.
+
+    full:      it picks among the solver's options and may override the captain.
+    veto_only: the solver's pick stands; the Director may only veto players on news,
+               and its own pick is recorded so replay keeps measuring it.
+    off:       no LLM call.
+    auto (default): full, until replay shows the Director losing points to the solver
+               with 95% confidence over at least 8 gameweeks, then veto_only.
+    """
+    mode = os.getenv("DIRECTOR_MODE", "auto").strip().lower()
+    if mode in DIRECTOR_MODES:
+        return mode
+    path = report_path or Path(os.getenv("STATE_DIR", "data")) / "replay" / "report.json"
+    try:
+        verdict = json.loads(path.read_text()).get("director_verdict")
+    except (OSError, ValueError, AttributeError):
+        return "full"
+    return "veto_only" if verdict == "costs_points" else "full"
+
+
+def limit_to_vetoes(director_decision: "DecisionOutput", solver_decision: "DecisionOutput") -> "DecisionOutput":
+    """Keep the solver's pick and the union of both sides' news vetoes."""
+    final = solver_decision.model_copy(deep=True)
+    final.veto_player_ids = sorted(set(final.veto_player_ids or []) | set(director_decision.veto_player_ids or []))
+    final.veto_reason = final.veto_reason or director_decision.veto_reason
+    final.source = "SOLVER_DIRECTOR_VETOES"
+    final.rationale = (f"{final.rationale} The AI Director is limited to news vetoes "
+                       f"(it would have picked {director_decision.chosen_move_name}, "
+                       f"captain {director_decision.captain_name}).")
+    return final
 
 
 class DecisionOutput(BaseModel):

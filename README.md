@@ -129,6 +129,8 @@ HORIZON_LENGTH=3                 # Lookahead horizon in Gameweeks (1 to 5)
 POINTS_MODEL_ENABLED=true        # Build Gegenbot's own fixture-level points model
 FORECAST_NEXT_GW_SOURCE=ep_next  # ep_next (default) or model, for the next gameweek only
 HEAD_TO_HEAD_RISK=true           # Price risk against the target rival (false = fixed mode weights)
+MULTI_PERIOD_PLAN=true           # Add a multi-week transfer MILP plan as a candidate
+MULTI_PERIOD_TIME_LIMIT=30       # Seconds the multi-week MILP may run
 BENCH_WEIGHT_FACTOR=0.10         # Auto-sub utility weight for bench players
 HIT_MIN_NET_XP_GAIN=5.0          # Minimum net xP gain required to justify taking a -4 hit
 ROLLING_BONUS_XP=1.5             # Strategic valuation for rolling/banking a Free Transfer
@@ -137,6 +139,7 @@ ROLLING_BONUS_XP=1.5             # Strategic valuation for rolling/banking a Fre
 LLM_API_KEY=your_llm_api_key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+DIRECTOR_MODE=auto               # auto | full | veto_only | off (see Director evaluation)
 ENABLE_LIVE_NEWS=true
 FIRECRAWL_API_KEY=your_optional_firecrawl_api_key
 
@@ -171,6 +174,17 @@ appearance uncertainty, rotation, captaincy exposure and shared club results.
 DEFEND penalizes that uncertainty more than NEUTRAL or CHASE. These risk estimates
 are model assumptions and have yet to be calibrated in replay.
 
+A multi-week MILP (`src/engine/horizon.py`) plans squad, lineup and captain for
+every week of the horizon in one solve. It banks free transfers (up to five),
+respects the hit cap, and never buys an original holding back because its sale
+price would differ. Prices stay fixed, and chips are left to the planner. The
+pool is the current squad plus the 20 strongest and 6 cheapest players in each
+position. Its first move joins the candidates, or is attached to an identical
+existing one. The rolling planner then scores both that plan's exact later
+transfers and its own beam search, and keeps the better path. This lets the
+planner value a move that only pays off later, such as banking a transfer for a
+double move or buying a player a week before a good run.
+
 Automatic chip proposals compare playing now with the strongest eligible use of
 the same chip in the forecast horizon. The comparison carries Wildcard changes
 forward and restores the original squad after a Free Hit. It keeps the existing
@@ -201,10 +215,27 @@ Gegenbot, official `ep_next`, and season points per game times scheduled fixture
 on the same player-gameweeks. Coverage is reported separately.
 
 Optimizer-only, immediate-xP, and roll policies share the same starting state
-and candidate pool. The Director's paired score includes its final selection
-and captaincy but holds the final candidate pool fixed, so it does not measure
-the separate effect of news vetoes. Forced chips and model fallbacks are excluded
-from the AI comparison. Bootstrap intervals are exploratory and only appear
+and candidate pool. The Director's paired score (`ai_director_vs_optimizer`)
+covers its final selection and captaincy. `director_breakdown` splits it into
+three parts:
+- `option_choice`: the Director's option as the solver built it, minus the solver's pick.
+- `lineup_overrides`: captain and vice overrides, plus lineup-chip rechecks, on top of that option.
+- `news_vetoes`: the solver's pick after a veto re-solve, minus its pick before it.
+
+It also reports `same_pick_rate`. Forced chips and model fallbacks are excluded
+from the AI comparison.
+
+`DIRECTOR_MODE` sets the Director's authority:
+- `full` lets it pick an option and override the captain.
+- `veto_only` keeps the solver's pick plus any news vetoes from either side. The
+  Director's own pick is still recorded, so measurement continues.
+- `off` skips the LLM.
+- `auto` (the default) behaves as `full` until `director_verdict` reads
+  `costs_points`. That needs eight paired gameweeks, with the 95% interval
+  entirely below zero. It then switches to `veto_only`, and switches back if the
+  evidence changes.
+
+The dashboard shows the running Director-vs-solver total. Bootstrap intervals are exploratory and only appear
 after eight paired gameweeks. Each gameweek is a separate counterfactual, with no
 simulated transfer carryover between historical observations.
 

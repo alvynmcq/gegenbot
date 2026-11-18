@@ -783,6 +783,14 @@ def test_flask_dashboard(tmp_path, mock_bootstrap_data, mock_fixtures_data):
     assert "TACTICAL DEPLOYMENT" in lcars_html
     assert decision.captain_name in lcars_html
 
+    # Once replay has scored Director weeks, both views show the running total.
+    (tmp_path / "replay").mkdir()
+    (tmp_path / "replay" / "report.json").write_text(json.dumps({
+        "ai_director_vs_optimizer": {"gameweeks": 3, "total_delta": -7, "mean_delta": -2.333},
+        "director_verdict": "collecting"}))
+    assert "Director vs solver: -7 pts over 3 GW" in client.get("/").data.decode("utf-8")
+    assert "AI vs solver -7 over 3 GW" in client.get("/lcars").data.decode("utf-8")
+
 
 def test_lcars_dashboard_without_decision(tmp_path):
     state_file = tmp_path / "latest_decision.json"

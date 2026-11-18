@@ -405,8 +405,8 @@
           </div>
           <div class="readout" style="--rc: var(--gold)">
             <div class="k">COMMAND SOURCE</div>
-            <div class="v">{{ 'AI DIRECTOR' if d.source == 'LLM_DIRECTOR' else 'MILP SOLVER' }}</div>
-            <div class="s">Captain: {{ d.captain_name }}</div>
+            <div class="v">{{ 'AI DIRECTOR' if d.source == 'LLM_DIRECTOR' else 'SOLVER + AI VETO' if d.source == 'SOLVER_DIRECTOR_VETOES' else 'MILP SOLVER' }}</div>
+            <div class="s">{% if director_record %}AI vs solver {{ '%+d' % director_record.total }} over {{ director_record.weeks }} GW{% else %}Captain: {{ d.captain_name }}{% endif %}</div>
           </div>
         </div>
       </section>

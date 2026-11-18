@@ -362,12 +362,21 @@
                     <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-950 text-purple-300 border border-purple-800">
                         🤖 AI Director
                     </span>
+                    {% elif data.decision.source == 'SOLVER_DIRECTOR_VETOES' %}
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-950 text-blue-300 border border-blue-800">
+                        📐 MILP + 🤖 vetoes
+                    </span>
                     {% else %}
                     <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-950 text-blue-300 border border-blue-800">
                         📐 PuLP MILP
                     </span>
                     {% endif %}
                 </div>
+                {% if director_record %}
+                <div class="text-xs text-slate-400 mt-1" title="AI Director's picks minus the solver's, scored on actual points">
+                    Director vs solver: {{ '%+d' % director_record.total }} pts over {{ director_record.weeks }} GW · {{ director_record.label }}
+                </div>
+                {% endif %}
             </div>
         </div>
 

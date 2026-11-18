@@ -233,7 +233,38 @@ class RollingPlanner:
                                triple=chip == "3xc")
         first = Round(self.gameweek, self.initial, after, starters, bench, captain,
                       candidate.net_xp, deviation, candidate.hit_cost, chip)
-        return self._future((first,), self.weeks[1:])
+        searched = self._future((first,), self.weeks[1:])
+        horizon = getattr(candidate, "horizon_plan", None)
+        followed = self._follow((first,), horizon) if horizon and not chip else None
+        if followed is not None and self._rank(followed) > self._rank(searched):
+            return followed
+        return searched
+
+    def _follow(self, path, horizon):
+        """Score the exact later transfers of a multi-week plan (None if illegal here)."""
+        from src.engine.horizon import pair_moves
+
+        schedule = {step["gameweek"]: step for step in horizon.get("rounds", [])}
+        for week in self.weeks[1:]:
+            step = schedule.get(week)
+            before = path[-1].after
+            if step is None:
+                return None
+            if not set(step["out"]) <= before.squad or set(step["in"]) & before.squad:
+                return None
+            pairs = pair_moves(step["out"], step["in"], self.players)
+            if pairs is None:
+                return None
+            state = before
+            for outgoing, incoming in pairs:
+                state = self._transfer(state, outgoing, incoming)
+                if state is None:
+                    return None
+            played = self._round(week, before, state, len(pairs))
+            if played.hits > self.hit_cap:
+                return None
+            path = path + (played,)
+        return path
 
     def _rebuild(self, state, week, chip):
         # Greedy rebuild counterfactual, scored over the remaining weeks for Wildcard.

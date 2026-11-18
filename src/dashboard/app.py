@@ -235,6 +235,22 @@ def create_app(data_file_path: Optional[Path] = None) -> Flask:
         except (ValueError, TypeError):
             return val
 
+    def director_record(report_path: Path) -> Optional[Dict[str, Any]]:
+        """AI Director vs solver from the replay report, as one short line."""
+        try:
+            report = json.loads(report_path.read_text())
+        except (OSError, ValueError):
+            return None
+        paired = report.get("ai_director_vs_optimizer") or {}
+        weeks = paired.get("gameweeks") or 0
+        if not weeks:
+            return None
+        verdict = report.get("director_verdict", "collecting")
+        labels = {"collecting": "Gathering evidence", "costs_points": "Costing points",
+                  "adds_points": "Adding points", "no_clear_difference": "No clear difference"}
+        return {"weeks": weeks, "total": paired.get("total_delta"), "mean": paired.get("mean_delta"),
+                "verdict": verdict, "label": labels.get(verdict, verdict)}
+
     def dashboard_context() -> Dict[str, Any]:
         data = load_decision_data(state_file)
 
@@ -277,6 +293,7 @@ def create_app(data_file_path: Optional[Path] = None) -> Flask:
 
         return {
             "data": data,
+            "director_record": director_record(Path(state_file).parent / "replay" / "report.json"),
             "starters_by_pos": starters_by_pos,
             "entry_data": entry_data or {},
             "global_leagues": global_leagues,
