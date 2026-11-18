@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.replay import fetch_outcomes, score_pick, score_replay
+from src.replay import fetch_outcomes, refresh_report, score_pick, score_replay
 
 
 @pytest.fixture
@@ -52,10 +52,10 @@ def snapshot(selection):
         "version": 1, "season": "2026-2027", "gameweek": 9, "captured_at": "2026-10-31T10:00:00Z",
         "deadline": "2026-10-31T11:00:00Z", "provenance": "gegenbot", "director_source": "LLM_DIRECTOR",
         "director_model": "example", "forecasts": {
-            "8": {"gegenbot": 4, "official_ep_next": 3, "season_ppg": 2},
-            "9": {"gegenbot": 5, "official_ep_next": None, "season_ppg": 4},
+            "8": {"gegenbot": 4, "official_ep_next": 3, "season_ppg": 2, "source": "fpl_core_insights"},
+            "9": {"gegenbot": 5, "official_ep_next": None, "season_ppg": 4, "source": "fpl_heuristic"},
         },
-        "policies": {"optimizer_only": selection, "roll": selection,
+        "policies": {"optimizer_only": dict(selection, projected_net_xp=60.0), "roll": selection,
                      "ai_director": dict(selection, captain=9, vice=8)},
     }
 
@@ -107,3 +107,31 @@ def test_outcome_fetch_is_current_season_public_and_finalized_only(tmp_path, sna
         assert fetch_outcomes([snapshot, unfinished, previous], tmp_path) == 1
     assert [call.args[0] for call in public.call_args_list] == ["bootstrap-static", "event/9/live"]
     assert (tmp_path / "2026-2027/gw09.json").exists()
+
+
+def test_forecast_error_by_source_and_team_projection(snapshot, outcome):
+    report = score_replay([snapshot], {("2026-2027", 9): outcome})
+    # Player 8 scored 2 against 4; player 9 scored 10 against 5.
+    assert report["gegenbot_forecast_by_source"]["fpl_core_insights"]["bias"] == 2
+    assert report["gegenbot_forecast_by_source"]["fpl_heuristic"]["bias"] == -5
+    optimizer = report["team_projection_by_policy"]["optimizer_only"]
+    assert optimizer["samples"] == 1
+    assert optimizer["bias"] == 60.0 - report["rounds"][0]["scores"]["optimizer_only"]
+    assert "roll" not in report["team_projection_by_policy"]  # no projection frozen
+
+
+def test_refresh_report_fetches_outcomes_and_writes_report(tmp_path, snapshot, outcome):
+    import json
+    (tmp_path / "snapshots" / "2026-2027").mkdir(parents=True)
+    (tmp_path / "snapshots" / "2026-2027" / "gw09.json").write_text(json.dumps(snapshot))
+
+    def fake_fetch(snapshots, destination):
+        (destination / "2026-2027").mkdir(parents=True)
+        (destination / "2026-2027" / "gw09.json").write_text(json.dumps(outcome))
+        return 1
+
+    with patch("src.replay.fetch_outcomes", side_effect=fake_fetch):
+        report = refresh_report(tmp_path)
+    assert report["rounds"][0]["status"] == "scored"
+    assert json.loads((tmp_path / "report.json").read_text())["rounds"][0]["gameweek"] == 9
+    assert refresh_report(tmp_path / "empty") is None

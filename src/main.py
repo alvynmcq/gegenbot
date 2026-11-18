@@ -21,7 +21,7 @@ from src.agent.director import AIDirector, DecisionOutput
 from src.api.auth import FPLAuth
 from src.api.client import FPLClient
 from src.state import atomic_write_json
-from src.replay import capture_snapshot
+from src.replay import capture_snapshot, refresh_report
 from src.execution import build_plan, execute_plan, execution_path, planning_snapshot
 from src.chips import available_chips
 from src.data_fetcher import (
@@ -1180,6 +1180,14 @@ def run_daemon(client: FPLClient):
                 logger.info(f"📡 Gameweek {gw_id} underway (+5m passed deadline). Triggering post-deadline scanner...")
                 run_post_deadline_intel(client, target_gw=gw_id)
                 post_scanned_gameweeks.add(gw_id)
+                # The previous gameweek is normally finalized by now, so score its frozen decision.
+                try:
+                    report = refresh_report(Path(os.getenv("STATE_DIR", "data")) / "replay")
+                    if report:
+                        logger.info("Replay report refreshed (%d scored gameweeks).",
+                                    sum(r["status"] == "scored" for r in report["rounds"]))
+                except Exception as exc:
+                    logger.warning("Replay report refresh failed (%s: %s)", type(exc).__name__, exc)
 
             # Adaptive sleep: sleep faster near deadline, slower when days away
             if 0 < delta_minutes <= 120:

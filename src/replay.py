@@ -57,6 +57,8 @@ def freeze_forecasts(players, bootstrap):
             "gegenbot": _number(row.xp),
             "official_ep_next": official.get(row.id),
             "season_ppg": round(row.points_per_game * row.fixtures_in_gw, 2),
+            # Which input produced the Gegenbot number, so each source can be judged separately.
+            "source": getattr(row, "xp_source", None),
         }
     return forecasts
 
@@ -225,6 +227,8 @@ def _validate_snapshot(snapshot):
 
 def score_replay(snapshots, outcomes):
     forecasts = defaultdict(list)
+    by_source = defaultdict(list)
+    projections = defaultdict(list)
     coverage = Counter()
     reports, seen, ai_deltas, roll_deltas, immediate_deltas = [], set(), [], [], []
     by_model = defaultdict(list)
@@ -250,12 +254,20 @@ def score_replay(snapshots, outcomes):
             for model in FORECAST_MODELS:
                 if _number(predictions.get(model)) is not None and int(pid) in actuals:
                     coverage[model] += 1
+            gegenbot = _number(predictions.get("gegenbot"))
+            if gegenbot is not None and int(pid) in actuals:
+                by_source[predictions.get("source") or "unknown"].append(
+                    (gegenbot, actuals[int(pid)]["points"]))
             values = [_number(predictions.get(model)) for model in FORECAST_MODELS]
             if None in values or int(pid) not in actuals:
                 continue
             for model, prediction in zip(FORECAST_MODELS, values):
                 forecasts[model].append((prediction, actuals[int(pid)]["points"]))
         scores = {name: score_pick(pick, actuals) for name, pick in snapshot["policies"].items()}
+        for name, pick in snapshot["policies"].items():
+            projected = _number(pick.get("projected_net_xp"))
+            if projected is not None and scores[name] is not None:
+                projections[name].append((projected, scores[name]))
         ai = scores.get("ai_director")
         baseline = scores.get("optimizer_only")
         roll = scores.get("roll")
@@ -278,6 +290,8 @@ def score_replay(snapshots, outcomes):
         "rounds": reports,
         "forecast_metrics_common_players": {model: _metrics(rows) for model, rows in forecasts.items()},
         "forecast_coverage": dict(coverage),
+        "gegenbot_forecast_by_source": {source: _metrics(rows) for source, rows in sorted(by_source.items())},
+        "team_projection_by_policy": {name: _metrics(rows) for name, rows in sorted(projections.items())},
         "optimizer_vs_roll": _paired(roll_deltas),
         "optimizer_vs_immediate_xp": _paired(immediate_deltas),
         "ai_director_vs_optimizer": _paired(ai_deltas),
@@ -385,9 +399,34 @@ def _read_directory(path):
     return [json.loads(file.read_text()) for file in sorted(path.glob("*/*.json"))]
 
 
+def _read_outcomes(path):
+    outcomes = {}
+    for row in _read_directory(path):
+        key = _key(row)
+        if key in outcomes:
+            raise ValueError(f"Duplicate outcomes for {key}")
+        outcomes[key] = row
+    return outcomes
+
+
+def refresh_report(root):
+    """Collect any newly finalized outcomes and rescore every snapshot under root."""
+    root = Path(root)
+    snapshots = _read_directory(root / "snapshots")
+    if not snapshots:
+        return None
+    fetch_outcomes(snapshots, root / "outcomes")
+    report = score_replay(snapshots, _read_outcomes(root / "outcomes"))
+    report["generated_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(root / "report.json", report)
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    refresh = commands.add_parser("refresh", help="fetch new outcomes and rewrite <root>/report.json")
+    refresh.add_argument("root", type=Path)
     for command in ("fetch-outcomes", "score"):
         sub = commands.add_parser(command)
         sub.add_argument("snapshots", type=Path)
@@ -398,6 +437,13 @@ def main():
     reconstruct.add_argument("bundle", type=Path)
     reconstruct.add_argument("snapshots", type=Path)
     args = parser.parse_args()
+    if args.command == "refresh":
+        report = refresh_report(args.root)
+        if report is None:
+            parser.error("No replay snapshots found")
+        print(f"Scored {sum(r['status'] == 'scored' for r in report['rounds'])} gameweeks; "
+              f"wrote {args.root / 'report.json'}")
+        return
     if args.command == "reconstruct":
         print(reconstruct_snapshot(json.loads(args.bundle.read_text()), args.snapshots))
         return
@@ -407,12 +453,10 @@ def main():
     if args.command == "fetch-outcomes":
         print(f"Wrote {fetch_outcomes(snapshots, args.outcomes)} finalized outcomes.")
         return
-    outcomes = {}
-    for row in _read_directory(args.outcomes):
-        key = _key(row)
-        if key in outcomes:
-            parser.error(f"Duplicate outcomes for {key}")
-        outcomes[key] = row
+    try:
+        outcomes = _read_outcomes(args.outcomes)
+    except ValueError as exc:
+        parser.error(str(exc))
     report = score_replay(snapshots, outcomes)
     if args.output:
         atomic_write_json(args.output, report)
