@@ -1,0 +1,586 @@
+{#- Starship-console (LCARS-style) view of the Gegenbot dashboard. Same context as index.html. -#}
+{%- set d = data.decision if data and data.decision else None -%}
+{%- set sc = d.selected_candidate if d and d.selected_candidate else {} -%}
+{%- set la = data.league_analysis if data and data.league_analysis else None -%}
+{%- set tm = la.threat_matrix if la and la.threat_matrix else {} -%}
+{%- set vuln_count = (tm.vulnerabilities or [])|length if tm else 0 -%}
+{%- if not d -%}{%- set condition = 'standby' -%}
+{%- elif vuln_count >= 3 -%}{%- set condition = 'red' -%}
+{%- elif vuln_count >= 1 -%}{%- set condition = 'yellow' -%}
+{%- else -%}{%- set condition = 'green' -%}{%- endif -%}
+
+{%- macro delta(item) -%}
+  {%- if item and item.direction == 'up' -%}<span class="delta up">▲ {{ item.movement | comma }}</span>
+  {%- elif item and item.direction == 'down' -%}<span class="delta down">▼ {{ (item.movement | abs) | comma }}</span>
+  {%- elif item and item.direction == 'same' -%}<span class="delta same">HOLDING</span>
+  {%- elif item -%}<span class="delta same">NEW</span>
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro rank_tile(label, item, color, fallback_rank=None) -%}
+<div class="tile">
+  <div class="tile-cap c-{{ color }}"></div>
+  <div class="tile-body">
+    <div class="tile-label t-{{ color }}">{{ label }}</div>
+    <div class="tile-value">
+      {%- if item and item.rank -%}{{ item.rank | comma }}{%- elif fallback_rank -%}{{ fallback_rank | comma }}{%- else -%}----{%- endif -%}
+    </div>
+    <div class="tile-foot">
+      {{ delta(item) }}
+      {%- if item and item.total_players %}<span class="of">OF {{ item.total_players | comma }}</span>{% endif -%}
+    </div>
+  </div>
+</div>
+{%- endmacro -%}
+
+{%- macro pill(p, pos) -%}
+<div class="unit pos-{{ pos|lower }}{% if p.is_captain %} is-captain{% endif %}" title="{{ p.web_name }} · {{ p.team_code }} · {{ p.xp }} xP">
+  <span class="unit-name">{{ p.web_name }}</span>
+  <span class="unit-xp">{{ p.xp }}</span>
+  {%- if p.is_captain %}<span class="unit-badge cap">C</span>
+  {%- elif p.is_vice_captain %}<span class="unit-badge vice">V</span>{% endif %}
+  {%- if pos in ['GKP', 'DEF'] and p.implied_cs_pct and p.implied_cs_pct >= 30.0 %}
+  <span class="unit-sub">CS {{ p.implied_cs_pct | round(0) | int }}%</span>
+  {%- elif pos in ['MID', 'FWD'] and p.implied_goal_pct and p.implied_goal_pct >= 35.0 %}
+  <span class="unit-sub">G {{ p.implied_goal_pct | round(0) | int }}%</span>
+  {%- endif %}
+</div>
+{%- endmacro -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gegenbot Ops Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Antonio:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000;
+    --orange: #ff9c00;
+    --peach: #ff9966;
+    --tan: #ffcc99;
+    --gold: #ffcc66;
+    --lilac: #cc99cc;
+    --violet: #9999ff;
+    --blue: #99ccff;
+    --sky: #5599ff;
+    --red: #cc4444;
+    --rose: #ff6666;
+    --green: #99dd66;
+    --text: #ffcc99;
+    --dim: #886a55;
+    --side: 168px;
+    --bar: 18px;
+    --elbow: 64px;
+    --inner: 32px;
+    --gap: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--text); }
+  body {
+    font-family: 'Antonio', 'Arial Narrow', 'Roboto Condensed', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    min-height: 100vh;
+    padding: 10px 10px 16px;
+    overflow-x: hidden;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  .c-orange { background: var(--orange); } .t-orange { color: var(--orange); }
+  .c-peach  { background: var(--peach); }  .t-peach  { color: var(--peach); }
+  .c-tan    { background: var(--tan); }    .t-tan    { color: var(--tan); }
+  .c-gold   { background: var(--gold); }   .t-gold   { color: var(--gold); }
+  .c-lilac  { background: var(--lilac); }  .t-lilac  { color: var(--lilac); }
+  .c-violet { background: var(--violet); } .t-violet { color: var(--violet); }
+  .c-blue   { background: var(--blue); }   .t-blue   { color: var(--blue); }
+  .c-red    { background: var(--red); }    .t-red    { color: var(--rose); }
+
+  /* ---------- Frames ---------- */
+  .frame { display: grid; grid-template-columns: var(--side) minmax(0, 1fr); }
+  .frame + .frame { margin-top: 8px; }
+  .side { display: flex; flex-direction: column; gap: var(--gap); }
+  .blk {
+    min-height: 52px; padding: 4px 12px;
+    display: flex; align-items: flex-end; justify-content: flex-end;
+    color: #000; font-size: 15px; font-weight: 600;
+    transition: filter .15s;
+  }
+  a.blk:hover, button.blk:hover { filter: brightness(1.25); }
+  .blk.grow { flex: 1; }
+  .blk.short { min-height: 28px; }
+
+  /* top frame: sidebar turns right along the bottom */
+  .elbow { position: relative; }
+  .elbow-bl { border-bottom-left-radius: var(--elbow); min-height: 96px; }
+  .elbow-bl::after {
+    content: ""; position: absolute; right: calc(-1 * var(--inner)); bottom: 0;
+    width: var(--inner); height: calc(var(--bar) + var(--inner)); background: inherit;
+  }
+  .elbow-bl::before {
+    content: ""; position: absolute; right: calc(-1 * var(--inner)); bottom: var(--bar);
+    width: var(--inner); height: var(--inner); background: var(--bg);
+    border-bottom-left-radius: var(--inner); z-index: 2;
+  }
+  /* main frame: sidebar comes down from the top bar */
+  .elbow-tl { border-top-left-radius: var(--elbow); min-height: 96px; align-items: flex-start; padding-top: 14px; }
+  .elbow-tl::after {
+    content: ""; position: absolute; right: calc(-1 * var(--inner)); top: 0;
+    width: var(--inner); height: calc(var(--bar) + var(--inner)); background: inherit;
+  }
+  .elbow-tl::before {
+    content: ""; position: absolute; right: calc(-1 * var(--inner)); top: var(--bar);
+    width: var(--inner); height: var(--inner); background: var(--bg);
+    border-top-left-radius: var(--inner); z-index: 2;
+  }
+
+  .content { display: flex; flex-direction: column; min-width: 0; }
+  .hbar { display: flex; gap: var(--gap); height: var(--bar); }
+  .hbar > span { display: block; height: 100%; }
+  .hbar > span:last-child { border-radius: 0 calc(var(--bar)/2) calc(var(--bar)/2) 0; }
+  .hbar .w1 { flex: 0 0 34px; } .hbar .w2 { flex: 0 0 120px; } .hbar .w3 { flex: 0 0 60px; }
+  .hbar .fill { flex: 1; }
+
+  /* ---------- Header ---------- */
+  .head { flex: 1; display: flex; gap: 18px; align-items: flex-end; justify-content: space-between; padding: 6px 4px 10px calc(var(--inner) + 14px); }
+  .head-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .cascade { display: grid; grid-template-columns: repeat(6, auto); gap: 0 14px; font-size: 12px; color: var(--violet); line-height: 1.25; opacity: .85; }
+  .cascade span:nth-child(3n) { color: var(--orange); }
+  .cascade span:nth-child(5n) { color: var(--tan); }
+  .head-right { text-align: right; min-width: 0; }
+  .title { font-size: clamp(26px, 4.6vw, 54px); font-weight: 700; color: var(--orange); line-height: .95; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtitle { font-size: clamp(13px, 1.4vw, 17px); color: var(--lilac); margin-top: 4px; }
+  .subtitle b { color: var(--tan); font-weight: 600; }
+
+  /* ---------- Main content ---------- */
+  .main { padding: 18px 0 0 calc(var(--inner) + 14px); display: grid; gap: 26px; grid-template-columns: repeat(12, minmax(0, 1fr)); align-content: start; }
+  .span-12 { grid-column: span 12; } .span-7 { grid-column: span 7; } .span-5 { grid-column: span 5; }
+  .stack { display: flex; flex-direction: column; gap: 26px; min-width: 0; }
+
+  .ph { display: flex; align-items: center; gap: 8px; height: 24px; margin-bottom: 12px; }
+  .ph::before { content: ""; flex: 0 0 26px; height: 100%; border-radius: 12px 0 0 12px; background: var(--ph, var(--orange)); }
+  .ph::after { content: ""; flex: 1; height: 100%; border-radius: 0 12px 12px 0; background: var(--ph, var(--orange)); min-width: 20px; }
+  .ph h2 { font-size: 21px; font-weight: 600; color: var(--ph, var(--orange)); line-height: 1; white-space: nowrap; }
+  .ph .tag { order: 3; font-size: 13px; color: #000; background: var(--ph, var(--orange)); padding: 0 12px 0 8px; height: 100%; display: flex; align-items: center; border-radius: 0 12px 12px 0; white-space: nowrap; }
+  .ph:has(.tag)::after { border-radius: 0; }
+
+  /* Rank tiles */
+  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  .tile { display: flex; gap: 8px; min-width: 0; }
+  .tile-cap { flex: 0 0 14px; border-radius: 7px 0 0 7px; }
+  .tile-body { flex: 1; min-width: 0; border-top: 3px solid #222; padding-top: 4px; }
+  .tile-label { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile-value { font-size: clamp(30px, 3.4vw, 44px); font-weight: 700; color: var(--tan); line-height: 1.05; }
+  .tile-foot { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--dim); }
+  .delta { font-weight: 600; } .delta.up { color: var(--blue); } .delta.down { color: var(--rose); } .delta.same { color: var(--dim); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; height: 26px; padding: 0 14px; border-radius: 13px; background: #1a1410; border: 1px solid #3a2a1c; font-size: 13px; }
+  .chip b { color: var(--tan); font-weight: 600; }
+
+  /* Readouts */
+  .readouts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  .readout { background: #0d0d14; border-left: 10px solid var(--rc, var(--violet)); padding: 8px 12px; min-width: 0; }
+  .readout .k { font-size: 13px; color: var(--rc, var(--violet)); }
+  .readout .v { font-size: 26px; font-weight: 700; color: var(--tan); line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .readout .s { font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-transform: none; letter-spacing: 0; }
+
+  /* Captain's log */
+  .log { border-left: 4px solid var(--lilac); padding: 4px 0 4px 18px; }
+  .log p { text-transform: none; letter-spacing: .01em; font-size: 19px; line-height: 1.45; color: var(--tan); }
+  .log .entry { color: var(--lilac); text-transform: uppercase; letter-spacing: .04em; }
+
+  /* Transmissions */
+  .tx { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; }
+  .tx div { display: flex; gap: 10px; align-items: stretch; background: #140d06; }
+  .tx div::before { content: attr(data-n); flex: 0 0 44px; background: var(--gold); color: #000; font-size: 13px; display: flex; align-items: center; justify-content: center; font-weight: 600; }
+  .tx span { padding: 8px 10px 8px 0; font-size: 15px; text-transform: none; letter-spacing: .01em; line-height: 1.35; }
+
+  /* Tactical grid (pitch) */
+  .grid-wrap { position: relative; border: 2px solid #23234a; border-radius: 4px; padding: 26px 14px; min-height: 520px; display: flex; flex-direction: column-reverse; justify-content: space-between; gap: 18px; overflow: hidden;
+    background:
+      linear-gradient(rgba(153,153,255,.07) 1px, transparent 1px) 0 0 / 100% 40px,
+      linear-gradient(90deg, rgba(153,153,255,.07) 1px, transparent 1px) 0 0 / 40px 100%; }
+  .grid-wrap::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: rgba(153,153,255,.25); }
+  .grid-wrap::after { content: ""; position: absolute; left: 50%; top: 50%; width: 120px; height: 120px; transform: translate(-50%, -50%); border: 2px solid rgba(153,153,255,.25); border-radius: 50%; }
+  .sweep { position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 0%, rgba(153,204,255,.10) 48%, rgba(153,204,255,.18) 50%, transparent 51%); background-size: 100% 300%; animation: sweep 6s linear infinite; }
+  @keyframes sweep { from { background-position: 0 100%; } to { background-position: 0 0%; } }
+  .line { position: relative; z-index: 1; display: flex; flex-wrap: wrap; justify-content: space-evenly; gap: 26px 10px; }
+  .line-label { position: absolute; left: 0; top: 50%; transform: translateY(-50%); font-size: 11px; color: #4a4a8a; }
+  .unit { position: relative; display: grid; grid-template-columns: auto auto; align-items: center; column-gap: 8px; min-width: 104px; height: 40px; padding: 0 16px 0 18px; border-radius: 20px; color: #000; font-weight: 600; }
+  .unit-name { font-size: 16px; white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+  .unit-xp { font-size: 14px; text-align: right; opacity: .8; }
+  .unit-sub { position: absolute; left: 50%; bottom: -16px; transform: translateX(-50%); font-size: 11px; color: var(--blue); white-space: nowrap; }
+  .unit-badge { position: absolute; top: -8px; right: -6px; width: 22px; height: 22px; border-radius: 11px; display: flex; align-items: center; justify-content: center; font-size: 13px; border: 2px solid #000; }
+  .unit-badge.cap { background: var(--rose); color: #000; animation: blink 1.6s steps(2, start) infinite; }
+  .unit-badge.vice { background: var(--tan); color: #000; }
+  @keyframes blink { 50% { background: #000; color: var(--rose); } }
+  .pos-gkp { background: var(--gold); } .pos-def { background: var(--blue); } .pos-mid { background: var(--lilac); } .pos-fwd { background: var(--peach); }
+  .is-captain { box-shadow: 0 0 0 2px #000, 0 0 0 4px var(--rose); }
+
+  .bench { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+  .bench > div { background: #15110c; padding: 6px 10px; border-right: 10px solid var(--dim); min-width: 0; }
+  .bench .o { font-size: 11px; color: var(--dim); }
+  .bench .n { font-size: 16px; color: var(--tan); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bench .x { font-size: 12px; color: var(--violet); }
+
+  /* Lists */
+  .rows { display: flex; flex-direction: column; gap: 4px; }
+  .row { display: flex; align-items: stretch; min-height: 30px; font-size: 15px; }
+  .row .lab { flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #0f0f0f; min-width: 0; }
+  .row .lab b { color: var(--tan); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .lab i { font-style: normal; color: var(--dim); font-size: 12px; }
+  .row .val { flex: 0 0 82px; display: flex; align-items: center; justify-content: flex-end; padding: 0 12px; color: #000; font-weight: 600; border-radius: 0 15px 15px 0; }
+  .sub-h { display: flex; justify-content: space-between; font-size: 14px; margin: 14px 0 6px; }
+  .sub-h:first-child { margin-top: 0; }
+  .sub-h small { font-size: 12px; color: var(--dim); }
+  .empty { font-size: 13px; color: var(--dim); padding: 6px 10px; border: 1px dashed #2c2c2c; }
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0 3px; font-size: 15px; }
+  th { text-align: left; font-weight: 400; font-size: 12px; color: var(--violet); padding: 0 8px 4px; }
+  td { background: #0f0f0f; padding: 5px 8px; color: var(--tan); }
+  td:first-child { border-left: 8px solid var(--violet); }
+  td.num, th.num { text-align: right; }
+  td .s { display: block; font-size: 11px; color: var(--dim); text-transform: none; letter-spacing: 0; }
+  td.cap { color: var(--gold); }
+  .scroll { max-height: 300px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--violet) #000; }
+
+  /* Condition indicator */
+  .condition { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; }
+  .condition .lamp { width: 12px; height: 12px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
+  .condition.yellow .lamp { background: var(--gold); box-shadow: 0 0 10px var(--gold); }
+  .condition.red .lamp { background: var(--rose); box-shadow: 0 0 12px var(--rose); animation: pulse 0.9s ease-in-out infinite; }
+  .condition.standby .lamp { background: var(--dim); box-shadow: none; }
+  @keyframes pulse { 50% { opacity: .25; } }
+  body.alert-red .elbow-tl, body.alert-red .elbow-bl { animation: redalert 1.8s ease-in-out infinite; }
+  @keyframes redalert { 50% { background: var(--red); } }
+
+  .standby-box { text-align: left; max-width: 620px; }
+  .standby-box p { text-transform: none; letter-spacing: .01em; font-size: 18px; line-height: 1.5; margin-bottom: 14px; }
+  .standby-box code { display: block; background: #0d0d14; border-left: 10px solid var(--violet); padding: 10px 14px; font-family: ui-monospace, monospace; text-transform: none; font-size: 14px; color: var(--blue); }
+
+  .foot { display: flex; justify-content: space-between; gap: 12px; padding: 14px 0 0 calc(var(--inner) + 14px); font-size: 12px; color: var(--dim); }
+  .foot a { color: var(--violet); }
+
+  @media (max-width: 1080px) {
+    .span-7, .span-5 { grid-column: span 12; }
+    .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    :root { --side: 54px; --elbow: 36px; --inner: 18px; --bar: 12px; }
+    body { padding: 8px 8px 16px; }
+    .blk { font-size: 0; min-height: 34px; padding: 0; }
+    .blk.keep { font-size: 11px; padding: 2px 6px; }
+    .elbow.keep { font-size: 0; }
+    .head { flex-direction: column-reverse; align-items: stretch; gap: 8px; }
+    .title { font-size: 30px; }
+    .readout.wide { grid-column: span 2; }
+    .readout .v { font-size: 21px; }
+    .row .val { flex-basis: 70px; }
+    .cascade { display: none; }
+    .head { padding-left: calc(var(--inner) + 8px); }
+    .main, .foot { padding-left: calc(var(--inner) + 8px); }
+    .tiles { grid-template-columns: 1fr; }
+    .readouts { grid-template-columns: 1fr 1fr; }
+    .bench { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-wrap { padding: 22px 6px; min-height: 460px; }
+    .unit { min-width: 0; height: 34px; padding: 0 10px 0 12px; column-gap: 5px; }
+    .unit-name { font-size: 13px; max-width: 74px; }
+    .unit-xp { font-size: 12px; }
+    .line-label { display: none; }
+    .hbar .w2 { flex-basis: 50px; }
+    .ph h2 { font-size: 17px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; }
+  }
+</style>
+</head>
+<body class="alert-{{ condition }}">
+
+<!-- ===== Upper frame ===== -->
+<header class="frame">
+  <div class="side">
+    <a class="blk short c-lilac keep" href="/">{{ 'GW ' ~ data.gameweek if data and data.gameweek else 'GW --' }}</a>
+    <div class="blk elbow elbow-bl c-orange keep">GEGENBOT</div>
+  </div>
+  <div class="content">
+    <div class="head">
+      <div class="head-left">
+        <div class="cascade" id="cascade" aria-hidden="true"></div>
+        <div class="condition {{ condition }}">
+          <span class="lamp"></span>
+          {%- if condition == 'standby' %}<span class="t-tan">STANDBY · AWAITING ORDERS</span>
+          {%- elif condition == 'red' %}<span class="t-red">RED ALERT · {{ vuln_count }} RANK HAZARDS</span>
+          {%- elif condition == 'yellow' %}<span class="t-gold">YELLOW ALERT · {{ vuln_count }} RANK HAZARD{{ 'S' if vuln_count != 1 }}</span>
+          {%- else %}<span class="t-blue">CONDITION GREEN</span>{% endif %}
+        </div>
+      </div>
+      <div class="head-right">
+        <div class="title">FANTASY OPERATIONS</div>
+        <div class="subtitle">
+          {%- if entry_data and entry_data.name %}<b>{{ entry_data.name }}</b> · {% endif -%}
+          {%- if entry_data and (entry_data.player_first_name or entry_data.player_last_name) %}CMDR {{ entry_data.player_last_name or entry_data.player_first_name }} · {% endif -%}
+          STARDATE <b id="stardate" data-ts="{{ data.timestamp if data and data.timestamp else '' }}">-----.-</b>
+        </div>
+      </div>
+    </div>
+    <div class="hbar">
+      <span class="w1 c-orange"></span><span class="w2 c-peach"></span><span class="fill c-orange"></span><span class="w3 c-lilac"></span><span class="w1 c-tan"></span>
+    </div>
+  </div>
+</header>
+
+<!-- ===== Main frame ===== -->
+<div class="frame">
+  <nav class="side">
+    <div class="blk elbow elbow-tl c-violet keep">{{ data.mode|replace('_', ' ') if data and data.mode else 'OFFLINE' }}</div>
+    <a class="blk c-lilac" href="#ranks" data-beep>01-RANKS</a>
+    <a class="blk c-peach" href="#log" data-beep>02-LOG</a>
+    <a class="blk c-blue" href="#grid" data-beep>03-GRID</a>
+    <a class="blk c-orange" href="#sensors" data-beep>04-SENSORS</a>
+    <a class="blk c-tan" href="#scan" data-beep>05-SCAN</a>
+    <div class="blk grow c-violet"></div>
+    <a class="blk short c-red" href="/" data-beep>CLASSIC</a>
+  </nav>
+  <div class="content">
+    <div class="hbar">
+      <span class="w1 c-violet"></span><span class="fill c-violet"></span><span class="w2 c-lilac"></span><span class="w3 c-blue"></span>
+    </div>
+
+    <main class="main">
+
+      {% if global_leagues or (entry_data and entry_data.summary_overall_rank) %}
+      <section class="span-12" id="ranks">
+        <div class="ph" style="--ph: var(--lilac)">
+          <h2>FLEET STANDINGS</h2>
+          {% if entry_data and entry_data.summary_overall_points %}<span class="tag">{{ entry_data.summary_overall_points | comma }} PTS</span>{% endif %}
+        </div>
+        <div class="tiles">
+          {{ rank_tile('OVERALL', global_summary.overall, 'orange', entry_data.summary_overall_rank if entry_data else None) }}
+          {{ rank_tile(global_summary.country.name if global_summary.country else (entry_data.player_region_name or 'REGIONAL'), global_summary.country, 'blue') }}
+          {{ rank_tile(global_summary.club.name if global_summary.club else 'CLUB', global_summary.club, 'gold') }}
+        </div>
+        {% if global_leagues and global_leagues|length > 3 %}
+        <div class="chips">
+          {% for gl in global_leagues %}
+          {% if gl.id != (global_summary.overall.id if global_summary.overall else None)
+                and gl.id != (global_summary.country.id if global_summary.country else None)
+                and gl.id != (global_summary.club.id if global_summary.club else None) %}
+          <span class="chip">{{ gl.name }} <b>{{ gl.rank | comma }}</b> {{ delta(gl) }}</span>
+          {% endif %}
+          {% endfor %}
+        </div>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      {% if not d %}
+      <section class="span-12">
+        <div class="ph" style="--ph: var(--gold)"><h2>NO TACTICAL DATA</h2></div>
+        <div class="standby-box">
+          <p>The ship's computer has no decision on file yet (<span class="t-blue">data/latest_decision.json</span>). Run the orchestrator to generate orders.</p>
+          <code>python src/main.py --dry-run</code>
+        </div>
+      </section>
+      {% else %}
+
+      <section class="span-12">
+        <div class="readouts">
+          <div class="readout" style="--rc: var(--orange)">
+            <div class="k">PROJECTED NET XP</div>
+            <div class="v">{{ d.projected_net_xp }}</div>
+            <div class="s">Formation {{ sc.formation }}</div>
+          </div>
+          <div class="readout wide" style="--rc: var(--lilac)">
+            <div class="k">TACTICAL MANEUVER</div>
+            <div class="v" title="{{ d.chosen_move_name }}">{{ d.chosen_move_name }}</div>
+            <div class="s" title="{{ d.transfers_description }}">{{ d.transfers_description }}</div>
+          </div>
+          <div class="readout" style="--rc: var(--blue)">
+            <div class="k">RESERVES</div>
+            <div class="v">£{{ sc.bank_remaining_m }}M</div>
+            <div class="s">{% if data.active_chip %}Chip engaged: {{ data.active_chip }}{% else %}No chip engaged{% endif %}</div>
+          </div>
+          <div class="readout" style="--rc: var(--gold)">
+            <div class="k">COMMAND SOURCE</div>
+            <div class="v">{{ 'AI DIRECTOR' if d.source == 'LLM_DIRECTOR' else 'MILP SOLVER' }}</div>
+            <div class="s">Captain: {{ d.captain_name }}</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="span-12" id="log">
+        <div class="ph" style="--ph: var(--peach)"><h2>CAPTAIN'S LOG</h2><span class="tag">GW {{ data.gameweek }}</span></div>
+        <div class="log">
+          <p><span class="entry">Captain's log, stardate <span class="sd-inline">-----.-</span>.</span> {{ d.rationale }}</p>
+        </div>
+      </section>
+
+      {% if d.news_alerts %}
+      <section class="span-12">
+        <div class="ph" style="--ph: var(--gold)"><h2>INCOMING TRANSMISSIONS</h2><span class="tag">{{ d.news_alerts|length }} ACTIVE</span></div>
+        <div class="tx">
+          {% for alert in d.news_alerts %}
+          <div data-n="{{ '%02d' % loop.index }}"><span>{{ alert }}</span></div>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      <div class="span-7 stack">
+        <section id="grid">
+          <div class="ph" style="--ph: var(--blue)">
+            <h2>TACTICAL DEPLOYMENT</h2>
+            <span class="tag">{{ sc.formation }}</span>
+          </div>
+          <div class="grid-wrap">
+            <div class="sweep"></div>
+            {% for pos, label in [('GKP', 'GK'), ('DEF', 'DEF'), ('MID', 'MID'), ('FWD', 'FWD')] %}
+            <div class="line">
+              <span class="line-label">{{ label }}</span>
+              {% for p in starters_by_pos[pos] %}{{ pill(p, pos) }}{% endfor %}
+            </div>
+            {% endfor %}
+          </div>
+          {% if sc.bench %}
+          <div class="bench">
+            {% for p in sc.bench %}
+            <div>
+              <div class="o">{% if p.bench_order == 0 %}RESERVE GK{% else %}RESERVE {{ p.bench_order }}{% endif %} · {{ p.position }}</div>
+              <div class="n">{{ p.web_name }}</div>
+              <div class="x">{{ p.team_code }} · {{ p.xp }} XP</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </section>
+      </div>
+
+      <div class="span-5 stack">
+        <section id="sensors">
+          <div class="ph" style="--ph: var(--orange)"><h2>THREAT ANALYSIS</h2><span class="tag">LEAGUE EO</span></div>
+
+          <div class="sub-h t-blue"><span>DEFLECTOR SHIELDS</span><small>OWNED · HIGH EO</small></div>
+          {% if tm and tm.shields %}
+          <div class="rows">
+            {% for p in tm.shields %}
+            <div class="row"><div class="lab"><b>{{ p.web_name }}</b><i>{{ p.team_code }}</i></div><div class="val c-blue">{{ p.eo_percent }}%</div></div>
+            {% endfor %}
+          </div>
+          {% else %}<div class="empty">Shields offline. No high-EO assets owned.</div>{% endif %}
+
+          <div class="sub-h t-red"><span>HULL BREACH RISKS</span><small>UNOWNED · HIGH EO</small></div>
+          {% if tm and tm.vulnerabilities %}
+          <div class="rows">
+            {% for p in tm.vulnerabilities %}
+            <div class="row"><div class="lab"><b>{{ p.web_name }}</b><i>{{ p.team_code }}</i></div><div class="val c-red">{{ p.eo_percent }}%</div></div>
+            {% endfor %}
+          </div>
+          {% else %}<div class="empty">Hull integrity nominal.</div>{% endif %}
+
+          <div class="sub-h t-gold"><span>PHOTON TORPEDOES</span><small>OWNED · EO &lt; 25%</small></div>
+          {% if tm and tm.daggers %}
+          <div class="rows">
+            {% for p in tm.daggers %}
+            <div class="row"><div class="lab"><b>{{ p.web_name }}</b><i>{{ p.team_code }}</i></div><div class="val c-gold">{{ p.eo_percent }}%</div></div>
+            {% endfor %}
+          </div>
+          {% else %}<div class="empty">Torpedo bays empty. No differentials armed.</div>{% endif %}
+        </section>
+
+        {% if mini_leagues %}
+        <section>
+          <div class="ph" style="--ph: var(--lilac)"><h2>ALLIED SECTORS</h2><span class="tag">{{ mini_leagues|length }}</span></div>
+          <table>
+            <thead><tr><th>LEAGUE</th><th class="num">RANK</th><th class="num">MOVE</th><th class="num">SIZE</th></tr></thead>
+            <tbody>
+              {% for ml in mini_leagues %}
+              <tr>
+                <td>{{ ml.name }}</td>
+                <td class="num">{{ ml.rank | comma if ml.rank else '-' }}</td>
+                <td class="num">{{ delta(ml) }}</td>
+                <td class="num">{{ ml.total_players | comma if ml.total_players else '-' }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </section>
+        {% endif %}
+
+        {% if la and la.rivals %}
+        <section id="scan">
+          <div class="ph" style="--ph: var(--violet)"><h2>LONG RANGE SCAN</h2><span class="tag">{{ la.total_managers }} VESSELS</span></div>
+          <div class="sub-h t-lilac"><span>{{ la.league_name }}</span></div>
+          <div class="scroll">
+            <table>
+              <thead><tr><th>#</th><th>COMMANDER</th><th>CAPTAIN</th><th class="num">PTS</th></tr></thead>
+              <tbody>
+                {% for r in la.rivals %}
+                <tr>
+                  <td>{{ r.rank }}</td>
+                  <td>{{ r.player_name }}<span class="s">{{ r.entry_name }}</span></td>
+                  <td class="cap">{{ r.captain_name or '-' }}</td>
+                  <td class="num">{{ r.total_points }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        {% endif %}
+      </div>
+
+      {% endif %}
+    </main>
+
+    <div class="foot">
+      <span>GEGENBOT · MILP SOLVER + AI DIRECTOR</span>
+      <span>{% if data and data.timestamp %}SYNC {{ data.timestamp[:16].replace('T', ' ') }} UTC · {% endif %}<a href="/">CLASSIC DISPLAY</a></span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // Stardate: decorative, derived from the decision timestamp (or now).
+  var el = document.getElementById('stardate');
+  var ts = el && el.dataset.ts ? new Date(el.dataset.ts) : new Date();
+  if (isNaN(ts)) ts = new Date();
+  var y = ts.getUTCFullYear();
+  var start = Date.UTC(y, 0, 1), end = Date.UTC(y + 1, 0, 1);
+  var sd = (41000 + (y - 1987) * 1000 + ((ts - start) / (end - start)) * 1000).toFixed(1);
+  if (el) el.textContent = sd;
+  document.querySelectorAll('.sd-inline').forEach(function (n) { n.textContent = sd; });
+
+  // Data cascade in the header.
+  var c = document.getElementById('cascade');
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function num() { var n = Math.floor(Math.random() * 99999); return (n < 10000 ? '0' : '') + n; }
+  if (c) {
+    for (var i = 0; i < 18; i++) { var s = document.createElement('span'); s.textContent = num(); c.appendChild(s); }
+    if (!reduce) setInterval(function () {
+      var kids = c.children; kids[Math.floor(Math.random() * kids.length)].textContent = num();
+    }, 180);
+  }
+
+  // Console chirp on navigation buttons.
+  var ctx;
+  document.querySelectorAll('[data-beep]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      try {
+        ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+        var o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine'; o.frequency.setValueAtTime(1350, ctx.currentTime);
+        o.frequency.exponentialRampToValueAtTime(900, ctx.currentTime + 0.09);
+        g.gain.setValueAtTime(0.06, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
+        o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.13);
+      } catch (e) {}
+    });
+  });
+})();
+</script>
+</body>
+</html>

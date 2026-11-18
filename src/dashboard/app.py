@@ -235,8 +235,7 @@ def create_app(data_file_path: Optional[Path] = None) -> Flask:
         except (ValueError, TypeError):
             return val
 
-    @app.route("/")
-    def index():
+    def dashboard_context() -> Dict[str, Any]:
         data = load_decision_data(state_file)
 
         # Categorize starters by position for pitch view
@@ -276,15 +275,23 @@ def create_app(data_file_path: Optional[Path] = None) -> Flask:
         global_leagues, mini_leagues = extract_leagues(entry_data)
         global_summary = build_global_summary(global_leagues, entry_data)
 
-        return render_template(
-            "index.html",
-            data=data,
-            starters_by_pos=starters_by_pos,
-            entry_data=entry_data or {},
-            global_leagues=global_leagues,
-            mini_leagues=mini_leagues,
-            global_summary=global_summary,
-        )
+        return {
+            "data": data,
+            "starters_by_pos": starters_by_pos,
+            "entry_data": entry_data or {},
+            "global_leagues": global_leagues,
+            "mini_leagues": mini_leagues,
+            "global_summary": global_summary,
+        }
+
+    @app.route("/")
+    def index():
+        return render_template("index.html", **dashboard_context())
+
+    @app.route("/lcars")
+    def lcars():
+        """Starship-console themed view of the same dashboard data."""
+        return render_template("lcars.html", **dashboard_context())
 
     @app.route("/api/decision")
     def api_decision():

@@ -768,6 +768,22 @@ def test_flask_dashboard(tmp_path, mock_bootstrap_data, mock_fixtures_data):
     assert "AI Director Tactical Directive" in html
     assert "Starting XI Lineup" in html
 
+    # Test starship-console (LCARS) view renders the same decision
+    res_lcars = client.get("/lcars")
+    assert res_lcars.status_code == 200
+    lcars_html = res_lcars.data.decode("utf-8")
+    assert "FANTASY OPERATIONS" in lcars_html
+    assert "TACTICAL DEPLOYMENT" in lcars_html
+    assert decision.captain_name in lcars_html
+
+
+def test_lcars_dashboard_without_decision(tmp_path):
+    state_file = tmp_path / "latest_decision.json"
+    app = create_app(data_file_path=state_file)
+    res = app.test_client().get("/lcars")
+    assert res.status_code == 200
+    assert "NO TACTICAL DATA" in res.data.decode("utf-8")
+
 
 def test_league_extraction_and_trajectory():
     """Test separating classic leagues into global and mini leagues with correct trajectory calculation."""
